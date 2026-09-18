@@ -1,0 +1,387 @@
+rules_version = '2';
+
+// ============================================================================
+// MyChama — Firestore Security Rules (project: mychama1)
+//
+// Design notes
+// ------------
+// 1. The SAMUHIA WhatsApp bot reaches this database with the Admin SDK (the
+//    CYBER compute service account, granted Firebase Admin via IAM). Admin SDK
+//    traffic BYPASSES these rules entirely. Everything below therefore governs
+//    signed-in app clients only — which is exactly the surface that needs it.
+//
+// 2. Role is resolved with ONE get() against /userChamas/{uid}/memberships/
+//    {chamaId}, kept in sync by a trigger on members. Rule get()s are billed
+//    and capped (10 per single-doc request), so a single cheap lookup is what
+//    makes the fine-grained rules below affordable.
+//
+// 3. "Safe but unrestricting": any active member reads everything in their own
+//    chama — the whole point of a chama is that the books are open to members.
+//    WRITES are narrow, role-scoped and, for anything financial, closed to
+//    clients completely so the server stays the single writer.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- //
+    // Helpers
+    // ---------------------------------------------------------------- //
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function membershipPath(chamaId) {
+      return /databases/$(database)/documents/userChamas/$(request.auth.uid)/memberships/$(chamaId);
+    }
+
+    function membership(chamaId) {
+      return get(membershipPath(chamaId)).data;
+    }
+
+    function isMember(chamaId) {
+      return signedIn()
+        && exists(membershipPath(chamaId))
+        && membership(chamaId).status == 'active';
+    }
+
+    function myMemberId(chamaId) {
+      return membership(chamaId).memberId;
+    }
+
+    function roleIn(chamaId, roles) {
+      return isMember(chamaId) && membership(chamaId).role in roles;
+    }
+
+    function isChair(chamaId)     { return roleIn(chamaId, ['chair']); }
+    function isTreasurer(chamaId) { return roleIn(chamaId, ['treasurer']); }
+    function isSecretary(chamaId) { return roleIn(chamaId, ['secretary']); }
+    function isOfficial(chamaId)  { return roleIn(chamaId, ['chair', 'treasurer', 'secretary']); }
+
+    // Chair + treasurer jointly control money and membership.
+    function isFinanceAdmin(chamaId) { return roleIn(chamaId, ['chair', 'treasurer']); }
+
+    // A member acting on their own record.
+    function isSelf(chamaId, memberId) {
+      return isMember(chamaId) && myMemberId(chamaId) == memberId;
+    }
+
+    // Reject any write that touches fields the client has no business setting.
+    function untouched(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Only the listed fields changed.
+    function onlyChanged(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    function isNumber(v) { return v is number; }
+
+    // ---------------------------------------------------------------- //
+    // userChamas — the rules-support index
+    // Readable by its owner. Written only by the trigger (Admin SDK).
+    // ---------------------------------------------------------------- //
+
+    match /userChamas/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+
+      match /memberships/{chamaId} {
+        allow read: if signedIn() && request.auth.uid == uid;
+        allow write: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------- //
+    // chamas — the group record
+    // ---------------------------------------------------------------- //
+
+    match /chamas/{chamaId} {
+
+      allow read: if isMember(chamaId);
+
+      // Creating a chama goes through a callable that also seeds the founder's
+      // membership; a bare client create would leave an orphaned group.
+      allow create: if false;
+
+      // Officials may edit presentation and contribution defaults. Plan,
+      // billing, settlement routing and SMS credits are server-owned: letting a
+      // client move settlementSplitCode would redirect the chama's money.
+      allow update: if isFinanceAdmin(chamaId)
+                    && untouched([
+                         'plan', 'planExpiry', 'autoRenew',
+                         'settlementAccount', 'settlementSplitCode',
+                         'autoSettle', 'settlementFreq', 'lastSettlement',
+                         'smsCredits', 'minutesExportsUsedThisMonth',
+                         'status', 'createdAt'
+                       ]);
+
+      allow delete: if false;
+
+      // -------------------------------------------------------------- //
+      // members
+      // -------------------------------------------------------------- //
+
+      match /members/{memberId} {
+
+        // Members see each other — that transparency is the product. idNumber
+        // is the one field that must not travel: callables that return member
+        // lists strip it, and only finance admins can read the raw document.
+        allow read: if isFinanceAdmin(chamaId)
+                    || (isMember(chamaId) && !('idNumber' in resource.data))
+                    || isSelf(chamaId, memberId);
+
+        allow create: if isFinanceAdmin(chamaId)
+                      && request.resource.data.totalContributed == 0
+                      && request.resource.data.creditBalance == 0
+                      && request.resource.data.status in ['active', 'inactive']
+                      && request.resource.data.role in ['chair', 'treasurer', 'secretary', 'member'];
+
+        // Balances are derived from the ledger — a client may never set them.
+        allow update: if (
+                        isFinanceAdmin(chamaId)
+                        && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt'])
+                      ) || (
+                        // A member maintains their own contact details only.
+                        isSelf(chamaId, memberId)
+                        && onlyChanged(['phone', 'phoneNormalized', 'whatsappOptIn', 'avatarColor', 'updatedAt'])
+                      );
+
+        // Members are deactivated, never deleted — their ledger history must
+        // stay resolvable.
+        allow delete: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // loanProducts
+      // -------------------------------------------------------------- //
+
+      match /loanProducts/{productId} {
+        allow read: if isMember(chamaId);
+
+        allow create, update: if isFinanceAdmin(chamaId)
+                              && request.resource.data.type in ['flat', 'reducing']
+                              && isNumber(request.resource.data.rate)
+                              && request.resource.data.rate >= 0
+                              && request.resource.data.rate <= 100
+                              && isNumber(request.resource.data.maxAmount)
+                              && request.resource.data.maxAmount > 0
+                              && isNumber(request.resource.data.maxTerm)
+                              && request.resource.data.maxTerm >= 1
+                              && request.resource.data.maxTerm <= 60;
+
+        // Retired products are deactivated so existing loans keep their terms.
+        allow delete: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // contributions
+      //
+      // Amounts and statuses are applied by the server (Paystack webhook or an
+      // admin callable) so the spill-forward logic has exactly one
+      // implementation. Clients may open a cycle, never settle one.
+      // -------------------------------------------------------------- //
+
+      match /contributions/{contributionId} {
+        allow read: if isMember(chamaId);
+
+        allow create: if isFinanceAdmin(chamaId)
+                      && request.resource.data.paidAmount == 0
+                      && request.resource.data.status == 'pending'
+                      && isNumber(request.resource.data.amount)
+                      && request.resource.data.amount > 0
+                      && request.resource.data.periodKey is string;
+
+        // Only the due date and the headline amount are correctable, and only
+        // before anything has been paid.
+        allow update: if isFinanceAdmin(chamaId)
+                      && resource.data.paidAmount == 0
+                      && onlyChanged(['amount', 'dueDate', 'updatedAt']);
+
+        allow delete: if isFinanceAdmin(chamaId) && resource.data.paidAmount == 0;
+      }
+
+      // -------------------------------------------------------------- //
+      // loans
+      //
+      // A member applies. Officials approve. The server disburses and records
+      // repayments. Nobody client-side touches the schedule.
+      // -------------------------------------------------------------- //
+
+      match /loans/{loanId} {
+        allow read: if isMember(chamaId);
+
+        allow create: if isMember(chamaId)
+                      && request.resource.data.memberId == myMemberId(chamaId)
+                      && request.resource.data.status == 'pending_approval'
+                      && request.resource.data.approvals.chair == false
+                      && request.resource.data.approvals.treasurer == false
+                      && request.resource.data.disbursedOn == null
+                      && isNumber(request.resource.data.principal)
+                      && request.resource.data.principal > 0
+                      && isNumber(request.resource.data.term)
+                      && request.resource.data.term >= 1
+                      && request.resource.data.schedule.size() == request.resource.data.term;
+
+        // Approval only. Chair flips chair; treasurer flips treasurer. Status
+        // may only move within the approval stage — activation, disbursement
+        // and repayment all belong to the server.
+        allow update: if (
+                        isChair(chamaId)
+                        && onlyChanged(['approvals', 'status', 'updatedAt'])
+                        && request.resource.data.approvals.treasurer == resource.data.approvals.treasurer
+                        && request.resource.data.status in ['pending_approval', 'awaiting_treasurer', 'rejected']
+                      ) || (
+                        isTreasurer(chamaId)
+                        && onlyChanged(['approvals', 'status', 'updatedAt'])
+                        && request.resource.data.approvals.chair == resource.data.approvals.chair
+                        && request.resource.data.status in ['awaiting_treasurer', 'approved', 'rejected']
+                      );
+
+        // An applicant may withdraw their own untouched application.
+        allow delete: if isSelf(chamaId, resource.data.memberId)
+                      && resource.data.status == 'pending_approval'
+                      && resource.data.disbursedOn == null;
+      }
+
+      // -------------------------------------------------------------- //
+      // transactions — the ledger. Append-only, and only by the server.
+      // -------------------------------------------------------------- //
+
+      match /transactions/{transactionId} {
+        allow read: if isMember(chamaId);
+        allow write: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // merry-go-round
+      // -------------------------------------------------------------- //
+
+      match /mgrPots/{potId} {
+        allow read: if isMember(chamaId);
+
+        allow create: if isFinanceAdmin(chamaId)
+                      && request.resource.data.status == 'draft'
+                      && request.resource.data.drawDone == false
+                      && isNumber(request.resource.data.amount)
+                      && request.resource.data.amount > 0
+                      && request.resource.data.period == 1;
+
+        // Officials run the draw, reorder the queue and advance periods. The
+        // per-period money is in the records subcollection, which is closed.
+        allow update: if isFinanceAdmin(chamaId)
+                      && untouched(['createdAt', 'createdOn']);
+
+        allow delete: if isFinanceAdmin(chamaId) && resource.data.status == 'draft';
+
+        // Records carry money, so the server is the only writer — cash
+        // recording goes through a callable that also writes the transaction.
+        match /records/{recordId} {
+          allow read: if isMember(chamaId);
+          allow write: if false;
+        }
+
+        match /payouts/{payoutId} {
+          allow read: if isMember(chamaId);
+          allow write: if false;
+        }
+      }
+
+      // -------------------------------------------------------------- //
+      // paymentIntents — server-written, member-readable (own only)
+      // -------------------------------------------------------------- //
+
+      match /paymentIntents/{reference} {
+        allow read: if isFinanceAdmin(chamaId)
+                    || (isMember(chamaId) && resource.data.memberId == myMemberId(chamaId));
+        allow write: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // minutes — the secretary's record
+      // -------------------------------------------------------------- //
+
+      match /minutes/{minuteId} {
+        allow read: if isMember(chamaId);
+        allow create, update: if isSecretary(chamaId) || isChair(chamaId);
+        allow delete: if isChair(chamaId);
+      }
+
+      // -------------------------------------------------------------- //
+      // settlements — Paystack payout history
+      // -------------------------------------------------------------- //
+
+      match /settlements/{settlementId} {
+        allow read: if isOfficial(chamaId);
+        allow write: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // settlementAccountRequests
+      //
+      // Changing where the chama's money lands needs two different officers:
+      // one raises, a different one approves. Self-approval is blocked here
+      // rather than only in the UI.
+      // -------------------------------------------------------------- //
+
+      match /settlementAccountRequests/{requestId} {
+        allow read: if isOfficial(chamaId);
+
+        allow create: if isFinanceAdmin(chamaId)
+                      && request.resource.data.requestedBy == myMemberId(chamaId)
+                      && request.resource.data.status == 'pending'
+                      && request.resource.data.approvedBy == null;
+
+        allow update: if isFinanceAdmin(chamaId)
+                      && resource.data.status == 'pending'
+                      && resource.data.requestedBy != myMemberId(chamaId)
+                      && onlyChanged(['status', 'approvedBy', 'updatedAt'])
+                      && request.resource.data.status in ['approved', 'rejected']
+                      && request.resource.data.approvedBy == myMemberId(chamaId);
+
+        allow delete: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // SMS
+      // -------------------------------------------------------------- //
+
+      match /smsLog/{smsId} {
+        allow read: if isOfficial(chamaId);
+        allow write: if false; // written by the SMS dispatch function
+      }
+
+      match /smsSchedules/{scheduleId} {
+        allow read: if isOfficial(chamaId);
+        allow create, update: if isOfficial(chamaId)
+                              && request.resource.data.status in ['active', 'paused']
+                              && request.resource.data.body.size() <= 480;
+        allow delete: if isOfficial(chamaId);
+      }
+    }
+
+    // ---------------------------------------------------------------- //
+    // whatsappAuditLog — server only, no client access in either direction.
+    // Contains failed-authentication traces, so read access would itself be
+    // an information leak.
+    // ---------------------------------------------------------------- //
+
+    match /whatsappAuditLog/{logId} {
+      allow read, write: if false;
+    }
+
+    match /whatsappRateLimits/{phone} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------- //
+    // Default deny — anything not matched above.
+    // ---------------------------------------------------------------- //
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

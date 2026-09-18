@@ -1,0 +1,598 @@
+{
+  "$meta": {
+    "name": "MyChama Firestore Data Contract",
+    "version": "1.0.0",
+    "projectId": "mychama1",
+    "derivedFrom": "MyChama_3_0.html (demo, single-chama localStorage model)",
+    "purpose": "Single source of truth for the MyChama live build AND the SAMUHIA WhatsApp bot. Both are written against this file. If a field changes here it changes in both codebases in the same commit.",
+    "consumers": [
+      "MyChama web/mobile app (project mychama1)",
+      "SAMUHIA WhatsApp bot (project plot-9fd6e, functions/src/services/mychama.service.ts)",
+      "MyChama Paystack webhook (project mychama1)"
+    ]
+  },
+
+  "conventions": {
+    "documentIds": "Firestore auto-IDs everywhere except paymentIntents (doc ID = payment reference) and loanProducts (doc ID = product slug, e.g. flat_emergency). The demo's uid('ln') style IDs are NOT carried over — the document ID is the ID.",
+    "memberId": "Always the members subcollection document ID. Every cross-reference (contributions.memberId, loans.memberId, mgrPots.memberIds[], transactions.memberId) stores that exact string.",
+    "uid": "members.uid is the Firebase Auth UID when the member has an app account, else null. WhatsApp-only members are legitimate and always have uid: null.",
+    "dates": "Calendar-day fields (paidOn, requestedOn, dueDate, joinDate, date) are ISO date strings 'YYYY-MM-DD' — string-sortable, which is what every range query in firestore.indexes.json relies on. Do not switch these to Timestamps without re-writing the indexes.",
+    "timestamps": "createdAt / updatedAt are epoch milliseconds (number), for cheap numeric range filters and to match the bot's session clock.",
+    "money": "All amounts are KES as numbers, rounded to 2dp. Never store money as a string. Fees are stored alongside the net amount, never subtracted from it.",
+    "phone": "members.phone is display E.164 ('+254712345671'). members.phoneNormalized is the canonical lookup key produced by normalizePhone() — always E.164, always written on every create and update. The WhatsApp bot resolves membership solely via a collection-group query on phoneNormalized, so a stale value means a member silently loses WhatsApp access.",
+    "nationalId": "members.idNumber holds the full number and must never be sent to a client (see firestore.rules). members.idLast4 is the last 4 digits, and is what the WhatsApp bot compares against as a second authentication factor. members.nationalIdMasked ('•••• 1234') is the display form.",
+    "arraysVsSubcollections": "The demo nests mgrPot.records[] and mgrPot.paidOut[] as arrays. Live they are subcollections (mgrPots/{potId}/records, mgrPots/{potId}/payouts) because both grow without bound and would blow the 1 MiB document limit on a daily pot. loans.schedule[] stays an array: it is bounded by maxTerm (≤ 12 entries) and is always read and written whole.",
+    "singleWriter": "Contribution, loan-schedule and MGR-record balances are mutated by exactly ONE writer: the Paystack webhook (for online money) or an admin action in the app (for cash). The WhatsApp bot never mutates a balance."
+  },
+
+  "feeEngine": {
+    "note": "These constants MUST match functions/src/config/mychama.config.ts FEES in the bot. A member quoted one figure on WhatsApp and charged another in the app is the single worst bug this system can ship.",
+    "PAYSTACK_FEE_RATE": 0.015,
+    "PAYSTACK_FEE_CAP": 3000,
+    "CONTRIBUTION_MARKUP_RATE": 0.005,
+    "LOAN_MARKUP_RATE": { "free": null, "starter": 0.015, "basic": 0.011, "growth": 0.007, "max": 0.007 },
+    "MGR_PAYOUT_MARKUP_RATE": { "free": null, "starter": 0.015, "basic": 0.011, "growth": 0.007, "max": 0.007 },
+    "grossUpForFees": "Money IN (contributions, loan repayments, MGR collections). gross = net / (1 - PAYSTACK_FEE_RATE - ourRate). If gross*PAYSTACK_FEE_RATE exceeds the cap, recompute as gross = (net + PAYSTACK_FEE_CAP) / (1 - ourRate) with paystackFee pinned at the cap. The member pays gross; exactly net reaches the chama.",
+    "disbursementCost": "Money OUT (loan disbursement, MGR payout). Fees are added ON TOP of the principal and deducted from the chama balance; the recipient receives the full principal. totalDeducted = principal + paystackFee + ourFee.",
+    "freePlan": "plan === 'free' disables online collection and payout entirely (markup rate null). Cash/manual recording stays free on every plan, including MGR draws and reordering."
+  },
+
+  "plans": {
+    "order": ["free", "starter", "basic", "growth", "max"],
+    "free":    { "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": false, "onlineCollection": false },
+    "starter": { "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": true,  "onlineCollection": true },
+    "basic":   { "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "minutesQuota": 3,    "exportsAllowed": true,  "onlineCollection": true },
+    "growth":  { "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
+    "max":     { "price": 4990, "memberLimit": 999, "smsRate": 0.5, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
+    "minutesQuotaNull": "null means unlimited. Beyond quota, a minutes export costs KES 100."
+  },
+
+  "collections": {
+    "chamas": {
+      "path": "chamas/{chamaId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "fields": {
+        "name": { "type": "string", "required": true },
+        "motto": { "type": "string" },
+        "plan": { "type": "string", "enum": ["free", "starter", "basic", "growth", "max"], "required": true },
+        "planExpiry": { "type": "string", "format": "YYYY-MM-DD" },
+        "autoRenew": { "type": "boolean" },
+        "contributionAmount": { "type": "number", "required": true, "note": "Default per-cycle contribution used when generating contribution documents." },
+        "contributionCycle": { "type": "string", "enum": ["daily", "weekly", "monthly"], "required": true },
+        "smsCredits": { "type": "number" },
+        "settlementAccount": { "type": "string", "note": "Display label only, e.g. 'M-Pesa Paybill •••521'. Never the raw account." },
+        "settlementSplitCode": { "type": "string", "note": "Paystack split code. The bot refuses to raise a payment intent without it." },
+        "autoSettle": { "type": "boolean" },
+        "settlementFreq": { "type": "string", "enum": ["daily", "weekly", "monthly"] },
+        "lastSettlement": { "type": "string", "format": "YYYY-MM-DD" },
+        "minutesExportsUsedThisMonth": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "suspended"], "required": true, "note": "The bot skips suspended chamas during membership lookup." },
+        "whatsappEnabled": { "type": "boolean", "default": true },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "sample": {
+        "name": "Sunrise Chama",
+        "motto": "Together we grow",
+        "plan": "growth",
+        "planExpiry": "2026-10-12",
+        "autoRenew": true,
+        "contributionAmount": 1000,
+        "contributionCycle": "monthly",
+        "smsCredits": 842,
+        "settlementAccount": "M-Pesa Paybill •••521",
+        "settlementSplitCode": "SPL_K3F9QW2",
+        "autoSettle": true,
+        "settlementFreq": "weekly",
+        "lastSettlement": "2026-09-14",
+        "minutesExportsUsedThisMonth": 0,
+        "status": "active",
+        "whatsappEnabled": true,
+        "createdAt": 1757000000000,
+        "updatedAt": 1758100000000
+      }
+    },
+
+    "members": {
+      "path": "chamas/{chamaId}/members/{memberId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "fields": {
+        "uid": { "type": "string|null", "note": "Firebase Auth UID, or null for WhatsApp-only members." },
+        "name": { "type": "string", "required": true },
+        "phone": { "type": "string", "format": "E.164", "required": true },
+        "phoneNormalized": { "type": "string", "format": "E.164", "required": true, "note": "Collection-group indexed. MUST be recomputed on every phone edit." },
+        "role": { "type": "string", "enum": ["chair", "treasurer", "secretary", "member"], "required": true },
+        "isAdmin": { "type": "boolean", "required": true, "note": "Derived: role !== 'member'. Stored so rules avoid a second read." },
+        "idNumber": { "type": "string", "required": true, "sensitive": true, "note": "Full National ID. Rules deny client reads of this field's document to non-admins; strip it in any callable that returns member lists." },
+        "idLast4": { "type": "string", "length": 4, "required": true, "note": "WhatsApp second factor." },
+        "nationalIdMasked": { "type": "string", "note": "'•••• 1234' display form." },
+        "joinDate": { "type": "string", "format": "YYYY-MM-DD" },
+        "status": { "type": "string", "enum": ["active", "inactive", "suspended"], "required": true },
+        "totalContributed": { "type": "number", "required": true, "note": "Denormalised sum of contributions.paidAmount. Recomputed by the webhook/admin action that applies a payment — never by the bot." },
+        "creditBalance": { "type": "number", "required": true, "note": "Overpayment carried forward." },
+        "avatarColor": { "type": "string" },
+        "initial": { "type": "string" },
+        "whatsappOptIn": { "type": "boolean", "default": true },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "sample": {
+        "uid": "Yp3kQ2xVb8W1nD0aL5zR",
+        "name": "Grace Wanjiru",
+        "phone": "+254712345672",
+        "phoneNormalized": "+254712345672",
+        "role": "treasurer",
+        "isAdmin": true,
+        "idNumber": "21029618",
+        "idLast4": "9618",
+        "nationalIdMasked": "•••• 9618",
+        "joinDate": "2023-02-15",
+        "status": "active",
+        "totalContributed": 4000,
+        "creditBalance": 0,
+        "avatarColor": "bg-gold-500",
+        "initial": "G",
+        "whatsappOptIn": true,
+        "createdAt": 1676419200000,
+        "updatedAt": 1758100000000
+      }
+    },
+
+    "loanProducts": {
+      "path": "chamas/{chamaId}/loanProducts/{productId}",
+      "documentId": "Slug, e.g. flat_emergency / reducing_dev",
+      "writtenByBot": false,
+      "readByBot": true,
+      "fields": {
+        "name": { "type": "string", "required": true },
+        "type": { "type": "string", "enum": ["flat", "reducing"], "required": true },
+        "rate": { "type": "number", "required": true, "note": "flat → % per month. reducing → % per annum." },
+        "maxAmount": { "type": "number", "required": true },
+        "maxTerm": { "type": "number", "required": true, "note": "Months." },
+        "desc": { "type": "string" },
+        "active": { "type": "boolean", "required": true }
+      },
+      "defaults": [
+        { "id": "flat_emergency", "name": "Emergency Loan", "type": "flat", "rate": 5, "maxAmount": 100000, "maxTerm": 3, "desc": "Quick short-term loan. Interest charged once on the full amount.", "active": true },
+        { "id": "reducing_dev", "name": "Development Loan", "type": "reducing", "rate": 12, "maxAmount": 300000, "maxTerm": 12, "desc": "Larger loan for development needs. Interest falls as you repay.", "active": true }
+      ]
+    },
+
+    "contributions": {
+      "path": "chamas/{chamaId}/contributions/{contributionId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "note": "One document per member per cycle, pre-generated by a scheduled function when a cycle opens. The bot lists documents whose status is pending/partial/overdue.",
+      "fields": {
+        "memberId": { "type": "string", "required": true },
+        "period": { "type": "string", "required": true, "note": "Human label as in the demo, e.g. 'Oct 2026'." },
+        "periodKey": { "type": "string", "format": "YYYY-MM", "required": true, "note": "ADDED FOR LIVE. The demo sorted periods by array order, which Firestore cannot do. Every ordering and range query uses this field." },
+        "amount": { "type": "number", "required": true },
+        "paidAmount": { "type": "number", "required": true, "default": 0 },
+        "status": { "type": "string", "enum": ["pending", "partial", "paid", "overdue"], "required": true },
+        "method": { "type": "string|null", "enum": ["paystack", "manual", null] },
+        "paidOn": { "type": "string|null", "format": "YYYY-MM-DD" },
+        "ref": { "type": "string|null" },
+        "dueDate": { "type": "string", "format": "YYYY-MM-DD" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "statusRules": {
+        "paid": "paidAmount >= amount - 0.01",
+        "partial": "0 < paidAmount < amount",
+        "overdue": "status was pending/partial and dueDate < today (set by a scheduled sweep, not on read)",
+        "overflow": "Excess beyond `amount` rolls to the member's next unpaid period in periodKey order; whatever remains increments members.creditBalance. This mirrors applyContributionPayment() in the demo exactly."
+      },
+      "sample": {
+        "memberId": "mem_100",
+        "period": "Sep 2026",
+        "periodKey": "2026-09",
+        "amount": 1000,
+        "paidAmount": 400,
+        "status": "partial",
+        "method": "paystack",
+        "paidOn": null,
+        "ref": "MCW-sunrise01-CNT-1758100000000-A7K2QX",
+        "dueDate": "2026-09-28",
+        "createdAt": 1756684800000,
+        "updatedAt": 1758100000000
+      }
+    },
+
+    "loans": {
+      "path": "chamas/{chamaId}/loans/{loanId}",
+      "writtenByBot": true,
+      "botWriteScope": "CREATE ONLY, and only with status 'pending_approval', approvals {chair:false,treasurer:false}, source 'whatsapp'. The bot never approves, disburses or marks an instalment paid.",
+      "readByBot": true,
+      "fields": {
+        "memberId": { "type": "string", "required": true },
+        "productId": { "type": "string", "required": true },
+        "principal": { "type": "number", "required": true },
+        "term": { "type": "number", "required": true },
+        "purpose": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending_approval", "awaiting_treasurer", "approved", "active", "overdue", "completed", "rejected"], "required": true },
+        "approvals": { "type": "map", "shape": { "chair": "boolean", "treasurer": "boolean" }, "required": true },
+        "requestedOn": { "type": "string", "format": "YYYY-MM-DD", "required": true },
+        "disbursedOn": { "type": "string|null", "format": "YYYY-MM-DD" },
+        "method": { "type": "string|null", "enum": ["paystack", "manual", null] },
+        "installment": { "type": "number", "required": true },
+        "totalInterest": { "type": "number", "required": true },
+        "totalPay": { "type": "number", "required": true },
+        "schedule": { "type": "array<LoanInstallment>", "required": true, "maxLength": 12 },
+        "source": { "type": "string", "enum": ["app", "whatsapp"], "required": true },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "LoanInstallment": {
+        "n": { "type": "number", "note": "1-based instalment number." },
+        "due": { "type": "number" },
+        "principalPart": { "type": "number" },
+        "interestPart": { "type": "number" },
+        "opening": { "type": "number" },
+        "closing": { "type": "number" },
+        "paid": { "type": "boolean" },
+        "paidAmount": { "type": "number" },
+        "dueDate": { "type": "string", "format": "YYYY-MM-DD" }
+      },
+      "scheduleMaths": {
+        "flat": "totalInterest = principal * (rate/100) * term; totalPay = principal + totalInterest; installment = totalPay / term; each row: principalPart = principal/term, interestPart = totalInterest/term, opening/closing walk down from totalPay.",
+        "reducing": "r = (rate/100)/12; installment = r === 0 ? principal/term : principal*r*(1+r)^term / ((1+r)^term - 1); per row: interestPart = opening*r, principalPart = installment - interestPart, closing = opening - principalPart.",
+        "dueDates": "dueDate of row i = start + (i+1)*30 days, where start is the disbursement date (or application date while pending). Kept at 30-day steps, exactly as the demo, so figures reconcile."
+      },
+      "statusTransitions": {
+        "pending_approval": "→ awaiting_treasurer (chair approves) | rejected",
+        "awaiting_treasurer": "→ approved (treasurer approves) | rejected",
+        "approved": "→ active (on disbursement; sets disbursedOn, method, and re-bases every schedule dueDate from the disbursement date)",
+        "active": "→ overdue (scheduled sweep: an unpaid row's dueDate has passed) | completed (every row paid)",
+        "overdue": "→ active (caught up) | completed"
+      },
+      "repaymentOverflow": "A repayment applies to the earliest unpaid instalment, then spills forward row by row; any remainder increments members.creditBalance. Mirrors applyLoanPayment() in the demo."
+    },
+
+    "transactions": {
+      "path": "chamas/{chamaId}/transactions/{transactionId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "note": "The ledger. Written by the Paystack webhook and by admin cash-recording actions. The bot only reads it, to build statements.",
+      "fields": {
+        "type": { "type": "string", "enum": ["contribution", "loan_disbursement", "loan_repayment", "mgr_contribution", "mgr_payout"], "required": true },
+        "memberId": { "type": "string", "required": true },
+        "amount": { "type": "number", "required": true, "note": "Net amount moved for/against the chama." },
+        "grossAmount": { "type": "number", "note": "Present only for paystack transactions." },
+        "paystackFee": { "type": "number" },
+        "ourFee": { "type": "number" },
+        "method": { "type": "string", "enum": ["paystack", "manual"], "required": true },
+        "ref": { "type": "string", "required": true, "note": "Paystack reference, or CASH... for manual entries." },
+        "date": { "type": "string", "format": "YYYY-MM-DD", "required": true },
+        "settled": { "type": "boolean", "required": true, "note": "Whether the money has reached the chama's settlement account." },
+        "direction": { "type": "string", "enum": ["in", "out"], "required": true },
+        "note": { "type": "string", "note": "e.g. the MGR pot name." },
+        "channel": { "type": "string", "enum": ["app", "whatsapp"], "required": true },
+        "intentId": { "type": "string", "note": "paymentIntents document ID when the payment originated on WhatsApp." },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "mgrPots": {
+      "path": "chamas/{chamaId}/mgrPots/{potId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "fields": {
+        "name": { "type": "string", "required": true },
+        "amount": { "type": "number", "required": true, "note": "Per member per period." },
+        "frequency": { "type": "string", "enum": ["daily", "weekly", "monthly"], "required": true },
+        "periodsPerRound": { "type": "number", "required": true },
+        "recipientsPerRound": { "type": "number", "required": true },
+        "memberIds": { "type": "array<string>", "required": true, "note": "array-contains indexed — this is how the bot finds a member's pots." },
+        "queue": { "type": "array<string>", "required": true, "note": "Payout order. Head of queue receives next." },
+        "drawDone": { "type": "boolean", "required": true },
+        "drawMethod": { "type": "string|null", "enum": ["smart", "random", null] },
+        "autoDemoteLate": { "type": "boolean", "required": true, "note": "When true, closing a period re-sorts the queue by late score so chronic late payers drift backwards." },
+        "status": { "type": "string", "enum": ["draft", "active", "completed"], "required": true },
+        "cycleNumber": { "type": "number", "required": true },
+        "period": { "type": "number", "required": true, "note": "Current open period. The bot only ever collects for this period." },
+        "createdOn": { "type": "string", "format": "YYYY-MM-DD" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "note": "A pot with status 'draft' or drawDone false is not collectable — the bot shows an explanatory message instead of a pay option."
+    },
+
+    "mgrRecords": {
+      "path": "chamas/{chamaId}/mgrPots/{potId}/records/{recordId}",
+      "writtenByBot": false,
+      "readByBot": true,
+      "note": "SUBCOLLECTION — replaces the demo's pot.records[] array. One document per member per period.",
+      "fields": {
+        "period": { "type": "number", "required": true },
+        "memberId": { "type": "string", "required": true },
+        "status": { "type": "string", "enum": ["paid", "missed", "pending"], "required": true },
+        "amount": { "type": "number", "required": true },
+        "date": { "type": "string|null", "format": "YYYY-MM-DD" },
+        "method": { "type": "string|null", "enum": ["paystack", "manual", null] },
+        "ref": { "type": "string|null" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "uniqueness": "At most one document per (potId, memberId, period). Enforce with a transaction on write — closing a period creates 'missed' rows for everyone without one."
+    },
+
+    "mgrPayouts": {
+      "path": "chamas/{chamaId}/mgrPots/{potId}/payouts/{payoutId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "note": "SUBCOLLECTION — replaces the demo's pot.paidOut[] array.",
+      "fields": {
+        "memberId": { "type": "string", "required": true },
+        "round": { "type": "number", "required": true },
+        "amount": { "type": "number", "required": true },
+        "date": { "type": "string", "format": "YYYY-MM-DD", "required": true },
+        "method": { "type": "string", "enum": ["paystack", "manual"], "required": true },
+        "ref": { "type": "string|null" },
+        "paystackFee": { "type": "number" },
+        "ourFee": { "type": "number" },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "paymentIntents": {
+      "path": "chamas/{chamaId}/paymentIntents/{reference}",
+      "documentId": "The payment reference itself, so the webhook resolves it in one get() and a replayed webhook is naturally idempotent.",
+      "writtenByBot": true,
+      "botWriteScope": "CREATE with status 'pending'; UPDATE only paystackMessage / status→'failed' when Paystack rejects the charge outright. Everything after that belongs to the webhook.",
+      "readByBot": true,
+      "fields": {
+        "chamaId": { "type": "string", "required": true },
+        "memberId": { "type": "string", "required": true },
+        "purpose": { "type": "string", "enum": ["contribution", "loan_repayment", "mgr_contribution"], "required": true },
+        "reference": { "type": "string", "required": true },
+        "amount": { "type": "number", "required": true, "note": "NET — what must reach the chama." },
+        "grossAmount": { "type": "number", "required": true, "note": "What the member is charged." },
+        "paystackFee": { "type": "number", "required": true },
+        "ourFee": { "type": "number", "required": true },
+        "currency": { "type": "string", "const": "KES" },
+        "phone": { "type": "string", "format": "E.164", "required": true },
+        "provider": { "type": "string", "enum": ["mpesa", "airtel"], "required": true },
+        "status": { "type": "string", "enum": ["pending", "success", "failed", "abandoned", "expired"], "required": true },
+        "channel": { "type": "string", "const": "whatsapp" },
+        "contributionId": { "type": "string", "note": "Set when purpose === 'contribution'." },
+        "loanId": { "type": "string", "note": "Set when purpose === 'loan_repayment'." },
+        "installmentNo": { "type": "number", "note": "Set when purpose === 'loan_repayment'." },
+        "potId": { "type": "string", "note": "Set when purpose === 'mgr_contribution'." },
+        "potPeriod": { "type": "number", "note": "Set when purpose === 'mgr_contribution'." },
+        "splitCode": { "type": "string", "required": true },
+        "paystackMessage": { "type": "string" },
+        "createdAt": { "type": "number", "required": true },
+        "updatedAt": { "type": "number", "required": true },
+        "expiresAt": { "type": "number", "required": true, "note": "createdAt + 30 minutes. A scheduled sweep marks anything still pending past this as 'expired'." }
+      },
+      "referenceFormat": "MCW-{chamaId}-{CNT|LNR|MGR}-{epochMs}-{6 random uppercase}. The MCW prefix marks WhatsApp origin; the webhook can branch on it without a lookup.",
+      "sample": {
+        "chamaId": "sunrise01",
+        "memberId": "mem_100",
+        "purpose": "contribution",
+        "reference": "MCW-sunrise01-CNT-1758100000000-A7K2QX",
+        "amount": 1000,
+        "grossAmount": 1020.41,
+        "paystackFee": 15.31,
+        "ourFee": 5.1,
+        "currency": "KES",
+        "phone": "+254712345680",
+        "provider": "mpesa",
+        "status": "pending",
+        "channel": "whatsapp",
+        "contributionId": "c8Kq2LmVb3",
+        "splitCode": "SPL_K3F9QW2",
+        "createdAt": 1758100000000,
+        "updatedAt": 1758100000000,
+        "expiresAt": 1758101800000
+      }
+    },
+
+    "userChamas": {
+      "path": "userChamas/{uid}/memberships/{chamaId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "note": "Rules-support index. Security rules resolve an authenticated user's role in a chama with ONE get() against this path instead of scanning members. Also doubles as the app's 'my chamas' list on login. Written by a Firestore trigger on members create/update/delete — never by hand.",
+      "fields": {
+        "chamaId": { "type": "string", "required": true },
+        "chamaName": { "type": "string", "required": true },
+        "memberId": { "type": "string", "required": true },
+        "role": { "type": "string", "enum": ["chair", "treasurer", "secretary", "member"], "required": true },
+        "status": { "type": "string", "enum": ["active", "inactive", "suspended"], "required": true },
+        "updatedAt": { "type": "number" }
+      }
+    },
+
+    "minutes": {
+      "path": "chamas/{chamaId}/minutes/{minuteId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "fields": {
+        "title": { "type": "string", "required": true },
+        "date": { "type": "string", "format": "YYYY-MM-DD", "required": true },
+        "venue": { "type": "string" },
+        "chairPresent": { "type": "boolean" },
+        "attendees": { "type": "array<string>", "note": "memberIds." },
+        "agenda": { "type": "array<string>" },
+        "resolutions": { "type": "array<string>" },
+        "aob": { "type": "string" },
+        "nextMeeting": { "type": "string", "format": "YYYY-MM-DD" },
+        "recordedBy": { "type": "string" },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "settlements": {
+      "path": "chamas/{chamaId}/settlements/{settlementId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "fields": {
+        "date": { "type": "string", "format": "ISO-8601 datetime", "required": true },
+        "amount": { "type": "number", "required": true },
+        "txCount": { "type": "number", "required": true },
+        "ref": { "type": "string", "required": true },
+        "status": { "type": "string", "enum": ["pending", "completed", "failed"], "required": true },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "settlementAccountRequests": {
+      "path": "chamas/{chamaId}/settlementAccountRequests/{requestId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "note": "Changing where the chama's money lands is the highest-risk action in the product. It is a request needing a second officer's approval, never a direct edit.",
+      "fields": {
+        "requestedBy": { "type": "string", "required": true, "note": "memberId." },
+        "accountLabel": { "type": "string", "required": true },
+        "accountType": { "type": "string", "enum": ["paybill", "till", "bank"], "required": true },
+        "accountNumber": { "type": "string", "sensitive": true },
+        "bankCode": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"], "required": true },
+        "approvedBy": { "type": "string|null" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      }
+    },
+
+    "smsLog": {
+      "path": "chamas/{chamaId}/smsLog/{smsId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "fields": {
+        "audience": { "type": "string" },
+        "body": { "type": "string" },
+        "credits": { "type": "number" },
+        "delivered": { "type": "number" },
+        "failed": { "type": "number" },
+        "sentBy": { "type": "string" },
+        "date": { "type": "string", "format": "ISO-8601 datetime" },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "smsSchedules": {
+      "path": "chamas/{chamaId}/smsSchedules/{scheduleId}",
+      "writtenByBot": false,
+      "readByBot": false,
+      "fields": {
+        "audience": { "type": "string", "enum": ["all", "overdue", "admins", "active"] },
+        "body": { "type": "string" },
+        "freq": { "type": "string", "enum": ["daily", "weekly", "monthly"] },
+        "dayOfMonth": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "paused"] },
+        "createdBy": { "type": "string" },
+        "lastRun": { "type": "string|null" },
+        "createdAt": { "type": "number" }
+      }
+    },
+
+    "whatsappAuditLog": {
+      "path": "whatsappAuditLog/{logId}",
+      "writtenByBot": true,
+      "readByBot": false,
+      "note": "Top-level, not under a chama, because failed authentication attempts happen before a chama is resolved. No client may read it — admin/BigQuery only.",
+      "fields": {
+        "phone": { "type": "string", "required": true },
+        "chamaId": { "type": "string" },
+        "memberId": { "type": "string" },
+        "action": { "type": "string", "required": true, "examples": ["auth.lookup", "auth.verify", "loan.apply", "payment.initiate", "statement.generate"] },
+        "outcome": { "type": "string", "enum": ["success", "failure", "denied"], "required": true },
+        "detail": { "type": "map" },
+        "channel": { "type": "string", "const": "whatsapp" },
+        "at": { "type": "timestamp" },
+        "createdAt": { "type": "number" }
+      },
+      "retention": "TTL policy on `at`, 180 days. Configure in the Firestore console (TTL is not expressible in firestore.indexes.json)."
+    }
+  },
+
+  "whatsappContract": {
+    "identity": "The bot trusts the WhatsApp-verified sender number to FIND candidate memberships, and the last 4 digits of the National ID to CONFIRM identity. Neither alone is sufficient. Three wrong attempts lock My Chama on that number for 15 minutes; the session re-verifies after 15 minutes idle.",
+    "reads": ["chamas", "members", "loanProducts", "contributions", "loans", "transactions", "mgrPots", "mgrPots/records", "paymentIntents"],
+    "writes": ["loans (create only, pending_approval)", "paymentIntents (create, and fail-mark)", "whatsappAuditLog (create)"],
+    "neverWrites": ["members.totalContributed", "members.creditBalance", "contributions.paidAmount", "contributions.status", "loans.schedule", "loans.status", "loans.approvals", "mgrPots/records", "transactions", "settlements", "chamas"],
+    "webhookDuties": {
+      "on charge.success": [
+        "Load chamas/{chamaId}/paymentIntents/{reference}. If missing or already status 'success', ACK and stop — this is the idempotency gate.",
+        "In one Firestore transaction: apply intent.amount to the target (contribution spill-forward, loan schedule spill-forward, or the MGR record for intent.potPeriod), recompute members.totalContributed and members.creditBalance, write the transactions document with grossAmount/paystackFee/ourFee copied from the intent and intentId set, and set the intent status to 'success'.",
+        "Send the member a WhatsApp confirmation via the SAMUHIA bot's send endpoint (optional but recommended)."
+      ],
+      "on charge.failed": ["Set intent status to 'failed' with paystackMessage. Touch nothing else."],
+      "amountCheck": "Verify the Paystack event amount equals Math.round(intent.grossAmount * 100). A mismatch means a tampered or stale reference — log to whatsappAuditLog with outcome 'denied' and do not apply."
+    },
+    "rateLimits": { "paymentIntentsPerMemberPerHour": 10, "authAttempts": 3, "authLockoutMinutes": 15, "sessionIdleReauthMinutes": 15 }
+  },
+
+  "seedForEmulator": {
+    "note": "Minimal, self-consistent fixture for local development. IDs are literal so the bot's flows can be exercised end to end.",
+    "chamas/sunrise01": {
+      "name": "Sunrise Chama",
+      "motto": "Together we grow",
+      "plan": "growth",
+      "contributionAmount": 1000,
+      "contributionCycle": "monthly",
+      "settlementSplitCode": "SPL_TESTSPLIT",
+      "settlementAccount": "M-Pesa Paybill •••521",
+      "autoSettle": true,
+      "settlementFreq": "weekly",
+      "status": "active",
+      "whatsappEnabled": true
+    },
+    "chamas/sunrise01/members/mem_100": {
+      "uid": null,
+      "name": "James Kamau",
+      "phone": "+254712345680",
+      "phoneNormalized": "+254712345680",
+      "role": "member",
+      "isAdmin": false,
+      "idNumber": "24556781",
+      "idLast4": "6781",
+      "nationalIdMasked": "•••• 6781",
+      "joinDate": "2023-02-01",
+      "status": "active",
+      "totalContributed": 3000,
+      "creditBalance": 0,
+      "whatsappOptIn": true
+    },
+    "chamas/sunrise01/loanProducts/reducing_dev": {
+      "name": "Development Loan",
+      "type": "reducing",
+      "rate": 12,
+      "maxAmount": 300000,
+      "maxTerm": 12,
+      "desc": "Larger loan for development needs. Interest falls as you repay.",
+      "active": true
+    },
+    "chamas/sunrise01/contributions/contrib_sep": {
+      "memberId": "mem_100",
+      "period": "Sep 2026",
+      "periodKey": "2026-09",
+      "amount": 1000,
+      "paidAmount": 0,
+      "status": "pending",
+      "method": null,
+      "paidOn": null,
+      "ref": null,
+      "dueDate": "2026-09-28"
+    },
+    "chamas/sunrise01/mgrPots/pot_daily": {
+      "name": "Daily Boost",
+      "amount": 300,
+      "frequency": "daily",
+      "periodsPerRound": 1,
+      "recipientsPerRound": 1,
+      "memberIds": ["mem_100"],
+      "queue": ["mem_100"],
+      "drawDone": true,
+      "drawMethod": "smart",
+      "autoDemoteLate": true,
+      "status": "active",
+      "cycleNumber": 1,
+      "period": 6,
+      "createdOn": "2026-09-13"
+    }
+  }
+}
