@@ -1,21 +1,58 @@
-# Welcome to Cloud Functions for Firebase for Python!
-# To get started, simply uncomment the below code or create your own.
-# Deploy with `firebase deploy`
+"""
+Cloud Functions entry point for the mychama1 Firebase project.
 
-from firebase_functions import https_fn
+Deployed functions must be importable names at THIS module's top level, so
+every submodule under mychama/ is imported explicitly and re-exported here
+rather than left to be discovered indirectly.
+"""
+
 from firebase_functions.options import set_global_options
 from firebase_admin import initialize_app
 
-# For cost control, you can set the maximum number of containers that can be
-# running at the same time. This helps mitigate the impact of unexpected
-# traffic spikes by instead downgrading performance. This limit is a per-function
-# limit. You can override the limit for each function using the max_instances
-# parameter in the decorator, e.g. @https_fn.on_request(max_instances=5).
+# For cost control — see the Firebase Functions docs for max_instances.
 set_global_options(max_instances=10)
 
-# initialize_app()
-#
-#
-# @https_fn.on_request()
-# def on_request_example(req: https_fn.Request) -> https_fn.Response:
-#     return https_fn.Response("Hello world!")
+initialize_app()
+
+# --- Phase 1: Identity & Access -------------------------------------------
+from mychama.identity import (  # noqa: E402,F401
+    createChama,
+    addAdmin,
+    addMember,
+    claimInvite,
+    completeProfile,
+    updateMember,
+)
+from mychama.triggers import on_member_write  # noqa: E402,F401
+
+# --- Phase 2: Core Chama Operations ----------------------------------------
+from mychama.contributions import (  # noqa: E402,F401
+    recordCashContribution,
+    open_contribution_cycles,
+    sweep_overdue_contributions,
+)
+from mychama.loans import (  # noqa: E402,F401
+    disburseLoanCash,
+    recordCashLoanRepayment,
+    sweep_overdue_loans,
+)
+from mychama.mgr import (  # noqa: E402,F401
+    createMgrPot,
+    runMgrDraw,
+    recordCashMgrPayment,
+    closeMgrPeriod,
+    recordMgrPayoutCash,
+)
+
+# --- Phase 3: Payments, SMS & Settlement -----------------------------------
+from mychama.payments import (  # noqa: E402,F401
+    setupSettlementAccount,
+    requestSettlementChange,
+    approveSettlementChange,
+    initiatePayment,
+)
+from mychama.sms import (  # noqa: E402,F401
+    sendSmsCampaign,
+    purchaseSmsCredits,
+    run_sms_schedules,
+)

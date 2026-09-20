@@ -1,1 +1,97 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
 @import "tailwindcss";
+
+/*
+ * Design tokens ported 1:1 from the original demo (MyChama_3_1.html)'s
+ * tailwind.config — see docs/DESIGN_SYSTEM.md. Keep these in sync if the
+ * demo's palette ever changes; nothing here should be invented separately.
+ */
+@theme {
+  --color-ink: #12211C;
+  --color-paper: #F7F9F5;
+
+  --color-forest-50: #EEF5F0;
+  --color-forest-100: #D8E8DC;
+  --color-forest-200: #B3D2BB;
+  --color-forest-300: #87B893;
+  --color-forest-400: #5C9C6D;
+  --color-forest-500: #3B7F4D;
+  --color-forest-600: #276139;
+  --color-forest-700: #1F4D3A;
+  --color-forest-800: #183B2C;
+  --color-forest-900: #122B20;
+
+  --color-gold-50: #FDF6E9;
+  --color-gold-100: #FAEAC6;
+  --color-gold-200: #F3D48C;
+  --color-gold-300: #EDBE5C;
+  --color-gold-400: #E8A33D;
+  --color-gold-500: #D98A21;
+  --color-gold-600: #B56D16;
+  --color-gold-700: #8F5512;
+
+  --color-brick-50: #FBEEEB;
+  --color-brick-300: #DDA394;
+  --color-brick-400: #C4664F;
+  --color-brick-500: #B4432F;
+  --color-brick-600: #96341F;
+
+  --font-display: "Space Grotesk", sans-serif;
+  --font-body: "Inter", sans-serif;
+
+  --shadow-card: 0 1px 2px rgba(18, 33, 28, 0.06);
+}
+
+html, body {
+  background: var(--color-paper);
+}
+body {
+  font-family: theme(--font-body);
+  color: var(--color-ink);
+}
+h1, h2, h3, .font-display {
+  font-family: theme(--font-display);
+}
+.num {
+  font-family: theme(--font-display);
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--color-forest-200); border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+input, select, textarea {
+  font-family: theme(--font-body);
+  color: var(--color-ink);
+  background-color: #fff;
+  caret-color: var(--color-forest-700);
+  accent-color: var(--color-forest-700);
+}
+input::placeholder, textarea::placeholder { color: var(--color-ink); opacity: .38; }
+input:disabled, select:disabled, textarea:disabled {
+  color: var(--color-ink); opacity: .5; background-color: #F3F5F1;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--color-forest-700);
+  box-shadow: 0 0 0 3px rgba(31, 77, 58, .12);
+}
+
+.card { background: #fff; border: 1px solid #E3E8E1; border-radius: 14px; }
+.btn-primary { background: var(--color-forest-700); color: #fff; }
+.btn-primary:hover { background: var(--color-forest-800); }
+.btn-gold { background: var(--color-gold-400); color: var(--color-ink); }
+.btn-gold:hover { background: var(--color-gold-500); }
+.chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600; }
+
+.nav-item.active { background: var(--color-forest-50); color: var(--color-forest-700); }
+
+@keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.pulse-dot { animation: pulseDot 1.4s ease-in-out infinite; }
+
+@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.fade-up { animation: fadeUp .6s cubic-bezier(.2,.7,.3,1) both; }
+
+@keyframes toastIn { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+.toast-in { animation: toastIn .2s ease-out both; }
