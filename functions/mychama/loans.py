@@ -175,7 +175,7 @@ def recordCashLoanRepayment(req: https_fn.CallableRequest) -> dict:
     return result
 
 
-@scheduler_fn.on_schedule(schedule="every day 00:20", region=REGION, timezone=scheduler_fn.Timezone("Africa/Nairobi"))
+@scheduler_fn.on_schedule(schedule="every day 00:20", region="us-central1", timezone=scheduler_fn.Timezone("Africa/Nairobi"))
 def sweep_overdue_loans(event: scheduler_fn.ScheduledEvent) -> None:
     db = _db()
     today = today_iso()

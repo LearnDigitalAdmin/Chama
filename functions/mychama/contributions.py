@@ -150,7 +150,7 @@ def _cycle_due_today(cycle: str) -> bool:
     return False
 
 
-@scheduler_fn.on_schedule(schedule="every day 00:05", region=REGION, timezone=scheduler_fn.Timezone("Africa/Nairobi"))
+@scheduler_fn.on_schedule(schedule="every day 00:05", region="us-central1", timezone=scheduler_fn.Timezone("Africa/Nairobi"))
 def open_contribution_cycles(event: scheduler_fn.ScheduledEvent) -> None:
     db = _db()
     ts = now_ms()
@@ -208,7 +208,7 @@ def open_contribution_cycles(event: scheduler_fn.ScheduledEvent) -> None:
             batch.commit()
 
 
-@scheduler_fn.on_schedule(schedule="every day 00:15", region=REGION, timezone=scheduler_fn.Timezone("Africa/Nairobi"))
+@scheduler_fn.on_schedule(schedule="every day 00:15", region="us-central1", timezone=scheduler_fn.Timezone("Africa/Nairobi"))
 def sweep_overdue_contributions(event: scheduler_fn.ScheduledEvent) -> None:
     db = _db()
     today = today_iso()

@@ -441,7 +441,7 @@ def _chair_phone(db, chama_id: str) -> str | None:
 
 @scheduler_fn.on_schedule(
     schedule="every day 00:40",
-    region=REGION,
+    region="us-central1",
     timezone=scheduler_fn.Timezone("Africa/Nairobi"),
     secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID],
 )
@@ -496,7 +496,7 @@ def sweep_plan_expiry(event: scheduler_fn.ScheduledEvent) -> None:
                     pass
 
 
-@scheduler_fn.on_schedule(schedule="1 of month 00:30", region=REGION, timezone=scheduler_fn.Timezone("Africa/Nairobi"))
+@scheduler_fn.on_schedule(schedule="1 of month 00:30", region="us-central1", timezone=scheduler_fn.Timezone("Africa/Nairobi"))
 def reset_monthly_export_quota(event: scheduler_fn.ScheduledEvent) -> None:
     """Nothing reset this before Phase 4 — a chama that used its one free
     export in its first month would otherwise stay locked out forever."""

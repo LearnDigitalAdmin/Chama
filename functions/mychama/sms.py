@@ -192,7 +192,7 @@ def _frequency_ms(frequency: str) -> int:
 
 @scheduler_fn.on_schedule(
     schedule="every 15 minutes",
-    region=REGION,
+    region="us-central1",
     timezone=scheduler_fn.Timezone("Africa/Nairobi"),
     secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID],
 )
