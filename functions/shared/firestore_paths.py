@@ -89,6 +89,10 @@ def plan_billing(chama_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.PLAN_BILLING}"
 
 
+def plan_billing_doc(chama_id: str, reference: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.PLAN_BILLING}/{reference}"
+
+
 def minutes(chama_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.MINUTES}"
 

@@ -10,7 +10,6 @@ import ClaimInvite from './onboarding/ClaimInvite';
 import { ChamaProvider } from './app/ChamaProvider';
 import AppShell from './app/AppShell';
 import Dashboard from './app/Dashboard';
-import ComingSoon from './app/ComingSoon';
 import Members from './features/members/Members';
 import LoanProducts from './features/loans/LoanProducts';
 import Loans from './features/loans/Loans';
@@ -20,6 +19,10 @@ import MgrPotDetail from './features/mgr/MgrPotDetail';
 import Minutes from './features/minutes/Minutes';
 import Payments from './features/payments/Payments';
 import Communication from './features/communication/Communication';
+import Billing from './features/billing/Billing';
+import Reports from './features/reports/Reports';
+import Settings from './features/settings/Settings';
+import Messages from './features/messages/Messages';
 import Hero from './marketing/Hero';
 import { useAuth } from './auth/AuthProvider';
 
@@ -75,10 +78,10 @@ export default function App() {
         <Route path="minutes" element={<Minutes />} />
         <Route path="payments" element={<Payments />} />
         <Route path="communication" element={<Communication />} />
-        <Route path="reports" element={<ComingSoon title="Exports" />} />
-        <Route path="billing" element={<ComingSoon title="Plan & Billing" />} />
-        <Route path="settings" element={<ComingSoon title="Settings" />} />
-        <Route path="messages" element={<ComingSoon title="Messages" />} />
+        <Route path="reports" element={<Reports />} />
+        <Route path="billing" element={<Billing />} />
+        <Route path="settings" element={<Settings />} />
+        <Route path="messages" element={<Messages />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

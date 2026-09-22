@@ -10,9 +10,15 @@ import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
 import { poolEstimate } from '../../lib/mgrEngine';
 import type { MgrPot } from '../../lib/types';
+import MyMgr from './MyMgr';
 
 export default function MgrPots() {
-  const { chamaId, isFinanceAdmin } = useChama();
+  const { chamaId, isFinanceAdmin, membership } = useChama();
+  if (membership?.role === 'member') return <MyMgr />;
+  return <AdminMgrPots chamaId={chamaId} isFinanceAdmin={isFinanceAdmin} />;
+}
+
+function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isFinanceAdmin: boolean }) {
   const [pots, setPots] = useState<MgrPot[]>([]);
   const [showForm, setShowForm] = useState(false);
   const { members } = useMembers(chamaId);

@@ -92,40 +92,49 @@ Errors:   permission-denied
 
 ## Phase 2 — Core operations
 
+**Correction from the original draft of this document, made once Phase 2
+was actually built against `firestore.rules`:** loan application, loan
+approval, loan products, and minutes are **direct Firestore writes**, not
+callables. `firestore.rules` was already written to validate these
+precisely (see its `loans`, `loanProducts`, and `minutes` sections) — no
+money moves at any of those steps, so there's no spill-forward math to
+centralise server-side, and adding a callable would just be a slower path
+to the same write the rules already make safe. Only the operations below,
+where rules deliberately block a direct client write, are callables.
+
+### Direct writes (not callables — for reference, so nothing gets
+### reimplemented as a callable later by mistake)
+
+- **Loan products** (`loanProducts` collection): finance admin
+  create/update directly; validated by `firestore.rules`.
+- **Loan application** (`loans` collection, create): a member creates
+  their own doc with `status: 'pending_approval'`, both `approvals` false,
+  `disbursedOn: null`, and a `schedule` array whose length equals `term` —
+  computed client-side with `src/lib/loanSchedule.ts::buildSchedule` (never
+  hand-built).
+- **Loan approval** (`loans` collection, update): the chair may only flip
+  `approvals.chair` and move `status` within
+  `['pending_approval','awaiting_treasurer','rejected']`; the treasurer may
+  only flip `approvals.treasurer` and move `status` within
+  `['awaiting_treasurer','approved','rejected']`. Once both are true,
+  `status` becomes `'approved'` and the loan is ready for
+  `disburseLoanCash`.
+- **Minutes** (`minutes` collection): secretary or chair create/update;
+  chair-only delete.
+
 ### `recordCashContribution`
 Caller: finance admin. Applies the shared "apply payment" transaction
-(spill-forward) for a cash payment — same logic the webhook uses for
-Paystack payments, `method: "manual"`, `ref` from
-`functions/shared/ids.py::build_cash_reference`.
+(spill-forward) for a cash payment — same logic the webhook will use for
+Paystack payments in Phase 3, `method: "manual"`.
 
 ```ts
 Request:  { chamaId: string; memberId: string; contributionId: string; amount: number }
 Response: { ok: true; status: ContributionStatus }
 ```
 
-### `applyLoan`
-Caller: any active member (self). Server computes the schedule via
-`functions/shared/loan_schedule.py::build_schedule` — the client never
-sends a schedule.
-
-```ts
-Request:  { chamaId: string; productId: string; principal: number; term: number; purpose?: string }
-Response: { loanId: string; installment: number; totalPay: number }
-Errors:   invalid-argument (principal > product.maxAmount or term > product.maxTerm)
-```
-
-### `approveLoan`
-Caller: `chair` or `treasurer`. Sets `approvals.{chair|treasurer} = true`
-on decision `'approve'`; sets `status: 'rejected'` on `'reject'`. When both
-approvals are true, status becomes `'approved'`.
-
-```ts
-Request:  { chamaId: string; loanId: string; decision: 'approve'|'reject'; note?: string }
-Response: { ok: true; status: LoanStatus }
-```
-
 ### `disburseLoanCash`
-Caller: `treasurer`. Requires `status === 'approved'`. Sets `status:
+Caller: `treasurer`/`chair`. Requires `status === 'approved'` (rules block
+a client from ever setting `status: 'active'` directly). Sets `status:
 'active'`, `disbursedOn`, `method: 'manual'`, re-bases every
 `schedule[].dueDate` off today.
 
@@ -136,18 +145,24 @@ Response: { ok: true }
 
 ### `recordCashLoanRepayment`
 Caller: finance admin. Applies payment to the next unpaid installment(s),
-spill-forward across installments same as contributions.
+spill-forward across installments same as contributions. Rules block any
+client write to `schedule[].paidAmount`, so this must be a callable.
 
 ```ts
 Request:  { chamaId: string; loanId: string; amount: number }
 Response: { ok: true; remainingOutstanding: number }
 ```
 
-### `createMgrPot`, `runMgrDraw`, `closeMgrPeriod`, `recordCashMgrPayment`
-Caller: finance admin for all four. `runMgrDraw`'s `'smart'` algorithm must
-be extracted from the attached demo HTML (search for the MGR draw
-functions) — it is not present in the WhatsApp bot, which only reads pots,
-never creates or draws them.
+### `createMgrPot`, `runMgrDraw`, `recordCashMgrPayment`, `closeMgrPeriod`, `recordMgrPayoutCash`
+Caller: finance admin for all five. The `records` and `payouts`
+subcollections are server-write-only per `firestore.rules`, so every
+meaningful MGR action goes through one of these rather than a mix of
+direct pot-document writes and callables — see
+`functions/mychama/mgr.py`'s module docstring. `recordMgrPayoutCash` was
+added beyond the original four-callable plan: `closeMgrPeriod` only
+advances the period and reports whether a round just completed (with the
+computed recipients and per-head share); actually paying out is a
+deliberate, separate confirmation step.
 
 ```ts
 createMgrPot:
@@ -160,14 +175,34 @@ runMgrDraw:
   Request:  { chamaId: string; potId: string; method: 'smart'|'random' }
   Response: { queue: string[] }
 
+recordCashMgrPayment:
+  Request:  { chamaId: string; potId: string; memberId: string; amount?: number }
+  Response: { ok: true }
+
 closeMgrPeriod:
   Request:  { chamaId: string; potId: string }
-  Response: { ok: true; nextPeriod: number }
+  Response: { ok: true; roundComplete: false; nextPeriod: number }
+          | { ok: true; roundComplete: true; payoutPending: true;
+              recipients: string[]; shareEach: number;
+              poolExpected: number; poolShortfall: number }
 
-recordCashMgrPayment:
-  Request:  { chamaId: string; potId: string; recordId: string; amount: number }
-  Response: { ok: true }
+recordMgrPayoutCash:
+  Request:  { chamaId: string; potId: string }
+  Response: { ok: true; paidTo: string[]; amountEach: number }
 ```
+
+The smart-draw algorithm (late-score decay, stable-sort-after-shuffle) and
+the pool/round math live in `functions/shared/mgr_engine.py`, mirrored
+read-only in `src/lib/mgrEngine.ts` for UI display figures ("late score",
+"recent reliability").
+
+### Scheduled functions (no callable, run on a cron)
+- `open_contribution_cycles` — daily at 00:05 Africa/Nairobi; opens each
+  active chama's next period's `contributions` docs on its cycle's due day.
+- `sweep_overdue_contributions` — daily at 00:15; flips `pending`/`partial`
+  contributions with a past `dueDate` to `overdue`.
+- `sweep_overdue_loans` — daily at 00:20; flips `active` loans whose next
+  unpaid installment's `dueDate` has passed to `overdue`.
 
 ---
 

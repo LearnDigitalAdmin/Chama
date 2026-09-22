@@ -38,6 +38,7 @@ export const paths = {
   smsTopup: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.SMS_TOPUPS}/${reference}`,
 
   planBilling: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.PLAN_BILLING}`,
+  planBillingDoc: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.PLAN_BILLING}/${reference}`,
   minutes: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MINUTES}`,
   settlements: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.SETTLEMENTS}`,
   settlementAccountRequests: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.SETTLEMENT_ACCOUNT_REQUESTS}`,

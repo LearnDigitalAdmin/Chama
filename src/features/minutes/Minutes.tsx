@@ -10,12 +10,17 @@ import { db } from '../../lib/firebase';
 import { paths } from '../../lib/firestorePaths';
 import { useChama } from '../../app/ChamaProvider';
 import { todayISO } from '../../lib/dates';
+import { generateStatement } from '../../lib/callables';
+import { describeCallError } from '../../lib/errorMessages';
+import { PLANS } from '../../lib/constants';
 import type { Minute } from '../../lib/types';
 
 export default function Minutes() {
-  const { chamaId, membership } = useChama();
+  const { chama, chamaId, membership } = useChama();
   const [minutes, setMinutes] = useState<Minute[]>([]);
   const [showForm, setShowForm] = useState(false);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!chamaId) return;
@@ -33,7 +38,22 @@ export default function Minutes() {
     await deleteDoc(doc(db, `${paths.minutes(chamaId)}/${id}`));
   }
 
+  async function exportPdf(id: string) {
+    if (!chamaId) return;
+    setExportingId(id);
+    setExportError(null);
+    try {
+      const res = await generateStatement({ chamaId, minutesId: id, format: 'pdf' });
+      window.open(res.url, '_blank');
+    } catch (e) {
+      setExportError(describeCallError(e).message);
+    } finally {
+      setExportingId(null);
+    }
+  }
+
   const canWrite = membership?.role === 'chair' || membership?.role === 'secretary';
+  const exportsAllowed = chama ? PLANS[chama.plan].exportsAllowed : false;
 
   return (
     <div className="space-y-5">
@@ -84,9 +104,15 @@ export default function Minutes() {
                 Delete
               </button>
             )}
+            {exportsAllowed && (
+              <button className="text-sm font-semibold text-forest-700 mt-3 ml-4" onClick={() => exportPdf(m.id)} disabled={exportingId === m.id}>
+                {exportingId === m.id ? 'Exporting…' : 'Export PDF'}
+              </button>
+            )}
           </div>
         ))}
         {!minutes.length && <p className="text-forest-900/50">No minutes recorded yet.</p>}
+        {exportError && <p className="text-sm text-brick-500 font-medium">{exportError}</p>}
       </div>
     </div>
   );

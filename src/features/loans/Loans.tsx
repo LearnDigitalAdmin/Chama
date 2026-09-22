@@ -20,6 +20,7 @@ import { todayISO } from '../../lib/dates';
 import { disburseLoanCash, recordCashLoanRepayment } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import type { Loan, LoanProduct } from '../../lib/types';
+import MyLoans from './MyLoans';
 
 const STATUS_CHIP: Record<string, string> = {
   pending_approval: 'bg-gold-50 text-gold-700',
@@ -33,6 +34,11 @@ const STATUS_CHIP: Record<string, string> = {
 
 export default function Loans() {
   const { chamaId, membership, isFinanceAdmin } = useChama();
+  if (membership?.role === 'member') return <MyLoans />;
+  return <AdminLoans chamaId={chamaId} membership={membership} isFinanceAdmin={isFinanceAdmin} />;
+}
+
+function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string | null; membership: ReturnType<typeof useChama>['membership']; isFinanceAdmin: boolean }) {
   const [loans, setLoans] = useState<Loan[]>([]);
   const [products, setProducts] = useState<Record<string, LoanProduct>>({});
   const { members } = useMembers(chamaId, false);
@@ -131,7 +137,7 @@ export default function Loans() {
   );
 }
 
-function ApplyLoanForm({
+export function ApplyLoanForm({
   chamaId,
   memberId,
   products,

@@ -56,3 +56,11 @@ from mychama.sms import (  # noqa: E402,F401
     purchaseSmsCredits,
     run_sms_schedules,
 )
+
+# --- Phase 4: Billing, Reports & Exports -----------------------------------
+from mychama.billing import (  # noqa: E402,F401
+    upgradePlan,
+    generateStatement,
+    sweep_plan_expiry,
+    reset_monthly_export_quota,
+)

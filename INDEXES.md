@@ -34,6 +34,13 @@
   - Settlement run: unsettled money-in, oldest first.
 - **`transactions`** (collection) — memberId ascending, type ascending, date descending
   - Reconciliation: a member's transactions by type over time.
+- **`transactions`** (collection) — memberId ascending, date ascending
+  - Phase 4: `generateStatement`'s member-scoped date-range query
+    (`where(memberId==X).where(date>=from).where(date<=to)`). Ascending
+    (not the existing memberId+date DESC index) because this is a plain
+    range read with no need for reverse-chronological ordering, and an
+    explicit ascending index avoids relying on Firestore serving a range
+    scan off a descending-declared index.
 - **`mgrPots`** (collection) — memberIds array-contains, status ascending
   - Bot: the pots a member belongs to that are collectable.
 - **`mgrPots`** (collection) — status ascending, createdOn descending

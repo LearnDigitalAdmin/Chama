@@ -232,7 +232,7 @@ export const sendSmsCampaign = callable<
 >('sendSmsCampaign', (r) => `Send SMS to ${r.audience}`);
 
 // ---------------------------------------------------------------------------
-// Phase 4 — Billing, reports & exports (not yet implemented server-side)
+// Phase 4 — Billing, reports & exports
 // ---------------------------------------------------------------------------
 
 /** Not queueable: live payment (non-free plans) or an immediate plan change the UI reflects right away. */
@@ -241,8 +241,14 @@ export const upgradePlan = liveCallable<
   { reference: string } | { ok: true }
 >('upgradePlan', 'Changing plan');
 
-/** Not queueable: generates and returns a document URL live. */
+/**
+ * Not queueable: generates and returns a document URL live.
+ * Either a date-ranged statement (from/to/format, memberId optional for a
+ * whole-chama statement) OR — a small, documented addition beyond the
+ * original contract, see TOUCH_BASE.md "Billing & statements" — a single
+ * minutes entry's PDF via minutesId, which ignores from/to/memberId.
+ */
 export const generateStatement = liveCallable<
-  { chamaId: string; memberId?: string; from: string; to: string; format: 'pdf' | 'csv' },
+  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string },
   { url: string }
 >('generateStatement', 'Generating statement');

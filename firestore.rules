@@ -106,12 +106,17 @@ service cloud.firestore {
       // membership; a bare client create would leave an orphaned group.
       allow create: if false;
 
-      // Officials may edit presentation and contribution defaults. Plan,
-      // billing, settlement routing and SMS credits are server-owned: letting a
-      // client move settlementSplitCode would redirect the chama's money.
+      // Officials may edit presentation and contribution defaults, PLUS
+      // (Phase 4) autoRenew — a benign self-service toggle that moves no
+      // money and changes no billing outcome by itself (the scheduled
+      // sweep only ever reminds or downgrades; it never auto-charges).
+      // Plan, billing, settlement routing and SMS credits stay server-owned:
+      // letting a client move settlementSplitCode would redirect the
+      // chama's money, and letting it set `plan` directly would grant paid
+      // features without a completed payment.
       allow update: if isFinanceAdmin(chamaId)
                     && untouched([
-                         'plan', 'planExpiry', 'autoRenew',
+                         'plan', 'planExpiry',
                          'settlementAccount', 'settlementSplitCode',
                          'autoSettle', 'settlementFreq', 'lastSettlement',
                          'smsCredits', 'minutesExportsUsedThisMonth',
@@ -147,6 +152,18 @@ service cloud.firestore {
                         // A member maintains their own contact details only.
                         isSelf(chamaId, memberId)
                         && onlyChanged(['phone', 'phoneNormalized', 'whatsappOptIn', 'avatarColor', 'updatedAt'])
+                      ) || (
+                        // Phase 4 — self-service "leave this chama" (Profile
+                        // screen). Deliberately narrow: a member may only
+                        // move THEMSELF from active to inactive, never the
+                        // reverse (self-reinstatement) and never any other
+                        // member — re-activating requires an admin, since
+                        // the server can't tell "left voluntarily" apart
+                        // from "removed for cause" once status is inactive.
+                        isSelf(chamaId, memberId)
+                        && onlyChanged(['status', 'updatedAt'])
+                        && resource.data.status == 'active'
+                        && request.resource.data.status == 'inactive'
                       );
 
         // Members are deactivated, never deleted — their ledger history must
@@ -299,6 +316,14 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      // smsTopUps — server-written (purchaseSmsCredits), settled by the PAY
+      // repo's webhook. Same trust model as paymentIntents; read access is
+      // finance-admin-only since a top-up isn't tied to one member.
+      match /smsTopUps/{reference} {
+        allow read: if isFinanceAdmin(chamaId);
+        allow write: if false;
+      }
+
       // -------------------------------------------------------------- //
       // minutes — the secretary's record
       // -------------------------------------------------------------- //
@@ -349,7 +374,12 @@ service cloud.firestore {
       // -------------------------------------------------------------- //
 
       match /smsLog/{smsId} {
-        allow read: if isOfficial(chamaId);
+        // Phase 4: every active member can read the chama's SMS log — this
+        // IS the Messages screen's data source (a member sees messages
+        // addressed to them by checking recipientIds client-side). Chama
+        // announcements are not officials-only information; the smsRate/
+        // credits spend behind them already is (see the chama doc itself).
+        allow read: if isMember(chamaId);
         allow write: if false; // written by the SMS dispatch function
       }
 
@@ -359,6 +389,31 @@ service cloud.firestore {
                               && request.resource.data.status in ['active', 'paused']
                               && request.resource.data.body.size() <= 480;
         allow delete: if isOfficial(chamaId);
+      }
+
+      // -------------------------------------------------------------- //
+      // planBilling — Phase 4. Pending/settled plan-payment records,
+      // written by upgradePlan and settled by the PAY repo's webhook.
+      // Same shape/trust model as paymentIntents, but there's no
+      // per-member "own" case — a plan payment belongs to the chama, so
+      // only finance admins (who alone can see the Billing screen's
+      // history) may read it.
+      // -------------------------------------------------------------- //
+
+      match /planBilling/{reference} {
+        allow read: if isFinanceAdmin(chamaId);
+        allow write: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // invites — server-only (addMember/addAdmin create, claimInvite
+      // reads/settles). Made explicit here rather than left to the
+      // default-deny fallthrough, so the intent is documented, not just
+      // incidental.
+      // -------------------------------------------------------------- //
+
+      match /invites/{inviteId} {
+        allow read, write: if false;
       }
     }
 

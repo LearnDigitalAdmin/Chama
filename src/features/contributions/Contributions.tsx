@@ -8,6 +8,7 @@ import { recordCashContribution } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
 import type { Contribution } from '../../lib/types';
+import MyContributions from './MyContributions';
 
 const STATUS_CHIP: Record<string, string> = {
   paid: 'bg-forest-50 text-forest-700',
@@ -17,7 +18,12 @@ const STATUS_CHIP: Record<string, string> = {
 };
 
 export default function Contributions() {
-  const { chamaId, isFinanceAdmin } = useChama();
+  const { chamaId, isFinanceAdmin, membership } = useChama();
+  if (membership?.role === 'member') return <MyContributions />;
+  return <AdminContributions chamaId={chamaId} isFinanceAdmin={isFinanceAdmin} />;
+}
+
+function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | null; isFinanceAdmin: boolean }) {
   const [contributions, setContributions] = useState<Contribution[]>([]);
   const { members } = useMembers(chamaId, false);
   const [periodKey, setPeriodKey] = useState<string | null>(null);

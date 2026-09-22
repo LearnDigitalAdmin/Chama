@@ -311,3 +311,35 @@ export interface SettlementAccountRequest {
   createdAt?: number;
   updatedAt?: number;
 }
+
+/** APP-ONLY, Phase 4. chamas/{chamaId}/smsLog/{id} — one campaign send. The
+ * Messages screen (member) filters this by recipientIds to build an inbox;
+ * it also doubles as an in-app fallback if the SMS itself failed to land. */
+export interface SmsLogEntry {
+  id: string;
+  audience: 'all' | 'overdue' | 'custom';
+  message: string;
+  recipientIds: string[];
+  recipientCount: number;
+  sentCount: number;
+  creditsUsed: number;
+  sentBy: string;
+  createdAt: number;
+}
+
+/** APP-ONLY, Phase 4. chamas/{chamaId}/planBilling/{reference} — a plan
+ * payment, pending until the PAY repo's webhook settles it (mirrors
+ * PaymentIntent/smsTopUps exactly — see functions/mychama/billing.py). */
+export interface PlanBillingRecord {
+  id: string;
+  chamaId: string;
+  fromPlan: ChamaPlan;
+  toPlan: ChamaPlan;
+  amountKes: number;
+  phone: string;
+  status: 'pending' | 'success' | 'failed';
+  requestedBy: string;
+  createdAt: number;
+  updatedAt?: number;
+  expiresAt: number;
+}

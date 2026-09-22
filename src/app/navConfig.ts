@@ -1,9 +1,9 @@
 /**
  * Mirrors the demo's `NAV`, `BOTTOM_NAV`, and `can()` objects exactly (see
  * MyChama_3_1.html's buildNav()/can() functions) so the app's navigation
- * looks and behaves identically per role. Routes not yet built (Phase 4:
- * reports, billing, settings, and the member-only views) point at
- * <ComingSoon> rather than a missing route.
+ * looks and behaves identically per role. All routes below are wired to
+ * real screens as of Phase 4 — src/app/ComingSoon.tsx is now unused but
+ * left in place as the pattern for any future not-yet-built route.
  */
 
 import type { MemberRole } from '../lib/types';

@@ -112,6 +112,11 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
     db.collection(paths.sms_log(chama_id)).document().set({
         "audience": audience,
         "message": message,
+        # The member IDs this campaign was addressed to (regardless of
+        # individual SMS delivery success) — this is what the in-app
+        # Messages inbox (Phase 4) filters on, so a member sees a message
+        # here even if their SMS itself failed to deliver.
+        "recipientIds": [m["id"] for m in recipients],
         "recipientCount": len(recipients),
         "sentCount": sent,
         "creditsUsed": actual_cost,
@@ -247,6 +252,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
             db.collection(paths.sms_log(chama_id)).document().set({
                 "audience": sched.get("audience", "all"),
                 "message": sched["message"],
+                "recipientIds": [m["id"] for m in recipients],
                 "recipientCount": len(recipients),
                 "sentCount": sent,
                 "creditsUsed": actual_cost,
