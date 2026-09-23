@@ -6,7 +6,7 @@ import { useChama } from '../../app/ChamaProvider';
 import { initiatePayment } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { kes, loanRepaymentFees } from '../../lib/money';
-import { loanOutstanding, nextUnpaidInstallment } from '../../lib/loanSchedule';
+import { loanOutstanding, loanStatusLabel, nextUnpaidInstallment } from '../../lib/loanSchedule';
 import { PLANS } from '../../lib/constants';
 import { ApplyLoanForm } from './Loans';
 import type { Loan, LoanProduct } from '../../lib/types';
@@ -29,6 +29,20 @@ const STATUS_LABEL: Record<string, string> = {
   completed: 'Completed',
   rejected: 'Rejected',
 };
+
+// pending_approval and awaiting_treasurer are stored generically ("one
+// approver has gone, one hasn't") — the fixed map above only ever labels
+// them as if chair goes first and treasurer is always the one still
+// pending, which is wrong whenever the treasurer actually approved first.
+// This derives the honest label from `approvals` for those two statuses
+// and falls back to the fixed map for everything else.
+function pendingLoanLabel(loan: Loan): string {
+  if (loan.status !== 'pending_approval' && loan.status !== 'awaiting_treasurer') {
+    return STATUS_LABEL[loan.status];
+  }
+  const label = loanStatusLabel(loan);
+  return label.charAt(0).toUpperCase() + label.slice(1) + ' approval';
+}
 
 export default function MyLoans() {
   const { chama, chamaId, chamaReady, membership } = useChama();
@@ -104,7 +118,7 @@ export default function MyLoans() {
         <div className="card p-6">
           <p className="text-xs font-semibold text-forest-900/50">{products[pendingLoan.productId]?.name ?? 'Loan'}</p>
           <p className="font-display text-2xl font-semibold mt-1">{kes(pendingLoan.principal)} requested</p>
-          <span className={`chip mt-2 inline-block ${STATUS_CHIP[pendingLoan.status]}`}>{STATUS_LABEL[pendingLoan.status]}</span>
+          <span className={`chip mt-2 inline-block ${STATUS_CHIP[pendingLoan.status]}`}>{pendingLoanLabel(pendingLoan)}</span>
         </div>
       ) : (
         <div className="card p-6 text-center">

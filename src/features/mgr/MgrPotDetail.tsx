@@ -9,6 +9,7 @@ import { closeMgrPeriod, recordCashMgrPayment, recordMgrPayoutCash, runMgrDraw }
 import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
 import { lateScore, recentReliability } from '../../lib/mgrEngine';
+import { AdminChargeButton } from '../payments/AdminChargeButton';
 import type { MgrPot, MgrRecord } from '../../lib/types';
 
 export default function MgrPotDetail() {
@@ -165,9 +166,12 @@ export default function MgrPotDetail() {
                     {isFinanceAdmin && (
                       <td className="px-4 py-3">
                         {!paidThisPeriod.has(id) && (
-                          <button onClick={() => recordPaid(id)} disabled={busy} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full">
-                            Record cash
-                          </button>
+                          <div className="flex flex-col gap-2 items-start">
+                            <button onClick={() => recordPaid(id)} disabled={busy} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full">
+                              Record cash
+                            </button>
+                            <AdminChargeButton chamaId={cid} memberId={id} amount={pot.amount} purpose="mgr_contribution" potId={pid} potPeriod={pot.period} />
+                          </div>
                         )}
                       </td>
                     )}

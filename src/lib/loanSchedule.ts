@@ -96,3 +96,21 @@ export function loanPaid(loan: { schedule: LoanInstallment[] }): number {
 export function nextUnpaidInstallment(loan: { schedule: LoanInstallment[] }): LoanInstallment | null {
   return loan.schedule.find((s) => (s.due || 0) - (s.paidAmount || 0) > 0.009) ?? null;
 }
+
+/**
+ * `status: 'awaiting_treasurer'` is stored literally for "one approver has
+ * gone, the other hasn't" — regardless of which one is actually still
+ * pending (see functions/mychama/loans.py::on_loan_write). Reading that
+ * enum value as display text ("awaiting treasurer") is only correct half
+ * the time; this derives the honest label from `approvals` instead, which
+ * is what every screen showing a loan's status chip should render.
+ */
+export function loanStatusLabel(loan: { status: string; approvals: { chair: boolean; treasurer: boolean } }): string {
+  if (loan.status === 'pending_approval') return 'awaiting chair & treasurer';
+  if (loan.status === 'awaiting_treasurer') {
+    if (loan.approvals.chair && !loan.approvals.treasurer) return 'awaiting treasurer';
+    if (loan.approvals.treasurer && !loan.approvals.chair) return 'awaiting chair';
+    return 'awaiting approval';
+  }
+  return loan.status.replace(/_/g, ' ');
+}

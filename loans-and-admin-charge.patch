@@ -1,0 +1,698 @@
+diff --git a/firestore.rules b/firestore.rules
+index 7e41efb..4fb2a79 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -242,19 +242,35 @@ service cloud.firestore {
+                       && request.resource.data.term >= 1
+                       && request.resource.data.schedule.size() == request.resource.data.term;
+ 
+-        // Approval only. Chair flips chair; treasurer flips treasurer. Status
+-        // may only move within the approval stage — activation, disbursement
+-        // and repayment all belong to the server.
++        // Approval only. Chair flips chair; treasurer flips treasurer, via a
++        // dot-path update touching ONLY that one boolean — never the whole
++        // `approvals` map — so a stale local read can never overwrite the
++        // other approver's already-committed flag. `status` is NOT
++        // client-settable here at all: it's derived server-side from
++        // `approvals` by on_loan_write (functions/mychama/loans.py), which
++        // is what makes it impossible for status to desync from approvals
++        // again, from any client, online or offline.
++        //
++        // Reject is the one status transition a client still makes
++        // directly — it's unilateral (either approver alone, no shared
++        // state to race) and terminal, so there's nothing to derive.
+         allow update: if (
+                         isChair(chamaId)
+-                        && onlyChanged(['approvals', 'status', 'updatedAt'])
++                        && onlyChanged(['approvals', 'updatedAt'])
++                        && request.resource.data.approvals.chair == true
+                         && request.resource.data.approvals.treasurer == resource.data.approvals.treasurer
+-                        && request.resource.data.status in ['pending_approval', 'awaiting_treasurer', 'rejected']
++                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
+                       ) || (
+                         isTreasurer(chamaId)
+-                        && onlyChanged(['approvals', 'status', 'updatedAt'])
++                        && onlyChanged(['approvals', 'updatedAt'])
++                        && request.resource.data.approvals.treasurer == true
+                         && request.resource.data.approvals.chair == resource.data.approvals.chair
+-                        && request.resource.data.status in ['awaiting_treasurer', 'approved', 'rejected']
++                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
++                      ) || (
++                        (isChair(chamaId) || isTreasurer(chamaId))
++                        && onlyChanged(['status', 'updatedAt'])
++                        && request.resource.data.status == 'rejected'
++                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
+                       );
+ 
+         // An applicant may withdraw their own untouched application.
+diff --git a/functions/main.py b/functions/main.py
+index 5fe5f51..215477a 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -36,6 +36,7 @@ from mychama.loans import (  # noqa: E402,F401
+     disburseLoanCash,
+     recordCashLoanRepayment,
+     sweep_overdue_loans,
++    on_loan_write,
+ )
+ from mychama.mgr import (  # noqa: E402,F401
+     createMgrPot,
+diff --git a/functions/mychama/loans.py b/functions/mychama/loans.py
+index 7a32f0e..1981aaf 100644
+--- a/functions/mychama/loans.py
++++ b/functions/mychama/loans.py
+@@ -7,20 +7,34 @@ create their own 'pending_approval' loan directly (with a client-computed
+ schedule whose length must equal `term` — use
+ src/lib/loanSchedule.ts::buildSchedule so the client never freehands the
+ schedule), and let the chair/treasurer flip their own `approvals.*` flag
+-and advance `status` through a fixed small set of values directly. No
+-money moves at either step, so there's no spill-forward math to centralise
+-and the direct-write path is simpler and just as safe.
++directly via a dot-path update. No money moves at either step, so there's
++no spill-forward math to centralise and the direct-write path is simpler
++and just as safe.
++
++`status`, while a loan is still in the approval stage, is NOT settable by
++either client write above — it's derived server-side by on_loan_write
++below, purely from `approvals.chair`/`approvals.treasurer`. This used to
++be computed client-side inside the approve button's click handler, which
++meant it was only ever as fresh as whatever the approving client had
++loaded locally — a race that let one approver's stale read silently
++clobber the other's already-committed approval (see docs/ARCHITECTURE.md
++or the incident notes if this history matters to you; short version: an
++offline write computed against a stale local doc overwrote a same-loan
++approval another admin had already made online). Deriving `status`
++server-side, from the single source of truth `approvals`, makes that class
++of bug structurally impossible — there's no client read to go stale.
++`Reject` is the one client-settable status transition, because it's a
++unilateral action by either approver with no shared state to race.
+ 
+ What IS a callable, and why: `status` can never become 'active' via a
+ direct client write (disbursement), and `schedule[].paidAmount` can never
+ be touched by a direct client write at all (repayment) — see the rules
+-file's loans `update` rule, which only permits changing
+-`['approvals', 'status', 'updatedAt']`. Both of those need the server.
++file's loans `update` rule. Both of those need the server.
+ """
+ 
+ from __future__ import annotations
+ 
+-from firebase_functions import https_fn, scheduler_fn
++from firebase_functions import firestore_fn, https_fn, scheduler_fn
+ from firebase_admin import firestore
+ 
+ from shared import firestore_paths as paths
+@@ -32,11 +46,64 @@ from shared.roles import require_finance_admin
+ 
+ REGION = "africa-south1"
+ 
++# Statuses where `status` is still purely a function of `approvals` — once a
++# loan leaves this set (rejected, approved-and-disbursed, overdue,
++# completed), status becomes server-owned by disburseLoanCash /
++# recordCashLoanRepayment / sweep_overdue_loans instead, and this trigger
++# must not touch it again.
++_APPROVAL_STAGE_STATUSES = {"pending_approval", "awaiting_treasurer"}
++
+ 
+ def _db():
+     return firestore.client()
+ 
+ 
++@firestore_fn.on_document_written(
++    document=f"{paths.MC.CHAMAS}/{{chamaId}}/{MC.LOANS}/{{loanId}}",
++    region=REGION,
++)
++def on_loan_write(event: firestore_fn.Event[firestore_fn.Change]) -> None:
++    """
++    Derives `status` from `approvals.{chair,treasurer}` server-side, so it
++    can never desync from the approvals it's supposed to summarise —
++    whether that'd happen from a stale offline write racing another
++    approver (the bug that prompted this), or a manual Firestore console
++    edit (which bypasses firestore.rules and every client code path
++    entirely).
++
++    firestore.rules' loans `update` rule no longer lets a client set
++    `status` when approving (see the `loans` section) — only `approvals`
++    and `updatedAt` — so this trigger is now the *only* writer of `status`
++    while a loan is in the approval stage. It's idempotent: it only writes
++    when the computed value actually differs from what's stored, which is
++    also what stops it from re-triggering itself forever.
++    """
++    after = event.data.after
++    if after is None or not after.exists:
++        return
++
++    loan = after.to_dict()
++    status = loan.get("status")
++    if status not in _APPROVAL_STAGE_STATUSES:
++        return
++
++    approvals = loan.get("approvals") or {}
++    chair_ok = bool(approvals.get("chair"))
++    treasurer_ok = bool(approvals.get("treasurer"))
++
++    if chair_ok and treasurer_ok:
++        computed = "approved"
++    elif chair_ok or treasurer_ok:
++        computed = "awaiting_treasurer"
++    else:
++        computed = "pending_approval"
++
++    if computed == status:
++        return
++
++    after.reference.update({"status": computed, "updatedAt": now_ms()})
++
++
+ @https_fn.on_call(region=REGION)
+ def disburseLoanCash(req: https_fn.CallableRequest) -> dict:
+     uid = require_auth(req)
+diff --git a/functions/mychama/payments.py b/functions/mychama/payments.py
+index 9b92db4..c9bdbb2 100644
+--- a/functions/mychama/payments.py
++++ b/functions/mychama/payments.py
+@@ -9,6 +9,20 @@ docs/ARCHITECTURE.md §1/§4 and the PAY repo delivery notes) is what
+ actually applies the payment once Paystack confirms it; this callable only
+ ever gets the STK push started and records what was quoted to the member.
+ 
++initiatePayment also covers admin-initiated collection: pass `memberId` to
++charge a DIFFERENT member than the caller (finance-admin only). This is
++what the "Charge Paystack" action in Contributions.tsx and MgrPotDetail.tsx
++calls, via the shared src/features/payments/AdminChargeButton.tsx
++component — one callable, one fee/reference/rate-limit/idempotency path,
++usable for any purpose already in the `purpose` dispatch table below
++(currently `contribution` and `mgr_contribution` have UI wired to it;
++`loan_repayment` works identically if a UI ever wants it, with zero
++backend changes). The phone charged is always read from the target
++member's own record — never a client-supplied number — so an admin can't
++redirect someone else's STK prompt to a phone of their choosing. Self-pay
++(no `memberId`, or `memberId` equal to the caller's own) is unchanged from
++before and needs no finance-admin role.
++
+ setupSettlementAccount / requestSettlementChange / approveSettlementChange
+ create/change the Paystack subaccount + split code a chama's collections
+ settle into. Bank/paybill/till codes for Paystack Kenya's subaccount API
+@@ -209,17 +223,39 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+     chama_id = data.get("chamaId")
+     purpose = data.get("purpose")
+     amount = data.get("amount")
+-    phone = data.get("phone") or ""
++    target_member_id = data.get("memberId")
+ 
+     if not chama_id or purpose not in ("contribution", "loan_repayment", "mgr_contribution"):
+         raise bad_request("chamaId and a valid purpose are required.")
+     if not isinstance(amount, (int, float)) or amount <= 0:
+         raise bad_request("amount must be a positive number.")
+-    if not is_valid_kenyan_phone(phone):
+-        raise bad_request("A valid Kenyan phone number is required.")
+ 
+     db = _db()
+-    membership = require_membership(db, uid, chama_id)
++    caller_membership = require_membership(db, uid, chama_id)
++
++    if target_member_id and target_member_id != caller_membership.member_id:
++        # Admin-initiated charge on behalf of another member. Only a
++        # finance admin may do this, and the phone charged always comes
++        # from the target member's own record — never `data.get("phone")`
++        # — so this can't be used to push an STK prompt to an arbitrary
++        # number under someone else's name.
++        require_finance_admin(db, uid, chama_id)
++        target_snap = db.document(paths.member(chama_id, target_member_id)).get()
++        if not target_snap.exists:
++            raise not_found("Member not found.")
++        target_member = target_snap.to_dict()
++        if target_member.get("status") != "active":
++            raise precondition("This member isn't active.")
++        member_id = target_member_id
++        phone = target_member.get("phone") or ""
++        initiated_by = {"uid": uid, "memberId": caller_membership.member_id, "role": caller_membership.role}
++    else:
++        member_id = caller_membership.member_id
++        phone = data.get("phone") or ""
++        initiated_by = None
++
++    if not is_valid_kenyan_phone(phone):
++        raise bad_request("A valid Kenyan phone number is required.")
+ 
+     chama_snap = db.document(paths.chama(chama_id)).get()
+     if not chama_snap.exists:
+@@ -232,11 +268,15 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+     if not chama.get("settlementSplitCode"):
+         raise precondition("This chama hasn't set up a settlement account yet — ask the chair to set one up first.")
+ 
+-    # Rate limit: MAX_INTENTS_PER_HOUR per member, mirrors the bot's guard.
++    # Rate limit: MAX_INTENTS_PER_HOUR, keyed on whoever is actually being
++    # charged (member_id) — not the caller — so an admin working down a
++    # list of members doesn't share one bucket with everyone's self-pay
++    # attempts, but also can't bypass a given member's own limit by being
++    # the one to trigger it.
+     one_hour_ago = now_ms() - 60 * 60 * 1000
+     recent = list(
+         db.collection(paths.payment_intents(chama_id))
+-        .where("memberId", "==", membership.member_id)
++        .where("memberId", "==", member_id)
+         .where("createdAt", ">=", one_hour_ago)
+         .stream()
+     )
+@@ -260,7 +300,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+ 
+     intent = {
+         "chamaId": chama_id,
+-        "memberId": membership.member_id,
++        "memberId": member_id,
+         "purpose": purpose,
+         "reference": reference,
+         "amount": fee_calc["net"],
+@@ -272,6 +312,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+         "provider": provider,
+         "status": "pending",
+         "channel": "app",
++        "initiatedBy": initiated_by,
+         "contributionId": data.get("contributionId"),
+         "loanId": data.get("loanId"),
+         "installmentNo": data.get("installmentNo"),
+@@ -287,7 +328,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+     try:
+         paystack_resp = paystack.charge_mobile_money(
+             secret_key=PAYSTACK_SECRET_KEY.value,
+-            email=f"{membership.member_id}@mychama.app",
++            email=f"{member_id}@mychama.app",
+             amount_kes=fee_calc["gross"],
+             phone_e164=normalized_phone,
+             provider=provider,
+@@ -296,7 +337,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+                 "chargeType": "mychama_payment",
+                 "targetProject": "mychama1",
+                 "chamaId": chama_id,
+-                "memberId": membership.member_id,
++                "memberId": member_id,
+                 "purpose": purpose,
+                 "splitCode": chama["settlementSplitCode"],
+             },
+diff --git a/src/features/contributions/Contributions.tsx b/src/features/contributions/Contributions.tsx
+index d6efb05..47312cb 100644
+--- a/src/features/contributions/Contributions.tsx
++++ b/src/features/contributions/Contributions.tsx
+@@ -7,6 +7,7 @@ import { useMembers, memberName } from '../../app/useMembers';
+ import { recordCashContribution } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
++import { AdminChargeButton } from '../payments/AdminChargeButton';
+ import type { Contribution } from '../../lib/types';
+ import MyContributions from './MyContributions';
+ 
+@@ -110,7 +111,7 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
+               <th className="px-4 py-3 font-medium">Member</th>
+               <th className="px-4 py-3 font-medium">Amount</th>
+               <th className="px-4 py-3 font-medium">Status</th>
+-              {isFinanceAdmin && <th className="px-4 py-3 font-medium">Record cash</th>}
++              {isFinanceAdmin && <th className="px-4 py-3 font-medium">Collect</th>}
+             </tr>
+           </thead>
+           <tbody>
+@@ -124,22 +125,33 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
+                 {isFinanceAdmin && (
+                   <td className="px-4 py-3">
+                     {c.status !== 'paid' && (
+-                      <div className="flex gap-2">
+-                        <input
+-                          type="number"
+-                          placeholder={String(c.amount - c.paidAmount)}
+-                          value={amounts[c.id] ?? ''}
+-                          onChange={(e) => setAmounts((prev) => ({ ...prev, [c.id]: e.target.value }))}
+-                          className="w-24 px-2 py-1.5 rounded-lg border border-forest-100 text-sm"
+-                          disabled={busyId === c.id}
+-                        />
+-                        <button
+-                          onClick={() => record(c)}
+-                          disabled={busyId === c.id}
+-                          className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full"
+-                        >
+-                          {busyId === c.id ? '…' : 'Record'}
+-                        </button>
++                      <div className="flex flex-col gap-2">
++                        <div className="flex gap-2">
++                          <input
++                            type="number"
++                            placeholder={String(c.amount - c.paidAmount)}
++                            value={amounts[c.id] ?? ''}
++                            onChange={(e) => setAmounts((prev) => ({ ...prev, [c.id]: e.target.value }))}
++                            className="w-24 px-2 py-1.5 rounded-lg border border-forest-100 text-sm"
++                            disabled={busyId === c.id}
++                          />
++                          <button
++                            onClick={() => record(c)}
++                            disabled={busyId === c.id}
++                            className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full"
++                          >
++                            {busyId === c.id ? '…' : 'Record cash'}
++                          </button>
++                        </div>
++                        {chamaId && (
++                          <AdminChargeButton
++                            chamaId={chamaId}
++                            memberId={c.memberId}
++                            amount={c.amount - c.paidAmount}
++                            purpose="contribution"
++                            contributionId={c.id}
++                          />
++                        )}
+                       </div>
+                     )}
+                   </td>
+diff --git a/src/features/loans/Loans.tsx b/src/features/loans/Loans.tsx
+index ada4cc4..da530f2 100644
+--- a/src/features/loans/Loans.tsx
++++ b/src/features/loans/Loans.tsx
+@@ -2,9 +2,11 @@
+  * Loan APPLICATION and APPROVAL below are direct Firestore writes, per
+  * firestore.rules — see functions/mychama/loans.py's module docstring.
+  * They work offline for free via Firestore's persistent local cache.
+- * Disbursement and repayment call the server (offline-queued) because
+- * rules block clients from ever setting status:'active' or touching
+- * schedule[].paidAmount directly.
++ * Approval writes touch ONLY the one approver's boolean, via a dot-path
++ * update, never the whole `approvals` map — status is derived server-side
++ * by on_loan_write, never computed here. Disbursement and repayment call
++ * the server (offline-queued) because rules block clients from ever
++ * setting status:'active' or touching schedule[].paidAmount directly.
+  */
+ 
+ import { useEffect, useState } from 'react';
+@@ -14,7 +16,7 @@ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers, memberName } from '../../app/useMembers';
+-import { buildSchedule, loanOutstanding, nextUnpaidInstallment } from '../../lib/loanSchedule';
++import { buildSchedule, loanOutstanding, loanStatusLabel, nextUnpaidInstallment } from '../../lib/loanSchedule';
+ import { kes } from '../../lib/money';
+ import { todayISO } from '../../lib/dates';
+ import { disburseLoanCash, recordCashLoanRepayment } from '../../lib/callables';
+@@ -43,7 +45,8 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
+   const [products, setProducts] = useState<Record<string, LoanProduct>>({});
+   const { members } = useMembers(chamaId, false);
+   const [showApply, setShowApply] = useState(false);
+-  const [selected, setSelected] = useState<Loan | null>(null);
++  const [selectedId, setSelectedId] = useState<string | null>(null);
++  const selected = selectedId ? (loans.find((l) => l.id === selectedId) ?? null) : null;
+ 
+   useEffect(() => {
+     if (!chamaId) return;
+@@ -70,7 +73,7 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
+         membership={membership}
+         isFinanceAdmin={isFinanceAdmin}
+         memberLabel={memberName(members, selected.memberId)}
+-        onBack={() => setSelected(null)}
++        onBack={() => setSelectedId(null)}
+       />
+     );
+   }
+@@ -113,12 +116,12 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
+           </thead>
+           <tbody>
+             {loans.map((l) => (
+-              <tr key={l.id} className="border-b border-forest-50 last:border-0 cursor-pointer hover:bg-forest-50/40" onClick={() => setSelected(l)}>
++              <tr key={l.id} className="border-b border-forest-50 last:border-0 cursor-pointer hover:bg-forest-50/40" onClick={() => setSelectedId(l.id)}>
+                 <td className="px-4 py-3 font-medium">{memberName(members, l.memberId)}</td>
+                 <td className="px-4 py-3 text-forest-900/70">{products[l.productId]?.name ?? '—'}</td>
+                 <td className="px-4 py-3 num">{kes(l.principal)}</td>
+                 <td className="px-4 py-3">
+-                  <span className={`chip ${STATUS_CHIP[l.status]}`}>{l.status.replace(/_/g, ' ')}</span>
++                  <span className={`chip ${STATUS_CHIP[l.status]}`}>{loanStatusLabel(l)}</span>
+                 </td>
+                 <td className="px-4 py-3 num">{l.status === 'completed' ? 'Paid off' : kes(loanOutstanding(l))}</td>
+               </tr>
+@@ -275,11 +278,15 @@ function LoanDetail({
+       if (decision === 'reject') {
+         await updateDoc(loanRef, { status: 'rejected', updatedAt: Date.now() });
+       } else if (membership?.role === 'chair') {
+-        const newStatus = loan.approvals.treasurer ? 'approved' : 'awaiting_treasurer';
+-        await updateDoc(loanRef, { approvals: { ...loan.approvals, chair: true }, status: newStatus, updatedAt: Date.now() });
++        // Dot-path: touches ONLY approvals.chair. Never spread the whole
++        // approvals map here — that's what let a stale local read
++        // overwrite the treasurer's already-committed flag (see
++        // functions/mychama/loans.py's module docstring for the incident
++        // this fixes). Status is not written here at all — on_loan_write
++        // derives it from approvals server-side.
++        await updateDoc(loanRef, { 'approvals.chair': true, updatedAt: Date.now() });
+       } else if (membership?.role === 'treasurer') {
+-        const newStatus = loan.approvals.chair ? 'approved' : 'awaiting_treasurer';
+-        await updateDoc(loanRef, { approvals: { ...loan.approvals, treasurer: true }, status: newStatus, updatedAt: Date.now() });
++        await updateDoc(loanRef, { 'approvals.treasurer': true, updatedAt: Date.now() });
+       }
+     } catch {
+       setError('Could not record the approval.');
+@@ -331,7 +338,7 @@ function LoanDetail({
+         <h1 className="font-display text-2xl font-semibold text-ink">{memberLabel}</h1>
+         <p className="text-sm text-forest-900/60 mt-1">
+           {product?.name} · {kes(loan.principal)} · {loan.term} months ·{' '}
+-          <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loan.status.replace(/_/g, ' ')}</span>
++          <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loanStatusLabel(loan)}</span>
+         </p>
+       </div>
+ 
+diff --git a/src/features/loans/MyLoans.tsx b/src/features/loans/MyLoans.tsx
+index c36d90d..9ac7ebc 100644
+--- a/src/features/loans/MyLoans.tsx
++++ b/src/features/loans/MyLoans.tsx
+@@ -6,7 +6,7 @@ import { useChama } from '../../app/ChamaProvider';
+ import { initiatePayment } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes, loanRepaymentFees } from '../../lib/money';
+-import { loanOutstanding, nextUnpaidInstallment } from '../../lib/loanSchedule';
++import { loanOutstanding, loanStatusLabel, nextUnpaidInstallment } from '../../lib/loanSchedule';
+ import { PLANS } from '../../lib/constants';
+ import { ApplyLoanForm } from './Loans';
+ import type { Loan, LoanProduct } from '../../lib/types';
+@@ -30,6 +30,20 @@ const STATUS_LABEL: Record<string, string> = {
+   rejected: 'Rejected',
+ };
+ 
++// pending_approval and awaiting_treasurer are stored generically ("one
++// approver has gone, one hasn't") — the fixed map above only ever labels
++// them as if chair goes first and treasurer is always the one still
++// pending, which is wrong whenever the treasurer actually approved first.
++// This derives the honest label from `approvals` for those two statuses
++// and falls back to the fixed map for everything else.
++function pendingLoanLabel(loan: Loan): string {
++  if (loan.status !== 'pending_approval' && loan.status !== 'awaiting_treasurer') {
++    return STATUS_LABEL[loan.status];
++  }
++  const label = loanStatusLabel(loan);
++  return label.charAt(0).toUpperCase() + label.slice(1) + ' approval';
++}
++
+ export default function MyLoans() {
+   const { chama, chamaId, chamaReady, membership } = useChama();
+   const [loans, setLoans] = useState<Loan[]>([]);
+@@ -104,7 +118,7 @@ export default function MyLoans() {
+         <div className="card p-6">
+           <p className="text-xs font-semibold text-forest-900/50">{products[pendingLoan.productId]?.name ?? 'Loan'}</p>
+           <p className="font-display text-2xl font-semibold mt-1">{kes(pendingLoan.principal)} requested</p>
+-          <span className={`chip mt-2 inline-block ${STATUS_CHIP[pendingLoan.status]}`}>{STATUS_LABEL[pendingLoan.status]}</span>
++          <span className={`chip mt-2 inline-block ${STATUS_CHIP[pendingLoan.status]}`}>{pendingLoanLabel(pendingLoan)}</span>
+         </div>
+       ) : (
+         <div className="card p-6 text-center">
+diff --git a/src/features/mgr/MgrPotDetail.tsx b/src/features/mgr/MgrPotDetail.tsx
+index 75e9f90..8727b73 100644
+--- a/src/features/mgr/MgrPotDetail.tsx
++++ b/src/features/mgr/MgrPotDetail.tsx
+@@ -9,6 +9,7 @@ import { closeMgrPeriod, recordCashMgrPayment, recordMgrPayoutCash, runMgrDraw }
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
+ import { lateScore, recentReliability } from '../../lib/mgrEngine';
++import { AdminChargeButton } from '../payments/AdminChargeButton';
+ import type { MgrPot, MgrRecord } from '../../lib/types';
+ 
+ export default function MgrPotDetail() {
+@@ -165,9 +166,12 @@ export default function MgrPotDetail() {
+                     {isFinanceAdmin && (
+                       <td className="px-4 py-3">
+                         {!paidThisPeriod.has(id) && (
+-                          <button onClick={() => recordPaid(id)} disabled={busy} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full">
+-                            Record cash
+-                          </button>
++                          <div className="flex flex-col gap-2 items-start">
++                            <button onClick={() => recordPaid(id)} disabled={busy} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full">
++                              Record cash
++                            </button>
++                            <AdminChargeButton chamaId={cid} memberId={id} amount={pot.amount} purpose="mgr_contribution" potId={pid} potPeriod={pot.period} />
++                          </div>
+                         )}
+                       </td>
+                     )}
+diff --git a/src/features/payments/AdminChargeButton.tsx b/src/features/payments/AdminChargeButton.tsx
+new file mode 100644
+index 0000000..c5e0027
+--- /dev/null
++++ b/src/features/payments/AdminChargeButton.tsx
+@@ -0,0 +1,104 @@
++/**
++ * Shared "Charge Paystack" action for a finance admin collecting on a
++ * member's behalf. One component, one backend path
++ * (initiatePayment({ memberId, ... }) — see functions/mychama/payments.py),
++ * so any purpose already in that callable's dispatch table plugs in here
++ * by passing a different `purpose` + matching id fields, no new backend
++ * work required. Used today by:
++ *   - src/features/contributions/Contributions.tsx  (purpose: 'contribution')
++ *   - src/features/mgr/MgrPotDetail.tsx              (purpose: 'mgr_contribution')
++ *
++ * The phone charged always comes from the member's own record, resolved
++ * server-side — this component never collects or sends a phone number.
++ */
++
++import { useState } from 'react';
++import { useChama } from '../../app/ChamaProvider';
++import { PLANS } from '../../lib/constants';
++import { initiatePayment } from '../../lib/callables';
++import { describeCallError } from '../../lib/errorMessages';
++
++type AdminChargePurpose = 'contribution' | 'mgr_contribution';
++
++export function AdminChargeButton({
++  chamaId,
++  memberId,
++  amount,
++  purpose,
++  contributionId,
++  potId,
++  potPeriod,
++  label = 'Charge Paystack',
++  onCharged,
++}: {
++  chamaId: string;
++  memberId: string;
++  /** Net amount the member owes for this purpose — same figure "Record cash" would take. */
++  amount: number;
++  purpose: AdminChargePurpose;
++  contributionId?: string;
++  potId?: string;
++  potPeriod?: number;
++  label?: string;
++  onCharged?: (result: { reference: string }) => void;
++}) {
++  const { chama } = useChama();
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
++  const [sent, setSent] = useState(false);
++
++  const planAllowsOnline = chama ? PLANS[chama.plan].onlineCollection : false;
++  const hasSettlement = !!chama?.settlementSplitCode;
++
++  if (!planAllowsOnline) {
++    return (
++      <p className="text-xs text-forest-900/50">
++        {chama?.plan === 'free' ? "Paystack needs a paid plan — record cash, or upgrade to collect online." : "Paystack isn't available on this plan."}
++      </p>
++    );
++  }
++  if (!hasSettlement) {
++    return <p className="text-xs text-forest-900/50">Ask the chair to set up a settlement account (in Payments) to collect via Paystack.</p>;
++  }
++  if (sent) {
++    return <span className="text-xs text-forest-700 font-medium">STK prompt sent — waiting for confirmation</span>;
++  }
++
++  async function charge() {
++    if (!(amount > 0)) return;
++    setError(null);
++    setBusy(true);
++    try {
++      const res = await initiatePayment({ chamaId, purpose, amount, memberId, contributionId, potId, potPeriod });
++      setSent(true);
++      onCharged?.(res);
++    } catch (e) {
++      const { message, isQueued } = describeCallError(e);
++      if (isQueued) {
++        // A live Paystack call can't be meaningfully queued offline — if
++        // this happens, describeCallError is telling us the SDK queued the
++        // write anyway; surface it but don't claim an STK prompt went out.
++        setQueuedMsg(message);
++      } else {
++        setError(message);
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="flex flex-col gap-1">
++      <button
++        onClick={charge}
++        disabled={busy || !(amount > 0)}
++        className="border border-forest-200 hover:bg-forest-50 text-xs font-semibold px-3 py-1.5 rounded-full disabled:opacity-50"
++      >
++        {busy ? 'Sending…' : label}
++      </button>
++      {error && <p className="text-xs text-brick-500 font-medium">{error}</p>}
++      {queuedMsg && <p className="text-xs text-gold-700 font-medium">{queuedMsg}</p>}
++    </div>
++  );
++}
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 4a0f125..19fcb7f 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -222,16 +222,31 @@ export const approveSettlementChange = callable<
+   { ok: true }
+ >('approveSettlementChange', () => 'Approve settlement account change');
+ 
+-/** Not queueable: triggers a live Paystack STK push to the member's phone right now. */
++/**
++ * Not queueable: triggers a live Paystack STK push right now.
++ *
++ * Self-pay (default): omit `memberId`; `phone` is required, same as
++ * before this change.
++ *
++ * Admin-on-behalf-of-member charge: pass `memberId` for a member other
++ * than the caller (finance-admin only — see functions/mychama/payments.py).
++ * `phone` is ignored in that case; the server always uses the target
++ * member's phone on file. This is what
++ * src/features/payments/AdminChargeButton.tsx calls, shared across
++ * Contributions and MGR admin screens.
++ */
+ export const initiatePayment = liveCallable<
+   {
+     chamaId: string;
+     purpose: IntentPurpose;
+     amount: number;
+-    phone: string;
++    phone?: string;
++    memberId?: string;
+     contributionId?: string;
+     loanId?: string;
++    installmentNo?: number;
+     potId?: string;
++    potPeriod?: number;
+   },
+   { reference: string; grossAmount: number; paystackFee: number; ourFee: number }
+ >('initiatePayment', 'Starting payment');
+diff --git a/src/lib/loanSchedule.ts b/src/lib/loanSchedule.ts
+index 0436376..0ad2772 100644
+--- a/src/lib/loanSchedule.ts
++++ b/src/lib/loanSchedule.ts
+@@ -96,3 +96,21 @@ export function loanPaid(loan: { schedule: LoanInstallment[] }): number {
+ export function nextUnpaidInstallment(loan: { schedule: LoanInstallment[] }): LoanInstallment | null {
+   return loan.schedule.find((s) => (s.due || 0) - (s.paidAmount || 0) > 0.009) ?? null;
+ }
++
++/**
++ * `status: 'awaiting_treasurer'` is stored literally for "one approver has
++ * gone, the other hasn't" — regardless of which one is actually still
++ * pending (see functions/mychama/loans.py::on_loan_write). Reading that
++ * enum value as display text ("awaiting treasurer") is only correct half
++ * the time; this derives the honest label from `approvals` instead, which
++ * is what every screen showing a loan's status chip should render.
++ */
++export function loanStatusLabel(loan: { status: string; approvals: { chair: boolean; treasurer: boolean } }): string {
++  if (loan.status === 'pending_approval') return 'awaiting chair & treasurer';
++  if (loan.status === 'awaiting_treasurer') {
++    if (loan.approvals.chair && !loan.approvals.treasurer) return 'awaiting treasurer';
++    if (loan.approvals.treasurer && !loan.approvals.chair) return 'awaiting chair';
++    return 'awaiting approval';
++  }
++  return loan.status.replace(/_/g, ' ');
++}

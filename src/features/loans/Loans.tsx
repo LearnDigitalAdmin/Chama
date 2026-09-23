@@ -2,9 +2,11 @@
  * Loan APPLICATION and APPROVAL below are direct Firestore writes, per
  * firestore.rules — see functions/mychama/loans.py's module docstring.
  * They work offline for free via Firestore's persistent local cache.
- * Disbursement and repayment call the server (offline-queued) because
- * rules block clients from ever setting status:'active' or touching
- * schedule[].paidAmount directly.
+ * Approval writes touch ONLY the one approver's boolean, via a dot-path
+ * update, never the whole `approvals` map — status is derived server-side
+ * by on_loan_write, never computed here. Disbursement and repayment call
+ * the server (offline-queued) because rules block clients from ever
+ * setting status:'active' or touching schedule[].paidAmount directly.
  */
 
 import { useEffect, useState } from 'react';
@@ -14,7 +16,7 @@ import { db } from '../../lib/firebase';
 import { paths } from '../../lib/firestorePaths';
 import { useChama } from '../../app/ChamaProvider';
 import { useMembers, memberName } from '../../app/useMembers';
-import { buildSchedule, loanOutstanding, nextUnpaidInstallment } from '../../lib/loanSchedule';
+import { buildSchedule, loanOutstanding, loanStatusLabel, nextUnpaidInstallment } from '../../lib/loanSchedule';
 import { kes } from '../../lib/money';
 import { todayISO } from '../../lib/dates';
 import { disburseLoanCash, recordCashLoanRepayment } from '../../lib/callables';
@@ -43,7 +45,8 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
   const [products, setProducts] = useState<Record<string, LoanProduct>>({});
   const { members } = useMembers(chamaId, false);
   const [showApply, setShowApply] = useState(false);
-  const [selected, setSelected] = useState<Loan | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = selectedId ? (loans.find((l) => l.id === selectedId) ?? null) : null;
 
   useEffect(() => {
     if (!chamaId) return;
@@ -70,7 +73,7 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
         membership={membership}
         isFinanceAdmin={isFinanceAdmin}
         memberLabel={memberName(members, selected.memberId)}
-        onBack={() => setSelected(null)}
+        onBack={() => setSelectedId(null)}
       />
     );
   }
@@ -113,12 +116,12 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
           </thead>
           <tbody>
             {loans.map((l) => (
-              <tr key={l.id} className="border-b border-forest-50 last:border-0 cursor-pointer hover:bg-forest-50/40" onClick={() => setSelected(l)}>
+              <tr key={l.id} className="border-b border-forest-50 last:border-0 cursor-pointer hover:bg-forest-50/40" onClick={() => setSelectedId(l.id)}>
                 <td className="px-4 py-3 font-medium">{memberName(members, l.memberId)}</td>
                 <td className="px-4 py-3 text-forest-900/70">{products[l.productId]?.name ?? '—'}</td>
                 <td className="px-4 py-3 num">{kes(l.principal)}</td>
                 <td className="px-4 py-3">
-                  <span className={`chip ${STATUS_CHIP[l.status]}`}>{l.status.replace(/_/g, ' ')}</span>
+                  <span className={`chip ${STATUS_CHIP[l.status]}`}>{loanStatusLabel(l)}</span>
                 </td>
                 <td className="px-4 py-3 num">{l.status === 'completed' ? 'Paid off' : kes(loanOutstanding(l))}</td>
               </tr>
@@ -275,11 +278,15 @@ function LoanDetail({
       if (decision === 'reject') {
         await updateDoc(loanRef, { status: 'rejected', updatedAt: Date.now() });
       } else if (membership?.role === 'chair') {
-        const newStatus = loan.approvals.treasurer ? 'approved' : 'awaiting_treasurer';
-        await updateDoc(loanRef, { approvals: { ...loan.approvals, chair: true }, status: newStatus, updatedAt: Date.now() });
+        // Dot-path: touches ONLY approvals.chair. Never spread the whole
+        // approvals map here — that's what let a stale local read
+        // overwrite the treasurer's already-committed flag (see
+        // functions/mychama/loans.py's module docstring for the incident
+        // this fixes). Status is not written here at all — on_loan_write
+        // derives it from approvals server-side.
+        await updateDoc(loanRef, { 'approvals.chair': true, updatedAt: Date.now() });
       } else if (membership?.role === 'treasurer') {
-        const newStatus = loan.approvals.chair ? 'approved' : 'awaiting_treasurer';
-        await updateDoc(loanRef, { approvals: { ...loan.approvals, treasurer: true }, status: newStatus, updatedAt: Date.now() });
+        await updateDoc(loanRef, { 'approvals.treasurer': true, updatedAt: Date.now() });
       }
     } catch {
       setError('Could not record the approval.');
@@ -331,7 +338,7 @@ function LoanDetail({
         <h1 className="font-display text-2xl font-semibold text-ink">{memberLabel}</h1>
         <p className="text-sm text-forest-900/60 mt-1">
           {product?.name} · {kes(loan.principal)} · {loan.term} months ·{' '}
-          <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loan.status.replace(/_/g, ' ')}</span>
+          <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loanStatusLabel(loan)}</span>
         </p>
       </div>
 

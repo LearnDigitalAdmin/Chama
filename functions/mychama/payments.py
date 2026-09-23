@@ -9,6 +9,20 @@ docs/ARCHITECTURE.md §1/§4 and the PAY repo delivery notes) is what
 actually applies the payment once Paystack confirms it; this callable only
 ever gets the STK push started and records what was quoted to the member.
 
+initiatePayment also covers admin-initiated collection: pass `memberId` to
+charge a DIFFERENT member than the caller (finance-admin only). This is
+what the "Charge Paystack" action in Contributions.tsx and MgrPotDetail.tsx
+calls, via the shared src/features/payments/AdminChargeButton.tsx
+component — one callable, one fee/reference/rate-limit/idempotency path,
+usable for any purpose already in the `purpose` dispatch table below
+(currently `contribution` and `mgr_contribution` have UI wired to it;
+`loan_repayment` works identically if a UI ever wants it, with zero
+backend changes). The phone charged is always read from the target
+member's own record — never a client-supplied number — so an admin can't
+redirect someone else's STK prompt to a phone of their choosing. Self-pay
+(no `memberId`, or `memberId` equal to the caller's own) is unchanged from
+before and needs no finance-admin role.
+
 setupSettlementAccount / requestSettlementChange / approveSettlementChange
 create/change the Paystack subaccount + split code a chama's collections
 settle into. Bank/paybill/till codes for Paystack Kenya's subaccount API
@@ -209,17 +223,39 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
     chama_id = data.get("chamaId")
     purpose = data.get("purpose")
     amount = data.get("amount")
-    phone = data.get("phone") or ""
+    target_member_id = data.get("memberId")
 
     if not chama_id or purpose not in ("contribution", "loan_repayment", "mgr_contribution"):
         raise bad_request("chamaId and a valid purpose are required.")
     if not isinstance(amount, (int, float)) or amount <= 0:
         raise bad_request("amount must be a positive number.")
-    if not is_valid_kenyan_phone(phone):
-        raise bad_request("A valid Kenyan phone number is required.")
 
     db = _db()
-    membership = require_membership(db, uid, chama_id)
+    caller_membership = require_membership(db, uid, chama_id)
+
+    if target_member_id and target_member_id != caller_membership.member_id:
+        # Admin-initiated charge on behalf of another member. Only a
+        # finance admin may do this, and the phone charged always comes
+        # from the target member's own record — never `data.get("phone")`
+        # — so this can't be used to push an STK prompt to an arbitrary
+        # number under someone else's name.
+        require_finance_admin(db, uid, chama_id)
+        target_snap = db.document(paths.member(chama_id, target_member_id)).get()
+        if not target_snap.exists:
+            raise not_found("Member not found.")
+        target_member = target_snap.to_dict()
+        if target_member.get("status") != "active":
+            raise precondition("This member isn't active.")
+        member_id = target_member_id
+        phone = target_member.get("phone") or ""
+        initiated_by = {"uid": uid, "memberId": caller_membership.member_id, "role": caller_membership.role}
+    else:
+        member_id = caller_membership.member_id
+        phone = data.get("phone") or ""
+        initiated_by = None
+
+    if not is_valid_kenyan_phone(phone):
+        raise bad_request("A valid Kenyan phone number is required.")
 
     chama_snap = db.document(paths.chama(chama_id)).get()
     if not chama_snap.exists:
@@ -232,11 +268,15 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
     if not chama.get("settlementSplitCode"):
         raise precondition("This chama hasn't set up a settlement account yet — ask the chair to set one up first.")
 
-    # Rate limit: MAX_INTENTS_PER_HOUR per member, mirrors the bot's guard.
+    # Rate limit: MAX_INTENTS_PER_HOUR, keyed on whoever is actually being
+    # charged (member_id) — not the caller — so an admin working down a
+    # list of members doesn't share one bucket with everyone's self-pay
+    # attempts, but also can't bypass a given member's own limit by being
+    # the one to trigger it.
     one_hour_ago = now_ms() - 60 * 60 * 1000
     recent = list(
         db.collection(paths.payment_intents(chama_id))
-        .where("memberId", "==", membership.member_id)
+        .where("memberId", "==", member_id)
         .where("createdAt", ">=", one_hour_ago)
         .stream()
     )
@@ -260,7 +300,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
 
     intent = {
         "chamaId": chama_id,
-        "memberId": membership.member_id,
+        "memberId": member_id,
         "purpose": purpose,
         "reference": reference,
         "amount": fee_calc["net"],
@@ -272,6 +312,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
         "provider": provider,
         "status": "pending",
         "channel": "app",
+        "initiatedBy": initiated_by,
         "contributionId": data.get("contributionId"),
         "loanId": data.get("loanId"),
         "installmentNo": data.get("installmentNo"),
@@ -287,7 +328,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
     try:
         paystack_resp = paystack.charge_mobile_money(
             secret_key=PAYSTACK_SECRET_KEY.value,
-            email=f"{membership.member_id}@mychama.app",
+            email=f"{member_id}@mychama.app",
             amount_kes=fee_calc["gross"],
             phone_e164=normalized_phone,
             provider=provider,
@@ -296,7 +337,7 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
                 "chargeType": "mychama_payment",
                 "targetProject": "mychama1",
                 "chamaId": chama_id,
-                "memberId": membership.member_id,
+                "memberId": member_id,
                 "purpose": purpose,
                 "splitCode": chama["settlementSplitCode"],
             },

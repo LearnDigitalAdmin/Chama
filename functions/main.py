@@ -20,6 +20,7 @@ from mychama.identity import (  # noqa: E402,F401
     addAdmin,
     addMember,
     claimInvite,
+    claimMyInvites,
     completeProfile,
     updateMember,
 )
@@ -35,6 +36,7 @@ from mychama.loans import (  # noqa: E402,F401
     disburseLoanCash,
     recordCashLoanRepayment,
     sweep_overdue_loans,
+    on_loan_write,
 )
 from mychama.mgr import (  # noqa: E402,F401
     createMgrPot,

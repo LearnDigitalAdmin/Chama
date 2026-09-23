@@ -7,20 +7,34 @@ create their own 'pending_approval' loan directly (with a client-computed
 schedule whose length must equal `term` — use
 src/lib/loanSchedule.ts::buildSchedule so the client never freehands the
 schedule), and let the chair/treasurer flip their own `approvals.*` flag
-and advance `status` through a fixed small set of values directly. No
-money moves at either step, so there's no spill-forward math to centralise
-and the direct-write path is simpler and just as safe.
+directly via a dot-path update. No money moves at either step, so there's
+no spill-forward math to centralise and the direct-write path is simpler
+and just as safe.
+
+`status`, while a loan is still in the approval stage, is NOT settable by
+either client write above — it's derived server-side by on_loan_write
+below, purely from `approvals.chair`/`approvals.treasurer`. This used to
+be computed client-side inside the approve button's click handler, which
+meant it was only ever as fresh as whatever the approving client had
+loaded locally — a race that let one approver's stale read silently
+clobber the other's already-committed approval (see docs/ARCHITECTURE.md
+or the incident notes if this history matters to you; short version: an
+offline write computed against a stale local doc overwrote a same-loan
+approval another admin had already made online). Deriving `status`
+server-side, from the single source of truth `approvals`, makes that class
+of bug structurally impossible — there's no client read to go stale.
+`Reject` is the one client-settable status transition, because it's a
+unilateral action by either approver with no shared state to race.
 
 What IS a callable, and why: `status` can never become 'active' via a
 direct client write (disbursement), and `schedule[].paidAmount` can never
 be touched by a direct client write at all (repayment) — see the rules
-file's loans `update` rule, which only permits changing
-`['approvals', 'status', 'updatedAt']`. Both of those need the server.
+file's loans `update` rule. Both of those need the server.
 """
 
 from __future__ import annotations
 
-from firebase_functions import https_fn, scheduler_fn
+from firebase_functions import firestore_fn, https_fn, scheduler_fn
 from firebase_admin import firestore
 
 from shared import firestore_paths as paths
@@ -32,9 +46,62 @@ from shared.roles import require_finance_admin
 
 REGION = "africa-south1"
 
+# Statuses where `status` is still purely a function of `approvals` — once a
+# loan leaves this set (rejected, approved-and-disbursed, overdue,
+# completed), status becomes server-owned by disburseLoanCash /
+# recordCashLoanRepayment / sweep_overdue_loans instead, and this trigger
+# must not touch it again.
+_APPROVAL_STAGE_STATUSES = {"pending_approval", "awaiting_treasurer"}
+
 
 def _db():
     return firestore.client()
+
+
+@firestore_fn.on_document_written(
+    document=f"{paths.MC.CHAMAS}/{{chamaId}}/{MC.LOANS}/{{loanId}}",
+    region=REGION,
+)
+def on_loan_write(event: firestore_fn.Event[firestore_fn.Change]) -> None:
+    """
+    Derives `status` from `approvals.{chair,treasurer}` server-side, so it
+    can never desync from the approvals it's supposed to summarise —
+    whether that'd happen from a stale offline write racing another
+    approver (the bug that prompted this), or a manual Firestore console
+    edit (which bypasses firestore.rules and every client code path
+    entirely).
+
+    firestore.rules' loans `update` rule no longer lets a client set
+    `status` when approving (see the `loans` section) — only `approvals`
+    and `updatedAt` — so this trigger is now the *only* writer of `status`
+    while a loan is in the approval stage. It's idempotent: it only writes
+    when the computed value actually differs from what's stored, which is
+    also what stops it from re-triggering itself forever.
+    """
+    after = event.data.after
+    if after is None or not after.exists:
+        return
+
+    loan = after.to_dict()
+    status = loan.get("status")
+    if status not in _APPROVAL_STAGE_STATUSES:
+        return
+
+    approvals = loan.get("approvals") or {}
+    chair_ok = bool(approvals.get("chair"))
+    treasurer_ok = bool(approvals.get("treasurer"))
+
+    if chair_ok and treasurer_ok:
+        computed = "approved"
+    elif chair_ok or treasurer_ok:
+        computed = "awaiting_treasurer"
+    else:
+        computed = "pending_approval"
+
+    if computed == status:
+        return
+
+    after.reference.update({"status": computed, "updatedAt": now_ms()})
 
 
 @https_fn.on_call(region=REGION)

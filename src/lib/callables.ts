@@ -109,8 +109,24 @@ export const completeProfile = liveCallable<
   { memberId: string | null }
 >('completeProfile', 'Completing your profile');
 
+/**
+ * Not queueable: called right after a phone sign-in resolves, so the app
+ * can decide whether to route into a chama or show "no chama yet" —
+ * queuing it would mean showing the wrong screen while offline.
+ *
+ * Auto-attaches the caller's uid to any pending member record matching
+ * their verified phone number, across every chama, and closes out the
+ * matching invite doc. See functions/mychama/identity.py::claimMyInvites —
+ * this is what lets a member added by an admin log in and land in their
+ * chama with no invite link ever having been sent.
+ */
+export const claimMyInvites = liveCallable<
+  Record<string, never>,
+  { claimed: { chamaId: string; chamaName: string; memberId: string; role: MemberRole }[] }
+>('claimMyInvites', 'Checking for pending invites');
+
 export const updateMember = callable<
-  { chamaId: string; memberId: string; patch: Partial<{ name: string; role: MemberRole; status: 'active' | 'inactive' | 'suspended' }> },
+  { chamaId: string; memberId: string; patch: Partial<{ name: string; phone: string; role: MemberRole; status: 'active' | 'inactive' | 'suspended' }> },
   { ok: true }
 >('updateMember', () => 'Update member');
 
@@ -206,16 +222,31 @@ export const approveSettlementChange = callable<
   { ok: true }
 >('approveSettlementChange', () => 'Approve settlement account change');
 
-/** Not queueable: triggers a live Paystack STK push to the member's phone right now. */
+/**
+ * Not queueable: triggers a live Paystack STK push right now.
+ *
+ * Self-pay (default): omit `memberId`; `phone` is required, same as
+ * before this change.
+ *
+ * Admin-on-behalf-of-member charge: pass `memberId` for a member other
+ * than the caller (finance-admin only — see functions/mychama/payments.py).
+ * `phone` is ignored in that case; the server always uses the target
+ * member's phone on file. This is what
+ * src/features/payments/AdminChargeButton.tsx calls, shared across
+ * Contributions and MGR admin screens.
+ */
 export const initiatePayment = liveCallable<
   {
     chamaId: string;
     purpose: IntentPurpose;
     amount: number;
-    phone: string;
+    phone?: string;
+    memberId?: string;
     contributionId?: string;
     loanId?: string;
+    installmentNo?: number;
     potId?: string;
+    potPeriod?: number;
   },
   { reference: string; grossAmount: number; paystackFee: number; ourFee: number }
 >('initiatePayment', 'Starting payment');

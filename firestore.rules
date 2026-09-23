@@ -242,19 +242,35 @@ service cloud.firestore {
                       && request.resource.data.term >= 1
                       && request.resource.data.schedule.size() == request.resource.data.term;
 
-        // Approval only. Chair flips chair; treasurer flips treasurer. Status
-        // may only move within the approval stage — activation, disbursement
-        // and repayment all belong to the server.
+        // Approval only. Chair flips chair; treasurer flips treasurer, via a
+        // dot-path update touching ONLY that one boolean — never the whole
+        // `approvals` map — so a stale local read can never overwrite the
+        // other approver's already-committed flag. `status` is NOT
+        // client-settable here at all: it's derived server-side from
+        // `approvals` by on_loan_write (functions/mychama/loans.py), which
+        // is what makes it impossible for status to desync from approvals
+        // again, from any client, online or offline.
+        //
+        // Reject is the one status transition a client still makes
+        // directly — it's unilateral (either approver alone, no shared
+        // state to race) and terminal, so there's nothing to derive.
         allow update: if (
                         isChair(chamaId)
-                        && onlyChanged(['approvals', 'status', 'updatedAt'])
+                        && onlyChanged(['approvals', 'updatedAt'])
+                        && request.resource.data.approvals.chair == true
                         && request.resource.data.approvals.treasurer == resource.data.approvals.treasurer
-                        && request.resource.data.status in ['pending_approval', 'awaiting_treasurer', 'rejected']
+                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
                       ) || (
                         isTreasurer(chamaId)
-                        && onlyChanged(['approvals', 'status', 'updatedAt'])
+                        && onlyChanged(['approvals', 'updatedAt'])
+                        && request.resource.data.approvals.treasurer == true
                         && request.resource.data.approvals.chair == resource.data.approvals.chair
-                        && request.resource.data.status in ['awaiting_treasurer', 'approved', 'rejected']
+                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
+                      ) || (
+                        (isChair(chamaId) || isTreasurer(chamaId))
+                        && onlyChanged(['status', 'updatedAt'])
+                        && request.resource.data.status == 'rejected'
+                        && resource.data.status in ['pending_approval', 'awaiting_treasurer']
                       );
 
         // An applicant may withdraw their own untouched application.

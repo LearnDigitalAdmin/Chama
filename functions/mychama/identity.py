@@ -305,6 +305,88 @@ def claimInvite(req: https_fn.CallableRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# claimMyInvites — automatic invite claiming for phone-authenticated sign-ins.
+#
+# claimInvite (above) requires the admin's invite link to actually reach the
+# member (SMS/WhatsApp/email) — nothing in this codebase sends that link.
+# Until that exists, a member added by an admin has no way to discover their
+# chamaId/inviteId, so their invite sits at status "pending" forever even
+# after they sign in with the exact phone number the admin used to add them.
+#
+# This callable removes the need for a link entirely. Any time a
+# phone-authenticated user is signed in, the frontend calls this once (see
+# src/auth/AuthProvider.tsx). It looks up every member record across every
+# chama that (a) matches the caller's Firebase-verified phone number and
+# (b) has no uid yet, attaches this uid, writes the userChamas index (same
+# shape as claimInvite/completeProfile), and closes out the matching invite
+# doc so it stops sitting at "pending". No link, no SMS, nothing sent.
+#
+# Idempotent by construction: once a member doc has a uid, the
+# `uid == None` filter below no longer matches it, so calling this again
+# (e.g. on every sign-in) is a harmless no-op for anything already claimed.
+# ---------------------------------------------------------------------------
+
+@https_fn.on_call(region=REGION)
+def claimMyInvites(req: https_fn.CallableRequest) -> dict:
+    uid = require_auth(req)
+    token = req.auth.token or {}
+    caller_phone = token.get("phone_number")
+    if not caller_phone:
+        # Not a phone-authenticated session (Google/email) — nothing to
+        # auto-claim here; completeProfile covers that path instead.
+        return {"claimed": []}
+
+    normalized = normalize_phone(caller_phone)
+    db = _db()
+
+    cg = db.collection_group(paths.MC.MEMBERS)
+    candidates = list(cg.where("phoneNormalized", "==", normalized).where("uid", "==", None).stream())
+
+    ts = now_ms()
+    claimed: list[dict] = []
+    for snap in candidates:
+        member_ref = snap.reference
+        chama_id = member_ref.parent.parent.id
+        member = snap.to_dict()
+
+        chama_snap = db.document(paths.chama(chama_id)).get()
+        chama_name = chama_snap.to_dict().get("name", "") if chama_snap.exists else ""
+
+        batch = db.batch()
+        batch.update(member_ref, {"uid": uid, "updatedAt": ts})
+        batch.set(db.document(paths.user_chama_membership(uid, chama_id)), {
+            "chamaId": chama_id,
+            "chamaName": chama_name,
+            "memberId": member_ref.id,
+            "role": member.get("role", "member"),
+            "status": member.get("status", "active"),
+            "updatedAt": ts,
+        })
+
+        # Close out any invite(s) still pending for this member so they
+        # stop showing as pending forever — the same end state claimInvite
+        # would have left them in, just reached without a link.
+        pending_invites = (
+            db.collection(paths.invites(chama_id))
+            .where("memberId", "==", member_ref.id)
+            .where("status", "==", "pending")
+            .stream()
+        )
+        for inv in pending_invites:
+            batch.update(inv.reference, {"status": "claimed", "claimedAt": ts, "claimedByUid": uid})
+
+        batch.commit()
+        claimed.append({
+            "chamaId": chama_id,
+            "chamaName": chama_name,
+            "memberId": member_ref.id,
+            "role": member.get("role", "member"),
+        })
+
+    return {"claimed": claimed}
+
+
+# ---------------------------------------------------------------------------
 # completeProfile — for Google (or email) sign-ins that need to supply the
 # phone number / ID number the schema requires, and to claim any pending
 # member record(s) that phone number matches.
@@ -377,7 +459,7 @@ def completeProfile(req: https_fn.CallableRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 ALLOWED_SELF_FIELDS = {"name"}
-ALLOWED_ADMIN_FIELDS = {"name", "role", "status"}
+ALLOWED_ADMIN_FIELDS = {"name", "phone", "role", "status"}
 
 
 @https_fn.on_call(region=REGION)
@@ -416,6 +498,22 @@ def updateMember(req: https_fn.CallableRequest) -> dict:
         raise bad_request("Invalid status.")
     if caller.is_finance_admin and target.get("role") == "chair" and clean_patch.get("role") not in (None, "chair"):
         raise denied("Use a dedicated chair-transfer flow to change the chair's role (not implemented in Phase 1).")
+
+    if "phone" in clean_patch:
+        new_phone = clean_patch["phone"]
+        if not is_valid_kenyan_phone(new_phone):
+            raise bad_request("Enter a valid Kenyan phone number (07xx/01xx or +254...).")
+        new_normalized = normalize_phone(new_phone)
+        dupe = (
+            db.collection(paths.members(chama_id))
+            .where("phoneNormalized", "==", new_normalized)
+            .limit(1)
+            .stream()
+        )
+        if any(d.id != member_id for d in dupe):
+            raise https_fn.HttpsError("already-exists", "This phone number is already a member of this chama.")
+        clean_patch["phone"] = new_phone.strip()
+        clean_patch["phoneNormalized"] = new_normalized
 
     clean_patch["updatedAt"] = now_ms()
     target_ref.update(clean_patch)

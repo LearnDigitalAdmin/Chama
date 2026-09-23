@@ -1,0 +1,600 @@
+diff --git a/functions/main.py b/functions/main.py
+index d0d0422..5fe5f51 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -20,6 +20,7 @@ from mychama.identity import (  # noqa: E402,F401
+     addAdmin,
+     addMember,
+     claimInvite,
++    claimMyInvites,
+     completeProfile,
+     updateMember,
+ )
+diff --git a/functions/mychama/identity.py b/functions/mychama/identity.py
+index b19c7f7..c703cd4 100644
+--- a/functions/mychama/identity.py
++++ b/functions/mychama/identity.py
+@@ -304,6 +304,88 @@ def claimInvite(req: https_fn.CallableRequest) -> dict:
+     return {"memberId": invite["memberId"], "role": member["role"]}
+ 
+ 
++# ---------------------------------------------------------------------------
++# claimMyInvites — automatic invite claiming for phone-authenticated sign-ins.
++#
++# claimInvite (above) requires the admin's invite link to actually reach the
++# member (SMS/WhatsApp/email) — nothing in this codebase sends that link.
++# Until that exists, a member added by an admin has no way to discover their
++# chamaId/inviteId, so their invite sits at status "pending" forever even
++# after they sign in with the exact phone number the admin used to add them.
++#
++# This callable removes the need for a link entirely. Any time a
++# phone-authenticated user is signed in, the frontend calls this once (see
++# src/auth/AuthProvider.tsx). It looks up every member record across every
++# chama that (a) matches the caller's Firebase-verified phone number and
++# (b) has no uid yet, attaches this uid, writes the userChamas index (same
++# shape as claimInvite/completeProfile), and closes out the matching invite
++# doc so it stops sitting at "pending". No link, no SMS, nothing sent.
++#
++# Idempotent by construction: once a member doc has a uid, the
++# `uid == None` filter below no longer matches it, so calling this again
++# (e.g. on every sign-in) is a harmless no-op for anything already claimed.
++# ---------------------------------------------------------------------------
++
++@https_fn.on_call(region=REGION)
++def claimMyInvites(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    token = req.auth.token or {}
++    caller_phone = token.get("phone_number")
++    if not caller_phone:
++        # Not a phone-authenticated session (Google/email) — nothing to
++        # auto-claim here; completeProfile covers that path instead.
++        return {"claimed": []}
++
++    normalized = normalize_phone(caller_phone)
++    db = _db()
++
++    cg = db.collection_group(paths.MC.MEMBERS)
++    candidates = list(cg.where("phoneNormalized", "==", normalized).where("uid", "==", None).stream())
++
++    ts = now_ms()
++    claimed: list[dict] = []
++    for snap in candidates:
++        member_ref = snap.reference
++        chama_id = member_ref.parent.parent.id
++        member = snap.to_dict()
++
++        chama_snap = db.document(paths.chama(chama_id)).get()
++        chama_name = chama_snap.to_dict().get("name", "") if chama_snap.exists else ""
++
++        batch = db.batch()
++        batch.update(member_ref, {"uid": uid, "updatedAt": ts})
++        batch.set(db.document(paths.user_chama_membership(uid, chama_id)), {
++            "chamaId": chama_id,
++            "chamaName": chama_name,
++            "memberId": member_ref.id,
++            "role": member.get("role", "member"),
++            "status": member.get("status", "active"),
++            "updatedAt": ts,
++        })
++
++        # Close out any invite(s) still pending for this member so they
++        # stop showing as pending forever — the same end state claimInvite
++        # would have left them in, just reached without a link.
++        pending_invites = (
++            db.collection(paths.invites(chama_id))
++            .where("memberId", "==", member_ref.id)
++            .where("status", "==", "pending")
++            .stream()
++        )
++        for inv in pending_invites:
++            batch.update(inv.reference, {"status": "claimed", "claimedAt": ts, "claimedByUid": uid})
++
++        batch.commit()
++        claimed.append({
++            "chamaId": chama_id,
++            "chamaName": chama_name,
++            "memberId": member_ref.id,
++            "role": member.get("role", "member"),
++        })
++
++    return {"claimed": claimed}
++
++
+ # ---------------------------------------------------------------------------
+ # completeProfile — for Google (or email) sign-ins that need to supply the
+ # phone number / ID number the schema requires, and to claim any pending
+@@ -377,7 +459,7 @@ def completeProfile(req: https_fn.CallableRequest) -> dict:
+ # ---------------------------------------------------------------------------
+ 
+ ALLOWED_SELF_FIELDS = {"name"}
+-ALLOWED_ADMIN_FIELDS = {"name", "role", "status"}
++ALLOWED_ADMIN_FIELDS = {"name", "phone", "role", "status"}
+ 
+ 
+ @https_fn.on_call(region=REGION)
+@@ -417,6 +499,22 @@ def updateMember(req: https_fn.CallableRequest) -> dict:
+     if caller.is_finance_admin and target.get("role") == "chair" and clean_patch.get("role") not in (None, "chair"):
+         raise denied("Use a dedicated chair-transfer flow to change the chair's role (not implemented in Phase 1).")
+ 
++    if "phone" in clean_patch:
++        new_phone = clean_patch["phone"]
++        if not is_valid_kenyan_phone(new_phone):
++            raise bad_request("Enter a valid Kenyan phone number (07xx/01xx or +254...).")
++        new_normalized = normalize_phone(new_phone)
++        dupe = (
++            db.collection(paths.members(chama_id))
++            .where("phoneNormalized", "==", new_normalized)
++            .limit(1)
++            .stream()
++        )
++        if any(d.id != member_id for d in dupe):
++            raise https_fn.HttpsError("already-exists", "This phone number is already a member of this chama.")
++        clean_patch["phone"] = new_phone.strip()
++        clean_patch["phoneNormalized"] = new_normalized
++
+     clean_patch["updatedAt"] = now_ms()
+     target_ref.update(clean_patch)
+ 
+diff --git a/src/auth/AuthProvider.tsx b/src/auth/AuthProvider.tsx
+index 0b815e5..9e883a9 100644
+--- a/src/auth/AuthProvider.tsx
++++ b/src/auth/AuthProvider.tsx
+@@ -13,13 +13,22 @@
+  * `authReady` / `membershipsReady` are separate so screens can render a
+  * "signed in, loading your chamas..." state instead of a flash of the
+  * wrong screen.
++ *
++ * `claimingInvites` covers a third, short-lived state: right after a
++ * phone sign-in resolves with zero memberships, this provider calls
++ * claimMyInvites() once (see src/lib/callables.ts) to auto-attach the
++ * caller to any pending member record an admin already created for their
++ * phone number — no invite link required. Home.tsx uses this flag to show
++ * "checking for invites…" instead of immediately telling a freshly-added
++ * member they're not part of any chama.
+  */
+ 
+-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
++import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+ import { onAuthStateChanged, type User } from 'firebase/auth';
+ import { collection, onSnapshot } from 'firebase/firestore';
+ import { auth, db } from '../lib/firebase';
+ import { paths } from '../lib/firestorePaths';
++import { claimMyInvites } from '../lib/callables';
+ import type { UserChamaMembership } from '../lib/types';
+ 
+ interface AuthContextValue {
+@@ -27,6 +36,7 @@ interface AuthContextValue {
+   authReady: boolean;
+   memberships: UserChamaMembership[];
+   membershipsReady: boolean;
++  claimingInvites: boolean;
+ }
+ 
+ const AuthContext = createContext<AuthContextValue>({
+@@ -34,6 +44,7 @@ const AuthContext = createContext<AuthContextValue>({
+   authReady: false,
+   memberships: [],
+   membershipsReady: false,
++  claimingInvites: false,
+ });
+ 
+ export function AuthProvider({ children }: { children: ReactNode }) {
+@@ -41,6 +52,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+   const [authReady, setAuthReady] = useState(false);
+   const [memberships, setMemberships] = useState<UserChamaMembership[]>([]);
+   const [membershipsReady, setMembershipsReady] = useState(false);
++  const [claimingInvites, setClaimingInvites] = useState(false);
++  const claimAttemptedForUid = useRef<string | null>(null);
+ 
+   useEffect(() => {
+     const unsub = onAuthStateChanged(auth, (u) => {
+@@ -49,6 +62,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+       if (!u) {
+         setMemberships([]);
+         setMembershipsReady(true);
++        claimAttemptedForUid.current = null;
+       }
+     });
+     return unsub;
+@@ -68,8 +82,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+     return unsub;
+   }, [user]);
+ 
++  // Phone-authenticated user, memberships loaded and empty, not yet tried
++  // this session — attempt to auto-claim any pending invite for their
++  // phone number. If claimMyInvites finds and attaches a member record,
++  // the userChamas listener above picks up the new membership live, so
++  // there's nothing to merge manually here.
++  useEffect(() => {
++    if (!user || !user.phoneNumber) return;
++    if (!membershipsReady || memberships.length > 0) return;
++    if (claimAttemptedForUid.current === user.uid) return;
++    claimAttemptedForUid.current = user.uid;
++
++    setClaimingInvites(true);
++    claimMyInvites({})
++      .catch(() => {
++        // Best-effort: if this fails (e.g. offline), the user still sees
++        // the normal "no chama yet" screen rather than getting stuck.
++      })
++      .finally(() => setClaimingInvites(false));
++  }, [user, membershipsReady, memberships.length]);
++
+   return (
+-    <AuthContext.Provider value={{ user, authReady, memberships, membershipsReady }}>{children}</AuthContext.Provider>
++    <AuthContext.Provider value={{ user, authReady, memberships, membershipsReady, claimingInvites }}>
++      {children}
++    </AuthContext.Provider>
+   );
+ }
+ 
+diff --git a/src/auth/Home.tsx b/src/auth/Home.tsx
+index 25b67b8..95894ce 100644
+--- a/src/auth/Home.tsx
++++ b/src/auth/Home.tsx
+@@ -10,11 +10,11 @@ import { useAuth } from './AuthProvider';
+ import AuthLayout, { LinkButton } from './AuthLayout';
+ 
+ export default function Home() {
+-  const { user, memberships, membershipsReady } = useAuth();
++  const { user, memberships, membershipsReady, claimingInvites } = useAuth();
+ 
+-  if (!membershipsReady) {
++  if (!membershipsReady || claimingInvites) {
+     return (
+-      <AuthLayout title="Loading your chamas…">
++      <AuthLayout title={claimingInvites ? 'Checking for pending invites…' : 'Loading your chamas…'}>
+         <div className="h-1.5 w-full bg-forest-50 rounded-full overflow-hidden">
+           <div className="h-full w-1/2 bg-gold-400 animate-pulse" />
+         </div>
+@@ -32,7 +32,10 @@ export default function Home() {
+       <Link to="/create-chama" className="btn-primary font-semibold px-4 py-2.5 rounded-full text-center transition-colors">
+         Create a chama
+       </Link>
+-      <p className="text-xs text-forest-900/50">Already been added by an admin? Ask them to resend your invite link.</p>
++      <p className="text-xs text-forest-900/50">
++        Already been added by an admin? Make sure you're signing in with the exact phone number they used to add you
++        — we check for that automatically each time you sign in.
++      </p>
+       <LinkButton onClick={() => signOut(auth)}>Sign out</LinkButton>
+     </AuthLayout>
+   );
+diff --git a/src/features/members/Members.tsx b/src/features/members/Members.tsx
+index 2577318..f2fa53d 100644
+--- a/src/features/members/Members.tsx
++++ b/src/features/members/Members.tsx
+@@ -1,11 +1,11 @@
+-import { useState } from 'react';
++import { useMemo, useState } from 'react';
+ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers } from '../../app/useMembers';
+-import { addAdmin, addMember } from '../../lib/callables';
++import { addAdmin, addMember, updateMember } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
+ import { isValidKenyanPhone } from '../../lib/phone';
+-import type { MemberRole } from '../../lib/types';
++import type { ChamaMember, MemberRole } from '../../lib/types';
+ 
+ const STATUS_CHIP: Record<string, string> = {
+   active: 'bg-forest-50 text-forest-700',
+@@ -13,10 +13,25 @@ const STATUS_CHIP: Record<string, string> = {
+   suspended: 'bg-brick-50 text-brick-500',
+ };
+ 
++const ASSIGNABLE_ROLES: Exclude<MemberRole, 'chair'>[] = ['treasurer', 'secretary', 'member'];
++const STATUSES: ChamaMember['status'][] = ['active', 'inactive', 'suspended'];
++
+ export default function Members() {
+   const { chamaId, isFinanceAdmin } = useChama();
+   const { members, ready } = useMembers(chamaId, false);
+   const [showForm, setShowForm] = useState<null | 'member' | 'admin'>(null);
++  const [query, setQuery] = useState('');
++  const [selected, setSelected] = useState<ChamaMember | null>(null);
++
++  const filtered = useMemo(() => {
++    const q = query.trim().toLowerCase();
++    if (!q) return members;
++    return members.filter((m) => m.name.toLowerCase().includes(q) || m.phone.toLowerCase().includes(q));
++  }, [members, query]);
++
++  // Keep the open detail panel in sync with live member updates (e.g. after
++  // an edit/role/status change commits) rather than holding a stale copy.
++  const selectedLive = selected ? (members.find((m) => m.id === selected.id) ?? null) : null;
+ 
+   if (!ready) return <p className="text-forest-900/60">Loading members…</p>;
+ 
+@@ -41,6 +56,15 @@ export default function Members() {
+ 
+       {showForm && <AddPersonForm kind={showForm} chamaId={chamaId!} onDone={() => setShowForm(null)} />}
+ 
++      <div className="relative max-w-sm">
++        <input
++          value={query}
++          onChange={(e) => setQuery(e.target.value)}
++          placeholder="Search members…"
++          className="w-full border border-forest-200 rounded-full pl-4 pr-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-forest-300"
++        />
++      </div>
++
+       <div className="card overflow-x-auto">
+         <table className="w-full text-sm">
+           <thead>
+@@ -53,8 +77,12 @@ export default function Members() {
+             </tr>
+           </thead>
+           <tbody>
+-            {members.map((m) => (
+-              <tr key={m.id} className="border-b border-forest-50 last:border-0">
++            {filtered.map((m) => (
++              <tr
++                key={m.id}
++                onClick={() => setSelected(m)}
++                className="border-b border-forest-50 last:border-0 cursor-pointer hover:bg-forest-50/60"
++              >
+                 <td className="px-4 py-3 font-medium">{m.name}</td>
+                 <td className="px-4 py-3 text-forest-900/70">{m.phone}</td>
+                 <td className="px-4 py-3 capitalize">{m.role}</td>
+@@ -64,9 +92,25 @@ export default function Members() {
+                 <td className="px-4 py-3 num">{kes(m.totalContributed)}</td>
+               </tr>
+             ))}
++            {filtered.length === 0 && (
++              <tr>
++                <td colSpan={5} className="px-4 py-8 text-center text-forest-900/50">
++                  No members match "{query}".
++                </td>
++              </tr>
++            )}
+           </tbody>
+         </table>
+       </div>
++
++      {selectedLive && chamaId && (
++        <MemberDetailModal
++          member={selectedLive}
++          chamaId={chamaId}
++          canManage={isFinanceAdmin}
++          onClose={() => setSelected(null)}
++        />
++      )}
+     </div>
+   );
+ }
+@@ -132,6 +176,10 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+           </select>
+         </label>
+       )}
++      <p className="text-xs text-forest-900/50">
++        {kind === 'admin' ? 'They' : 'This member'} will show up here right away. No link is sent — when they sign in
++        with this exact phone number, they're matched to this record and dropped straight into the chama automatically.
++      </p>
+       <div className="flex gap-2">
+         <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+           {busy ? 'Adding…' : 'Add'}
+@@ -145,3 +193,195 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+     </div>
+   );
+ }
++
++function MemberDetailModal({
++  member,
++  chamaId,
++  canManage,
++  onClose,
++}: {
++  member: ChamaMember;
++  chamaId: string;
++  canManage: boolean;
++  onClose: () => void;
++}) {
++  const [mode, setMode] = useState<'view' | 'edit' | 'role'>('view');
++  const [showId, setShowId] = useState(false);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
++
++  const isChair = member.role === 'chair';
++
++  async function patch(update: Partial<{ name: string; phone: string; role: MemberRole; status: ChamaMember['status'] }>) {
++    setError(null);
++    setBusy(true);
++    try {
++      await updateMember({ chamaId, memberId: member.id, patch: update });
++      setQueuedMsg(null);
++      setMode('view');
++    } catch (e) {
++      const { message, isQueued } = describeCallError(e);
++      if (isQueued) {
++        setQueuedMsg(message);
++        setMode('view');
++      } else {
++        setError(message);
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="fixed inset-0 bg-ink/40 flex items-end sm:items-center justify-center p-4 z-50" onClick={onClose}>
++      <div className="card p-5 max-w-sm w-full flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
++        {mode === 'view' && (
++          <>
++            <div className="flex items-start justify-between gap-3">
++              <div>
++                <h3 className="font-display font-semibold text-lg">{member.name}</h3>
++                <p className="text-sm text-forest-900/60">{member.phone}</p>
++              </div>
++              <span className={`chip ${STATUS_CHIP[member.status]} capitalize`}>{member.status}</span>
++            </div>
++
++            <dl className="text-sm grid grid-cols-2 gap-y-2">
++              <dt className="text-forest-900/50">Role</dt>
++              <dd className="capitalize">{member.role}</dd>
++              <dt className="text-forest-900/50">Joined</dt>
++              <dd>{member.joinDate}</dd>
++              <dt className="text-forest-900/50">Total contributed</dt>
++              <dd className="num">{kes(member.totalContributed)}</dd>
++              <dt className="text-forest-900/50">Credit balance</dt>
++              <dd className="num">{kes(member.creditBalance)}</dd>
++              <dt className="text-forest-900/50">National ID</dt>
++              <dd>
++                {showId ? (member.idNumber ?? member.nationalIdMasked) : member.nationalIdMasked}{' '}
++                <button onClick={() => setShowId((v) => !v)} className="text-forest-700 font-semibold text-xs ml-1">
++                  {showId ? 'Hide' : 'Show'}
++                </button>
++              </dd>
++              <dt className="text-forest-900/50">Account</dt>
++              <dd>{member.uid ? 'Linked — can log in' : 'Not linked — awaiting first sign-in'}</dd>
++            </dl>
++
++            {canManage && (
++              <div className="flex flex-col gap-2 pt-2 border-t border-forest-100">
++                <button onClick={() => setMode('edit')} disabled={busy} className="text-sm font-semibold text-forest-700 text-left">
++                  Edit details
++                </button>
++                {!isChair && (
++                  <button onClick={() => setMode('role')} disabled={busy} className="text-sm font-semibold text-forest-700 text-left">
++                    Change role
++                  </button>
++                )}
++                <div className="flex gap-2 flex-wrap pt-1">
++                  {STATUSES.map((s) => (
++                    <button
++                      key={s}
++                      disabled={busy || member.status === s}
++                      onClick={() => patch({ status: s })}
++                      className={`chip capitalize ${member.status === s ? STATUS_CHIP[s] : 'border border-forest-200 text-forest-700'}`}
++                    >
++                      {s}
++                    </button>
++                  ))}
++                </div>
++              </div>
++            )}
++          </>
++        )}
++
++        {mode === 'edit' && <EditMemberFields member={member} busy={busy} onCancel={() => setMode('view')} onSave={patch} />}
++
++        {mode === 'role' && (
++          <>
++            <h3 className="font-display font-semibold">Change role</h3>
++            <div className="flex flex-col gap-2">
++              {ASSIGNABLE_ROLES.map((r) => (
++                <button
++                  key={r}
++                  disabled={busy || member.role === r}
++                  onClick={() => patch({ role: r })}
++                  className={`text-sm font-semibold text-left px-3 py-2 rounded-lg border capitalize ${
++                    member.role === r ? 'border-forest-700 bg-forest-50' : 'border-forest-100 hover:bg-forest-50'
++                  }`}
++                >
++                  {r}
++                </button>
++              ))}
++            </div>
++            <button onClick={() => setMode('view')} disabled={busy} className="text-sm font-semibold text-forest-700 self-start">
++              Back
++            </button>
++          </>
++        )}
++
++        {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
++        {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
++
++        {mode === 'view' && (
++          <button onClick={onClose} className="text-sm font-semibold text-forest-900/50 self-center pt-1">
++            Close
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
++
++function EditMemberFields({
++  member,
++  busy,
++  onCancel,
++  onSave,
++}: {
++  member: ChamaMember;
++  busy: boolean;
++  onCancel: () => void;
++  onSave: (update: { name: string; phone: string }) => void;
++}) {
++  const [name, setName] = useState(member.name);
++  const [phone, setPhone] = useState(member.phone);
++  const [localError, setLocalError] = useState<string | null>(null);
++
++  function submit() {
++    setLocalError(null);
++    if (!name.trim()) {
++      setLocalError('Name is required.');
++      return;
++    }
++    if (!isValidKenyanPhone(phone)) {
++      setLocalError('Enter a valid Kenyan phone number.');
++      return;
++    }
++    onSave({ name: name.trim(), phone });
++  }
++
++  return (
++    <>
++      <h3 className="font-display font-semibold">Edit details</h3>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Full name
++        <input value={name} onChange={(e) => setName(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++      </label>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Phone number
++        <input value={phone} onChange={(e) => setPhone(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        <span className="text-xs text-forest-900/50 font-normal">
++          Changing this changes which sign-in matches this member — including WhatsApp bot access.
++        </span>
++      </label>
++      {localError && <p className="text-sm text-brick-500 font-medium">{localError}</p>}
++      <div className="flex gap-2">
++        <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
++          {busy ? 'Saving…' : 'Save'}
++        </button>
++        <button onClick={onCancel} disabled={busy} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">
++          Cancel
++        </button>
++      </div>
++    </>
++  );
++}
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 27f5627..4a0f125 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -109,8 +109,24 @@ export const completeProfile = liveCallable<
+   { memberId: string | null }
+ >('completeProfile', 'Completing your profile');
+ 
++/**
++ * Not queueable: called right after a phone sign-in resolves, so the app
++ * can decide whether to route into a chama or show "no chama yet" —
++ * queuing it would mean showing the wrong screen while offline.
++ *
++ * Auto-attaches the caller's uid to any pending member record matching
++ * their verified phone number, across every chama, and closes out the
++ * matching invite doc. See functions/mychama/identity.py::claimMyInvites —
++ * this is what lets a member added by an admin log in and land in their
++ * chama with no invite link ever having been sent.
++ */
++export const claimMyInvites = liveCallable<
++  Record<string, never>,
++  { claimed: { chamaId: string; chamaName: string; memberId: string; role: MemberRole }[] }
++>('claimMyInvites', 'Checking for pending invites');
++
+ export const updateMember = callable<
+-  { chamaId: string; memberId: string; patch: Partial<{ name: string; role: MemberRole; status: 'active' | 'inactive' | 'suspended' }> },
++  { chamaId: string; memberId: string; patch: Partial<{ name: string; phone: string; role: MemberRole; status: 'active' | 'inactive' | 'suspended' }> },
+   { ok: true }
+ >('updateMember', () => 'Update member');
+ 

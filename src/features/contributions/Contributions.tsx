@@ -7,6 +7,7 @@ import { useMembers, memberName } from '../../app/useMembers';
 import { recordCashContribution } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
+import { AdminChargeButton } from '../payments/AdminChargeButton';
 import type { Contribution } from '../../lib/types';
 import MyContributions from './MyContributions';
 
@@ -110,7 +111,7 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
               <th className="px-4 py-3 font-medium">Member</th>
               <th className="px-4 py-3 font-medium">Amount</th>
               <th className="px-4 py-3 font-medium">Status</th>
-              {isFinanceAdmin && <th className="px-4 py-3 font-medium">Record cash</th>}
+              {isFinanceAdmin && <th className="px-4 py-3 font-medium">Collect</th>}
             </tr>
           </thead>
           <tbody>
@@ -124,22 +125,33 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
                 {isFinanceAdmin && (
                   <td className="px-4 py-3">
                     {c.status !== 'paid' && (
-                      <div className="flex gap-2">
-                        <input
-                          type="number"
-                          placeholder={String(c.amount - c.paidAmount)}
-                          value={amounts[c.id] ?? ''}
-                          onChange={(e) => setAmounts((prev) => ({ ...prev, [c.id]: e.target.value }))}
-                          className="w-24 px-2 py-1.5 rounded-lg border border-forest-100 text-sm"
-                          disabled={busyId === c.id}
-                        />
-                        <button
-                          onClick={() => record(c)}
-                          disabled={busyId === c.id}
-                          className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full"
-                        >
-                          {busyId === c.id ? '…' : 'Record'}
-                        </button>
+                      <div className="flex flex-col gap-2">
+                        <div className="flex gap-2">
+                          <input
+                            type="number"
+                            placeholder={String(c.amount - c.paidAmount)}
+                            value={amounts[c.id] ?? ''}
+                            onChange={(e) => setAmounts((prev) => ({ ...prev, [c.id]: e.target.value }))}
+                            className="w-24 px-2 py-1.5 rounded-lg border border-forest-100 text-sm"
+                            disabled={busyId === c.id}
+                          />
+                          <button
+                            onClick={() => record(c)}
+                            disabled={busyId === c.id}
+                            className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full"
+                          >
+                            {busyId === c.id ? '…' : 'Record cash'}
+                          </button>
+                        </div>
+                        {chamaId && (
+                          <AdminChargeButton
+                            chamaId={chamaId}
+                            memberId={c.memberId}
+                            amount={c.amount - c.paidAmount}
+                            purpose="contribution"
+                            contributionId={c.id}
+                          />
+                        )}
                       </div>
                     )}
                   </td>
