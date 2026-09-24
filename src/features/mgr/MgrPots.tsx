@@ -33,10 +33,13 @@ function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isF
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display text-2xl font-semibold text-ink">Merry-Go-Round</h1>
+      <div className="mgr-header flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="font-display text-2xl font-semibold">Merry-Go-Round</h1>
+          <p className="text-sm text-white/70 mt-1">{pots.length} pot{pots.length === 1 ? '' : 's'} running</p>
+        </div>
         {isFinanceAdmin && (
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
             + New pot
           </button>
         )}
@@ -55,7 +58,12 @@ function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isF
 
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {pots.map((p) => (
-          <div key={p.id} className="card p-5 cursor-pointer hover:border-forest-300" onClick={() => navigate(`/app/mgr/${p.id}`)}>
+          <div
+            key={p.id}
+            className="card p-5 cursor-pointer hover:border-forest-300 border-l-4"
+            style={{ borderLeftColor: p.status === 'draft' ? 'var(--color-gold-400)' : p.status === 'completed' ? '#B8BDB6' : 'var(--color-forest-700)' }}
+            onClick={() => navigate(`/app/mgr/${p.id}`)}
+          >
             <h3 className="font-display font-semibold">{p.name}</h3>
             <p className="text-sm text-forest-900/60 mt-1">
               {kes(p.amount)} · {p.frequency} · {p.memberIds.length} members

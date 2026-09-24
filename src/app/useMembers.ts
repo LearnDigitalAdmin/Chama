@@ -37,3 +37,8 @@ export function useMembers(chamaId: string | null, activeOnly = true) {
 export function memberName(members: ChamaMember[], memberId: string): string {
   return members.find((m) => m.id === memberId)?.name ?? 'Unknown member';
 }
+
+/** Phone on file, for pre-filling AdminChargeButton's editable phone field — never used to bypass it. */
+export function memberPhone(members: ChamaMember[], memberId: string): string | undefined {
+  return members.find((m) => m.id === memberId)?.phone;
+}

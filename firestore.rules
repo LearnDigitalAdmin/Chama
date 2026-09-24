@@ -304,8 +304,15 @@ service cloud.firestore {
 
         // Officials run the draw, reorder the queue and advance periods. The
         // per-period money is in the records subcollection, which is closed.
+        // 'completed' (round-exhausted queue) and 'closed' (mgrCloseForever)
+        // are set only by server callables that first check for open
+        // arrears/an uncovered shortfall — a direct client write can't jump
+        // straight to either, so that check can't be bypassed by skipping
+        // the callable.
         allow update: if isFinanceAdmin(chamaId)
-                      && untouched(['createdAt', 'createdOn']);
+                      && untouched(['createdAt', 'createdOn'])
+                      && (request.resource.data.status == resource.data.status
+                          || request.resource.data.status in ['draft', 'active']);
 
         allow delete: if isFinanceAdmin(chamaId) && resource.data.status == 'draft';
 
@@ -317,6 +324,25 @@ service cloud.firestore {
         }
 
         match /payouts/{payoutId} {
+          allow read: if isMember(chamaId);
+          allow write: if false;
+        }
+
+        // Arrears, exits and the pot's own ledger all move money or record
+        // a membership change with money implications — same trust model
+        // as records/payouts: server-only, via the mgr* callables in
+        // functions/mychama/mgr.py.
+        match /arrears/{arrearId} {
+          allow read: if isMember(chamaId);
+          allow write: if false;
+        }
+
+        match /exits/{exitId} {
+          allow read: if isMember(chamaId);
+          allow write: if false;
+        }
+
+        match /ledger/{entryId} {
           allow read: if isMember(chamaId);
           allow write: if false;
         }

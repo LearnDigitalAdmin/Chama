@@ -198,9 +198,67 @@ export const closeMgrPeriod = callable<
 
 /** Added beyond the original Phase 2 contract — see mychama/mgr.py's docstring. */
 export const recordMgrPayoutCash = callable<
-  { chamaId: string; potId: string },
+  { chamaId: string; potId: string; acknowledgeShortfall?: boolean },
   { ok: true; paidTo: string[]; amountEach: number }
 >('recordMgrPayoutCash', () => 'Record merry-go-round payout');
+
+// -- MGR repair pass — membership, arrears, exits, shortfall, health -------
+
+export const mgrAddMembers = callable<{ chamaId: string; potId: string; memberIds: string[] }, { ok: true; added: string[] }>(
+  'mgrAddMembers',
+  (r) => `Add ${r.memberIds.length} member(s) to merry-go-round`
+);
+
+export const mgrRemoveMember = callable<{ chamaId: string; potId: string; memberId: string }, { ok: true }>(
+  'mgrRemoveMember',
+  () => 'Remove member from merry-go-round'
+);
+
+export const mgrReorderQueue = callable<{ chamaId: string; potId: string; queue: string[] }, { ok: true }>(
+  'mgrReorderQueue',
+  () => 'Reorder merry-go-round queue'
+);
+
+export const mgrToggleAutoDemote = callable<{ chamaId: string; potId: string }, { ok: true; autoDemoteLate: boolean }>(
+  'mgrToggleAutoDemote',
+  () => 'Toggle auto-demote for late payers'
+);
+
+export const mgrSettleArrear = callable<
+  { chamaId: string; potId: string; arrearId: string; amount?: number },
+  { ok: true; remaining: number }
+>('mgrSettleArrear', () => 'Settle merry-go-round arrear');
+
+export const mgrWriteOffArrear = callable<{ chamaId: string; potId: string; arrearId: string; reason: string }, { ok: true }>(
+  'mgrWriteOffArrear',
+  () => 'Write off merry-go-round arrear'
+);
+
+export const mgrCoverShortfall = callable<
+  { chamaId: string; potId: string; amount: number; source: 'reserve' | 'member'; memberId?: string },
+  { ok: true; remaining: number }
+>('mgrCoverShortfall', (r) => `Cover KES ${r.amount.toLocaleString()} merry-go-round shortfall`);
+
+/** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
+export const mgrProposeExit = liveCallable<
+  { chamaId: string; potId: string; memberId: string },
+  { exitId: string; proposedNet: number }
+>('mgrProposeExit', 'Working out exit settlement');
+
+export const mgrSettleExit = callable<
+  { chamaId: string; potId: string; exitId: string; settledAmount?: number },
+  { ok: true; settledAmount: number; settledDirection: 'pot_to_member' | 'member_to_pot' }
+>('mgrSettleExit', () => 'Settle merry-go-round exit');
+
+export const mgrRepairPot = callable<{ chamaId: string; potId: string }, { ok: true; changed: boolean; queue: string[] }>(
+  'mgrRepairPot',
+  () => 'Repair merry-go-round pot'
+);
+
+export const mgrCloseForever = callable<{ chamaId: string; potId: string }, { ok: true }>(
+  'mgrCloseForever',
+  () => 'Close merry-go-round pot'
+);
 
 // ---------------------------------------------------------------------------
 // Phase 3 — Payments, SMS & Settlement
@@ -230,8 +288,10 @@ export const approveSettlementChange = callable<
  *
  * Admin-on-behalf-of-member charge: pass `memberId` for a member other
  * than the caller (finance-admin only — see functions/mychama/payments.py).
- * `phone` is ignored in that case; the server always uses the target
- * member's phone on file. This is what
+ * `phone` is ignored in that case; the server defaults to the target
+ * member's phone on file, or — pass `overridePhone` to send the STK
+ * prompt to a different number instead (e.g. a spouse/agent paying on
+ * the member's behalf). This is what
  * src/features/payments/AdminChargeButton.tsx calls, shared across
  * Contributions and MGR admin screens.
  */
@@ -242,6 +302,7 @@ export const initiatePayment = liveCallable<
     amount: number;
     phone?: string;
     memberId?: string;
+    overridePhone?: string;
     contributionId?: string;
     loanId?: string;
     installmentNo?: number;
@@ -280,6 +341,6 @@ export const upgradePlan = liveCallable<
  * minutes entry's PDF via minutesId, which ignores from/to/memberId.
  */
 export const generateStatement = liveCallable<
-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string },
+  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string },
   { url: string }
 >('generateStatement', 'Generating statement');

@@ -145,12 +145,65 @@ export interface MgrPot {
   drawDone: boolean;
   drawMethod: 'smart' | 'random' | null;
   autoDemoteLate: boolean;
-  status: 'draft' | 'active' | 'completed';
+  status: 'draft' | 'active' | 'completed' | 'closed';
   cycleNumber: number;
   period: number;
+  /** Carried from the last closeMgrPeriod — what the round fell short by. Cleared by mgrCoverShortfall / paid out. */
+  pendingShortfall?: number;
+  remindersEnabled?: boolean;
+  reminderScheduleId?: string | null;
+  closedAt?: number | null;
   createdOn: string;
   createdAt?: number;
   updatedAt?: number;
+}
+
+export interface MgrArrear {
+  id: string;
+  memberId: string;
+  periods: number[];
+  amount: number;
+  status: 'open' | 'settled' | 'written_off';
+  settledAmount?: number;
+  writeOffReason?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MgrExit {
+  id: string;
+  memberId: string;
+  proposedNet: number;
+  status: 'proposed' | 'settled';
+  settledAmount?: number;
+  settledDirection?: 'pot_to_member' | 'member_to_pot';
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type MgrLedgerKind =
+  | 'contribution'
+  | 'payout'
+  | 'arrear_opened'
+  | 'arrear_settled'
+  | 'arrear_written_off'
+  | 'shortfall_recorded'
+  | 'shortfall_covered'
+  | 'member_added'
+  | 'member_removed'
+  | 'exit_settled'
+  | 'queue_reordered'
+  | 'period_closed'
+  | 'pot_closed'
+  | 'repaired';
+
+export interface MgrLedgerEntry {
+  id: string;
+  kind: MgrLedgerKind;
+  memberId?: string | null;
+  amount?: number;
+  note?: string;
+  createdAt: number;
 }
 
 export interface MgrRecord {
@@ -203,6 +256,8 @@ export interface ChamaTransaction {
   channel?: 'app' | 'whatsapp';
   /** paymentIntents document ID when the payment originated on WhatsApp or the app. */
   intentId?: string;
+  /** Set on mgr_contribution / mgr_payout / shortfall-cover / exit-settlement rows so a statement can be scoped to one pot. */
+  potId?: string | null;
   createdAt?: number;
 }
 

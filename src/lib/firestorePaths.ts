@@ -30,6 +30,13 @@ export const paths = {
   mgrRecord: (chamaId: string, potId: string, recordId: string) =>
     `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_RECORDS}/${recordId}`,
   mgrPayouts: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_PAYOUTS}`,
+  mgrArrears: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_ARREARS}`,
+  mgrArrear: (chamaId: string, potId: string, arrearId: string) =>
+    `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_ARREARS}/${arrearId}`,
+  mgrExits: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_EXITS}`,
+  mgrExit: (chamaId: string, potId: string, exitId: string) =>
+    `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_EXITS}/${exitId}`,
+  mgrLedger: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_LEDGER}`,
 
   paymentIntents: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.PAYMENT_INTENTS}`,
   paymentIntent: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.PAYMENT_INTENTS}/${reference}`,

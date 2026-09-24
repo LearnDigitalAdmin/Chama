@@ -3,7 +3,7 @@ import { collection, onSnapshot } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { paths } from '../../lib/firestorePaths';
 import { useChama } from '../../app/ChamaProvider';
-import { useMembers, memberName } from '../../app/useMembers';
+import { useMembers, memberName, memberPhone } from '../../app/useMembers';
 import { recordCashContribution } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
@@ -147,6 +147,7 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
                           <AdminChargeButton
                             chamaId={chamaId}
                             memberId={c.memberId}
+                            memberPhone={memberPhone(members, c.memberId)}
                             amount={c.amount - c.paidAmount}
                             purpose="contribution"
                             contributionId={c.id}

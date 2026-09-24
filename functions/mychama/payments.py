@@ -17,11 +17,16 @@ component — one callable, one fee/reference/rate-limit/idempotency path,
 usable for any purpose already in the `purpose` dispatch table below
 (currently `contribution` and `mgr_contribution` have UI wired to it;
 `loan_repayment` works identically if a UI ever wants it, with zero
-backend changes). The phone charged is always read from the target
-member's own record — never a client-supplied number — so an admin can't
-redirect someone else's STK prompt to a phone of their choosing. Self-pay
-(no `memberId`, or `memberId` equal to the caller's own) is unchanged from
-before and needs no finance-admin role.
+backend changes). The phone charged defaults to the target member's own
+record on file. A finance admin MAY additionally pass `overridePhone` to
+send the STK prompt to a different number instead (e.g. a spouse or agent
+paying on the member's behalf, matching the demo's manual-number-entry
+admin charge screen) — this never changes who the charge is recorded
+against, only whose phone gets the prompt, and every override is stamped
+on the paymentIntent (`phoneOverridden`, `memberPhoneOnFile`) for audit
+rather than silently substituted. Self-pay (no `memberId`, or `memberId`
+equal to the caller's own) is unchanged from before, ignores
+`overridePhone`, and needs no finance-admin role.
 
 setupSettlementAccount / requestSettlementChange / approveSettlementChange
 create/change the Paystack subaccount + split code a chama's collections
@@ -233,12 +238,14 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
     db = _db()
     caller_membership = require_membership(db, uid, chama_id)
 
+    phone_overridden = False
+    member_phone_on_file = None
     if target_member_id and target_member_id != caller_membership.member_id:
         # Admin-initiated charge on behalf of another member. Only a
-        # finance admin may do this, and the phone charged always comes
-        # from the target member's own record — never `data.get("phone")`
-        # — so this can't be used to push an STK prompt to an arbitrary
-        # number under someone else's name.
+        # finance admin may do this. Defaults to the target member's own
+        # phone on file; an explicit `overridePhone` from the finance admin
+        # is allowed (see module docstring) but is always logged as an
+        # override rather than silently treated as "the member's phone".
         require_finance_admin(db, uid, chama_id)
         target_snap = db.document(paths.member(chama_id, target_member_id)).get()
         if not target_snap.exists:
@@ -247,7 +254,13 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
         if target_member.get("status") != "active":
             raise precondition("This member isn't active.")
         member_id = target_member_id
-        phone = target_member.get("phone") or ""
+        member_phone_on_file = target_member.get("phone") or ""
+        override_phone = (data.get("overridePhone") or "").strip()
+        if override_phone:
+            phone = override_phone
+            phone_overridden = phone.strip() != member_phone_on_file.strip()
+        else:
+            phone = member_phone_on_file
         initiated_by = {"uid": uid, "memberId": caller_membership.member_id, "role": caller_membership.role}
     else:
         member_id = caller_membership.member_id
@@ -313,6 +326,8 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
         "status": "pending",
         "channel": "app",
         "initiatedBy": initiated_by,
+        "phoneOverridden": phone_overridden,
+        "memberPhoneOnFile": member_phone_on_file,
         "contributionId": data.get("contributionId"),
         "loanId": data.get("loanId"),
         "installmentNo": data.get("installmentNo"),

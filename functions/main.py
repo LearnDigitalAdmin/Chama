@@ -44,6 +44,17 @@ from mychama.mgr import (  # noqa: E402,F401
     recordCashMgrPayment,
     closeMgrPeriod,
     recordMgrPayoutCash,
+    mgrAddMembers,
+    mgrRemoveMember,
+    mgrReorderQueue,
+    mgrToggleAutoDemote,
+    mgrSettleArrear,
+    mgrWriteOffArrear,
+    mgrCoverShortfall,
+    mgrProposeExit,
+    mgrSettleExit,
+    mgrRepairPot,
+    mgrCloseForever,
 )
 
 # --- Phase 3: Payments, SMS & Settlement -----------------------------------

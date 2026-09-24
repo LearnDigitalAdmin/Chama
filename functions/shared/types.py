@@ -167,12 +167,68 @@ class MgrPot(TypedDict):
     drawDone: bool
     drawMethod: Optional[Literal["smart", "random"]]
     autoDemoteLate: bool
-    status: Literal["draft", "active", "completed"]
+    status: Literal["draft", "active", "completed", "closed"]
     cycleNumber: int
     period: int
+    # pending shortfall carried from the last closeMgrPeriod on this pot —
+    # set when the round's collected total falls short of the promised
+    # payout, cleared/decremented by recordMgrShortfallCover. Surfaced to
+    # admins to chase rather than quietly absorbed. See mgr_engine.py.
+    pendingShortfall: NotRequired[float]
+    remindersEnabled: NotRequired[bool]
+    reminderScheduleId: NotRequired[Optional[str]]
+    closedAt: NotRequired[Optional[int]]
     createdOn: NotRequired[str]
     createdAt: NotRequired[int]
     updatedAt: NotRequired[int]
+
+
+class MgrArrear(TypedDict):
+    """chamas/{c}/mgrPots/{p}/arrears/{id} — one open running balance per
+    member per pot, opened automatically the first time closeMgrPeriod
+    marks them missed, topped up by every subsequent miss."""
+    id: NotRequired[str]
+    memberId: str
+    periods: List[int]           # periods this arrear covers
+    amount: float                # outstanding balance
+    status: Literal["open", "settled", "written_off"]
+    settledAmount: NotRequired[float]
+    writeOffReason: NotRequired[str]
+    createdAt: int
+    updatedAt: int
+
+
+class MgrExit(TypedDict):
+    """chamas/{c}/mgrPots/{p}/exits/{id} — a member leaving the pot
+    mid-cycle. 'proposed' shows the computed net settlement (what they've
+    paid in this cycle minus what they've already received); 'settled'
+    records how the cash actually moved."""
+    id: NotRequired[str]
+    memberId: str
+    proposedNet: float           # positive = pot owes the member; negative = member owes the pot
+    status: Literal["proposed", "settled"]
+    settledAmount: NotRequired[float]
+    settledDirection: NotRequired[Literal["pot_to_member", "member_to_pot"]]
+    createdAt: int
+    updatedAt: int
+
+
+class MgrLedgerEntry(TypedDict):
+    """chamas/{c}/mgrPots/{p}/ledger/{id} — append-only log of every
+    money-moving or membership-changing event on the pot, independent of
+    the main chama transactions collection. This is what lets a pot be
+    audited/repaired on its own, and is the source for per-pot statements."""
+    id: NotRequired[str]
+    kind: Literal[
+        "contribution", "payout", "arrear_opened", "arrear_settled",
+        "arrear_written_off", "shortfall_recorded", "shortfall_covered",
+        "member_added", "member_removed", "exit_settled",
+        "queue_reordered", "period_closed", "pot_closed", "repaired",
+    ]
+    memberId: NotRequired[Optional[str]]
+    amount: NotRequired[float]
+    note: NotRequired[str]
+    createdAt: int
 
 
 class MgrRecord(TypedDict):
@@ -217,6 +273,10 @@ class ChamaTransaction(TypedDict):
     note: NotRequired[str]
     channel: Literal["app", "whatsapp"]
     intentId: NotRequired[str]
+    # Set on every mgr_contribution / mgr_payout / mgr_shortfall_cover /
+    # mgr_exit_settlement row so generateStatement can scope a statement to
+    # one pot without string-matching `note`. See functions/mychama/mgr.py.
+    potId: NotRequired[Optional[str]]
     createdAt: NotRequired[int]
 
 
@@ -242,6 +302,12 @@ class PaymentIntent(TypedDict):
     provider: Provider
     status: IntentStatus
     channel: IntentChannel
+    # Set when a finance admin charging on another member's behalf typed a
+    # different number than the one on file (e.g. a spouse's or agent's
+    # phone). Audit trail only — never changes who the charge is recorded
+    # against. See functions/mychama/payments.py::initiatePayment.
+    phoneOverridden: NotRequired[bool]
+    memberPhoneOnFile: NotRequired[Optional[str]]
     contributionId: NotRequired[Optional[str]]
     loanId: NotRequired[Optional[str]]
     installmentNo: NotRequired[Optional[int]]

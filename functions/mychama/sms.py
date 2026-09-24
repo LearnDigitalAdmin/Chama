@@ -199,8 +199,17 @@ def _frequency_ms(frequency: str) -> int:
 def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
     """
     Dispatches chamas/{chamaId}/smsSchedules entries whose nextRun has
-    passed. Each schedule doc: { message, audience, memberIds?, frequency,
-    nextRun (epoch ms), active }.
+    passed. Each schedule doc: { body, audience, memberIds?, frequency,
+    nextRun (epoch ms), status: 'active'|'paused', potId? }.
+
+    Field names here MUST match firestore.rules' smsSchedules validation
+    (`status` and `body`, not `active`/`message` — those were the original
+    field names before the rules were written and this cron was never
+    updated to match, so a schedule created through the rules-sanctioned
+    direct write was silently never picked up. potId is optional and is
+    for the UI's benefit only (which pot a reminder schedule belongs to,
+    e.g. src/features/mgr/MgrPotDetail.tsx's Reminders card) — it plays no
+    part in dispatch.
     """
     db = _db()
     now = now_ms()
@@ -214,21 +223,23 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
 
         due = (
             db.collection(paths.sms_schedules(chama_id))
-            .where("active", "==", True)
+            .where("status", "==", "active")
             .where("nextRun", "<=", now)
             .stream()
         )
         for sched_doc in due:
             sched = sched_doc.to_dict()
+            body = sched.get("body") or sched.get("message") or ""  # tolerate pre-fix docs written under the old field name
             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
             recipients = [m for m in recipients if m.get("phoneNormalized")]
             cost = round(len(recipients) * rate * 100) / 100
 
             credits = chama.get("smsCredits", 0)
-            if credits < cost or not recipients:
-                # Not enough credit or nobody to send to — push nextRun forward
-                # by one frequency step so it's retried next cycle rather than
-                # spamming the same failure every 15 minutes.
+            if credits < cost or not recipients or not body:
+                # Not enough credit, nobody to send to, or an empty body —
+                # push nextRun forward by one frequency step so it's retried
+                # next cycle rather than spamming the same failure every 15
+                # minutes.
                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
                 continue
 
@@ -241,7 +252,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
                         apikey=HP_APIKEY.value,
                         sender_id=HP_SENDER_ID.value,
                         phone_e164=normalize_sms_phone(member["phoneNormalized"]),
-                        message=sched["message"],
+                        message=body,
                     )
                     sent += 1
                 except Exception:  # noqa: BLE001
@@ -251,7 +262,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
             db.collection(paths.sms_log(chama_id)).document().set({
                 "audience": sched.get("audience", "all"),
-                "message": sched["message"],
+                "message": body,
                 "recipientIds": [m["id"] for m in recipients],
                 "recipientCount": len(recipients),
                 "sentCount": sent,

@@ -1,0 +1,2446 @@
+diff --git a/firestore.indexes.json b/firestore.indexes.json
+index 96c2763..9aba414 100644
+--- a/firestore.indexes.json
++++ b/firestore.indexes.json
+@@ -465,6 +465,52 @@
+           "order": "ASCENDING"
+         }
+       ]
++    },
++    {
++      "collectionGroup": "transactions",
++      "queryScope": "COLLECTION",
++      "fields": [
++        {
++          "fieldPath": "potId",
++          "order": "ASCENDING"
++        },
++        {
++          "fieldPath": "date",
++          "order": "ASCENDING"
++        }
++      ]
++    },
++    {
++      "collectionGroup": "transactions",
++      "queryScope": "COLLECTION",
++      "fields": [
++        {
++          "fieldPath": "memberId",
++          "order": "ASCENDING"
++        },
++        {
++          "fieldPath": "potId",
++          "order": "ASCENDING"
++        },
++        {
++          "fieldPath": "date",
++          "order": "ASCENDING"
++        }
++      ]
++    },
++    {
++      "collectionGroup": "arrears",
++      "queryScope": "COLLECTION",
++      "fields": [
++        {
++          "fieldPath": "memberId",
++          "order": "ASCENDING"
++        },
++        {
++          "fieldPath": "status",
++          "order": "ASCENDING"
++        }
++      ]
+     }
+   ],
+   "fieldOverrides": [
+diff --git a/firestore.rules b/firestore.rules
+index 4fb2a79..6169ac5 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -304,8 +304,15 @@ service cloud.firestore {
+ 
+         // Officials run the draw, reorder the queue and advance periods. The
+         // per-period money is in the records subcollection, which is closed.
++        // 'completed' (round-exhausted queue) and 'closed' (mgrCloseForever)
++        // are set only by server callables that first check for open
++        // arrears/an uncovered shortfall — a direct client write can't jump
++        // straight to either, so that check can't be bypassed by skipping
++        // the callable.
+         allow update: if isFinanceAdmin(chamaId)
+-                      && untouched(['createdAt', 'createdOn']);
++                      && untouched(['createdAt', 'createdOn'])
++                      && (request.resource.data.status == resource.data.status
++                          || request.resource.data.status in ['draft', 'active']);
+ 
+         allow delete: if isFinanceAdmin(chamaId) && resource.data.status == 'draft';
+ 
+@@ -320,6 +327,25 @@ service cloud.firestore {
+           allow read: if isMember(chamaId);
+           allow write: if false;
+         }
++
++        // Arrears, exits and the pot's own ledger all move money or record
++        // a membership change with money implications — same trust model
++        // as records/payouts: server-only, via the mgr* callables in
++        // functions/mychama/mgr.py.
++        match /arrears/{arrearId} {
++          allow read: if isMember(chamaId);
++          allow write: if false;
++        }
++
++        match /exits/{exitId} {
++          allow read: if isMember(chamaId);
++          allow write: if false;
++        }
++
++        match /ledger/{entryId} {
++          allow read: if isMember(chamaId);
++          allow write: if false;
++        }
+       }
+ 
+       // -------------------------------------------------------------- //
+diff --git a/functions/main.py b/functions/main.py
+index 215477a..4f1bd4e 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -44,6 +44,17 @@ from mychama.mgr import (  # noqa: E402,F401
+     recordCashMgrPayment,
+     closeMgrPeriod,
+     recordMgrPayoutCash,
++    mgrAddMembers,
++    mgrRemoveMember,
++    mgrReorderQueue,
++    mgrToggleAutoDemote,
++    mgrSettleArrear,
++    mgrWriteOffArrear,
++    mgrCoverShortfall,
++    mgrProposeExit,
++    mgrSettleExit,
++    mgrRepairPot,
++    mgrCloseForever,
+ )
+ 
+ # --- Phase 3: Payments, SMS & Settlement -----------------------------------
+diff --git a/functions/mychama/billing.py b/functions/mychama/billing.py
+index 6225935..c637165 100644
+--- a/functions/mychama/billing.py
++++ b/functions/mychama/billing.py
+@@ -203,10 +203,12 @@ TX_LABEL = {
+ }
+ 
+ 
+-def _fetch_transactions(db, chama_id: str, member_id: str | None, date_from: str, date_to: str) -> list[dict]:
++def _fetch_transactions(db, chama_id: str, member_id: str | None, date_from: str, date_to: str, pot_id: str | None = None) -> list[dict]:
+     q = db.collection(paths.transactions(chama_id)).where("date", ">=", date_from).where("date", "<=", date_to)
+     if member_id:
+         q = q.where("memberId", "==", member_id)
++    if pot_id:
++        q = q.where("potId", "==", pot_id)
+     rows = [d.to_dict() for d in q.stream()]
+     rows.sort(key=lambda r: (r.get("date", ""), r.get("createdAt", 0)))
+     return rows
+@@ -364,6 +366,7 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     date_to = data.get("to")
+     fmt = data.get("format")
+     minutes_id = data.get("minutesId")  # minimal, documented addition — see TOUCH_BASE.md
++    pot_id = data.get("potId")  # optional — scopes the statement to one MGR pot, see mychama/mgr.py
+ 
+     if not chama_id or fmt not in ("pdf", "csv"):
+         raise bad_request("chamaId and a valid format ('pdf' or 'csv') are required.")
+@@ -408,15 +411,22 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+         content_type = "application/pdf"
+     else:
+         names = _member_name_map(db, chama_id)
+-        scope_label = names.get(member_id, "Member") if member_id else "Whole chama"
+-        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to)
++        pot_label = None
++        if pot_id:
++            pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
++            if not pot_snap.exists:
++                raise not_found("Merry-go-round pot not found.")
++            pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
++        base_label = names.get(member_id, "Member") if member_id else "Whole chama"
++        scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
++        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
+         if fmt == "csv":
+             content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
+             content_type = "text/csv"
+         else:
+             content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to)
+             content_type = "application/pdf"
+-        filename = f"statement-{member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
++        filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
+ 
+     url = _upload_and_sign(chama_id, filename, content, content_type)
+ 
+diff --git a/functions/mychama/mgr.py b/functions/mychama/mgr.py
+index c9e699e..816da9c 100644
+--- a/functions/mychama/mgr.py
++++ b/functions/mychama/mgr.py
+@@ -17,6 +17,42 @@ period and flags whether a round just completed; actually paying the
+ recipient(s) is a distinct, deliberate action (mirroring the demo's
+ separate "confirm payout" step), so it gets its own callable. Back-ported
+ into API_CONTRACT.md in this same change.
++
++--------------------------------------------------------------------------
++MGR REPAIR — feature-parity pass with the original demo (see TOUCH_BASE.md
++"MGR repair"). Everything below is new. All of it follows the same trust
++split as the four callables above:
++  - mgrAddMembers / mgrRemoveMember / mgrReorderQueue — membership &
++    ordering changes. Reordering is deliberately still a callable even
++    though firestore.rules lets a finance admin write `queue` directly on
++    the pot doc — this validates the new order is a permutation of the
++    CURRENT queue (can't inject a member who isn't in it) and logs the
++    change to the ledger, so a bad client-side drag never corrupts payout
++    order silently.
++  - mgrProposeExit / mgrSettleExit — a member leaving mid-cycle. Propose
++    computes (server-side, from records+payouts) what the pot owes them or
++    they owe the pot; settle records how the cash actually moved and
++    removes them from the pot.
++  - mgrSettleArrear / mgrWriteOffArrear — arrears are opened automatically
++    by closeMgrPeriod (one running-balance doc per member per pot); these
++    close them out.
++  - mgrCoverShortfall — records how a round's shortfall (promised payout
++    minus what was actually collected) got made up, and clears it from
++    pot.pendingShortfall. recordMgrPayoutCash refuses to pay out while a
++    shortfall is outstanding unless the caller explicitly acknowledges it.
++  - mgrRepairPot — the only callable that MUTATES based on
++    mgr_engine.health_check's findings (de-dupes/reconciles the queue).
++    The health check itself is pure and mirrored client-side
++    (src/lib/mgrEngine.ts::healthCheck) for an instant-feeling Health card
++    — reading it needs no round trip, acting on it always does.
++  - mgrCloseForever — retires a pot. Refuses while arrears are open or a
++    shortfall is outstanding, to stop a pot being closed with unresolved
++    money still on the table.
++
++Every mutation below writes an entry to the pot's own `ledger`
++subcollection (functions/shared/types.py::MgrLedgerEntry) — independent of
++the chama-wide `transactions` collection — so a single pot's full history
++can be audited or exported without cross-referencing anything else.
+ """
+ 
+ from __future__ import annotations
+@@ -50,6 +86,37 @@ def _all_records(db, chama_id: str, pot_id: str) -> list[dict]:
+     return [d.to_dict() | {"id": d.id} for d in db.collection(paths.mgr_records(chama_id, pot_id)).stream()]
+ 
+ 
++def _all_payouts(db, chama_id: str, pot_id: str) -> list[dict]:
++    return [d.to_dict() | {"id": d.id} for d in db.collection(paths.mgr_payouts(chama_id, pot_id)).stream()]
++
++
++def _all_arrears(db, chama_id: str, pot_id: str) -> list[dict]:
++    return [d.to_dict() | {"id": d.id} for d in db.collection(paths.mgr_arrears(chama_id, pot_id)).stream()]
++
++
++def _open_arrear_for(db, chama_id: str, pot_id: str, member_id: str):
++    q = (
++        db.collection(paths.mgr_arrears(chama_id, pot_id))
++        .where("memberId", "==", member_id)
++        .where("status", "==", "open")
++        .limit(1)
++        .stream()
++    )
++    docs = list(q)
++    return docs[0] if docs else None
++
++
++def _log(db, chama_id: str, pot_id: str, kind: str, *, member_id: str | None = None, amount: float | None = None, note: str | None = None) -> None:
++    entry = {"kind": kind, "createdAt": now_ms()}
++    if member_id is not None:
++        entry["memberId"] = member_id
++    if amount is not None:
++        entry["amount"] = amount
++    if note is not None:
++        entry["note"] = note
++    db.collection(paths.mgr_ledger(chama_id, pot_id)).document().set(entry)
++
++
+ @https_fn.on_call(region=REGION)
+ def createMgrPot(req: https_fn.CallableRequest) -> dict:
+     uid = require_auth(req)
+@@ -209,8 +276,10 @@ def recordCashMgrPayment(req: https_fn.CallableRequest) -> dict:
+         "direction": "in",
+         "channel": "app",
+         "note": pot["name"],
++        "potId": pot_id,
+         "createdAt": ts,
+     })
++    _log(db, chama_id, pot_id, "contribution", member_id=member_id, amount=use_amount, note="cash")
+ 
+     result = {"ok": True}
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+@@ -240,26 +309,49 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
+     ts = now_ms()
+     today = today_iso()
+ 
+-    # Anyone with no record for this period is marked missed.
++    # Anyone with no record for this period is marked missed, and gets (or
++    # tops up) an open arrears balance — this is what turns a bare "missed"
++    # flag into a chaseable running total instead of a fact that's only
++    # ever visible one period at a time.
+     have_records = {
+         d.to_dict()["memberId"]
+         for d in db.collection(paths.mgr_records(chama_id, pot_id)).where("period", "==", pot["period"]).stream()
+     }
++    missed_ids = [m for m in pot["memberIds"] if m not in have_records]
+     batch = db.batch()
+-    for member_id in pot["memberIds"]:
+-        if member_id not in have_records:
+-            rec_ref = db.collection(paths.mgr_records(chama_id, pot_id)).document()
+-            batch.set(rec_ref, {
+-                "period": pot["period"],
++    for member_id in missed_ids:
++        rec_ref = db.collection(paths.mgr_records(chama_id, pot_id)).document()
++        batch.set(rec_ref, {
++            "period": pot["period"],
++            "memberId": member_id,
++            "status": "missed",
++            "amount": pot["amount"],
++            "date": today,
++            "method": None,
++            "createdAt": ts,
++            "updatedAt": ts,
++        })
++        existing_arrear = _open_arrear_for(db, chama_id, pot_id, member_id)
++        if existing_arrear:
++            a = existing_arrear.to_dict()
++            batch.update(existing_arrear.reference, {
++                "amount": round((a["amount"] + pot["amount"]) * 100) / 100,
++                "periods": a.get("periods", []) + [pot["period"]],
++                "updatedAt": ts,
++            })
++        else:
++            arrear_ref = db.collection(paths.mgr_arrears(chama_id, pot_id)).document()
++            batch.set(arrear_ref, {
+                 "memberId": member_id,
+-                "status": "missed",
++                "periods": [pot["period"]],
+                 "amount": pot["amount"],
+-                "date": today,
+-                "method": None,
++                "status": "open",
+                 "createdAt": ts,
+                 "updatedAt": ts,
+             })
+     batch.commit()
++    for member_id in missed_ids:
++        _log(db, chama_id, pot_id, "arrear_opened", member_id=member_id, amount=pot["amount"], note=f"period {pot['period']}")
+ 
+     records = _all_records(db, chama_id, pot_id)
+     queue = pot["queue"]
+@@ -273,7 +365,10 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
+         info = mgr_engine.pool_for_round(pot, records)
+         recipients = queue[: pot["recipientsPerRound"]]
+         share = round((info["expected"] / len(recipients)) * 100) / 100 if recipients else 0
+-        pot_ref.update({"queue": queue, "updatedAt": ts})
++        pot_ref.update({"queue": queue, "pendingShortfall": info["shortfall"], "updatedAt": ts})
++        if info["shortfall"] > 0:
++            _log(db, chama_id, pot_id, "shortfall_recorded", amount=info["shortfall"], note=f"round ending period {pot['period']}")
++        _log(db, chama_id, pot_id, "period_closed", note=f"period {pot['period']} (round complete)")
+         result.update({
+             "payoutPending": True,
+             "recipients": recipients,
+@@ -283,6 +378,7 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
+         })
+     else:
+         pot_ref.update({"queue": queue, "period": pot["period"] + 1, "updatedAt": ts})
++        _log(db, chama_id, pot_id, "period_closed", note=f"period {pot['period']}")
+         result["nextPeriod"] = pot["period"] + 1
+ 
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+@@ -312,13 +408,21 @@ def recordMgrPayoutCash(req: https_fn.CallableRequest) -> dict:
+     if dedup is not None:
+         return dedup
+ 
++    if pot.get("pendingShortfall", 0) > 0 and not data.get("acknowledgeShortfall"):
++        raise precondition(
++            f"This round is short by KES {pot['pendingShortfall']:,.2f} — record how it's being covered "
++            "(mgrCoverShortfall) first, or pay out anyway with acknowledgeShortfall."
++        )
++
+     records = _all_records(db, chama_id, pot_id)
++    short_round = mgr_engine.is_short_round(pot)
++    plan = mgr_engine.build_final_plan(pot, records) if short_round else None
+     info = mgr_engine.pool_for_round(pot, records)
+-    recipients = pot["queue"][: pot["recipientsPerRound"]]
++    recipients = plan["recipients"] if plan else pot["queue"][: pot["recipientsPerRound"]]
+     if not recipients:
+         raise precondition("No recipients left in the queue for this pot.")
+ 
+-    share = round((info["expected"] / len(recipients)) * 100) / 100
++    share = plan["shareEach"] if plan else round((info["expected"] / len(recipients)) * 100) / 100
+     round_no = -(-pot["period"] // pot["periodsPerRound"])  # ceil division
+     ts = now_ms()
+     today = today_iso()
+@@ -345,20 +449,497 @@ def recordMgrPayoutCash(req: https_fn.CallableRequest) -> dict:
+             "settled": True,
+             "direction": "out",
+             "channel": "app",
+-            "note": pot["name"] + " payout",
++            "note": pot["name"] + " payout" + (" (final, short round)" if short_round else ""),
++            "potId": pot_id,
+             "createdAt": ts,
+         })
+ 
+     new_queue = [m for m in pot["queue"] if m not in recipients]
+-    new_status = "completed" if len(new_queue) < pot["recipientsPerRound"] else pot["status"]
++    new_status = "completed" if short_round or len(new_queue) < pot["recipientsPerRound"] else pot["status"]
+     batch.update(pot_ref, {
+         "queue": new_queue,
+         "period": pot["period"] + 1,
+         "status": new_status,
++        "pendingShortfall": 0,
+         "updatedAt": ts,
+     })
+     batch.commit()
++    for member_id in recipients:
++        _log(db, chama_id, pot_id, "payout", member_id=member_id, amount=share, note=f"round {round_no}")
+ 
+     result = {"ok": True, "paidTo": recipients, "amountEach": share}
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+     return result
++
++
++# --------------------------------------------------------------------- #
++# Membership & queue
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrAddMembers(req: https_fn.CallableRequest) -> dict:
++    """Adds member(s) to a pot that's already drawn — appended to the back
++    of the queue so they join the rotation without displacing anyone
++    already waiting. (A draft pot's membership is edited by re-running
++    createMgrPot's picker instead, so this only applies once drawDone.)"""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    member_ids = data.get("memberIds") or []
++    if not chama_id or not pot_id or not member_ids:
++        raise bad_request("chamaId, potId, and memberIds are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    if pot["status"] not in ("draft", "active"):
++        raise precondition("Members can only be added to a draft or active pot.")
++
++    new_ids = [m for m in member_ids if m not in pot["memberIds"]]
++    if not new_ids:
++        raise bad_request("Those members are already in this pot.")
++
++    ts = now_ms()
++    pot_ref.update({
++        "memberIds": pot["memberIds"] + new_ids,
++        "queue": pot["queue"] + new_ids if pot["drawDone"] else pot["queue"],
++        "updatedAt": ts,
++    })
++    for member_id in new_ids:
++        _log(db, chama_id, pot_id, "member_added", member_id=member_id)
++
++    result = {"ok": True, "added": new_ids}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++@https_fn.on_call(region=REGION)
++def mgrRemoveMember(req: https_fn.CallableRequest) -> dict:
++    """Removes a member who has NOT yet received a payout this cycle and
++    has no open arrear — a plain "never got their turn, take them out"
++    removal. Someone who HAS received a payout, or is owed/owes money,
++    must go through mgrProposeExit/mgrSettleExit instead so that money
++    is accounted for."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    member_id = data.get("memberId")
++    if not chama_id or not pot_id or not member_id:
++        raise bad_request("chamaId, potId, and memberId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    if member_id not in pot["memberIds"]:
++        raise bad_request("That member isn't in this pot.")
++
++    payouts = _all_payouts(db, chama_id, pot_id)
++    if any(p["memberId"] == member_id for p in payouts):
++        raise precondition("This member has already received a payout — use mgrProposeExit instead.")
++    if _open_arrear_for(db, chama_id, pot_id, member_id):
++        raise precondition("This member has an open arrear — settle or write it off first.")
++
++    ts = now_ms()
++    pot_ref.update({
++        "memberIds": [m for m in pot["memberIds"] if m != member_id],
++        "queue": [m for m in pot["queue"] if m != member_id],
++        "updatedAt": ts,
++    })
++    _log(db, chama_id, pot_id, "member_removed", member_id=member_id)
++
++    result = {"ok": True}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++@https_fn.on_call(region=REGION)
++def mgrReorderQueue(req: https_fn.CallableRequest) -> dict:
++    """
++    Manual promotion/relegation override. The UI may compute and preview a
++    proposed order client-side (src/lib/mgrEngine.ts — late score and
++    recent reliability are already trusted read-only figures, so a
++    same-inputs preview costs nothing to trust); this callable is what
++    actually commits any reorder, so a queue can never be rewritten to
++    something that isn't a permutation of who's actually in it.
++    """
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    new_queue = data.get("queue")
++    if not chama_id or not pot_id or not isinstance(new_queue, list):
++        raise bad_request("chamaId, potId, and queue (array) are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    if sorted(new_queue) != sorted(pot["queue"]):
++        raise bad_request("The new queue must contain exactly the same members as the current one, reordered.")
++
++    pot_ref.update({"queue": new_queue, "updatedAt": now_ms()})
++    _log(db, chama_id, pot_id, "queue_reordered", note=",".join(new_queue))
++    return {"ok": True}
++
++
++@https_fn.on_call(region=REGION)
++def mgrToggleAutoDemote(req: https_fn.CallableRequest) -> dict:
++    """Trivial pot-field toggle — kept as a callable (rather than a direct
++    client write, though firestore.rules would allow one) so it lands in
++    the same audit ledger as every other pot change."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    if not chama_id or not pot_id:
++        raise bad_request("chamaId and potId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    new_value = not pot.get("autoDemoteLate", True)
++    pot_ref.update({"autoDemoteLate": new_value, "updatedAt": now_ms()})
++    _log(db, chama_id, pot_id, "repaired", note=f"autoDemoteLate -> {new_value}")
++    return {"ok": True, "autoDemoteLate": new_value}
++
++
++# --------------------------------------------------------------------- #
++# Arrears
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrSettleArrear(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    arrear_id = data.get("arrearId")
++    amount = data.get("amount")
++    if not chama_id or not pot_id or not arrear_id:
++        raise bad_request("chamaId, potId, and arrearId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    _, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    arrear_ref = db.document(paths.mgr_arrear(chama_id, pot_id, arrear_id))
++    arrear_snap = arrear_ref.get()
++    if not arrear_snap.exists:
++        raise not_found("Arrear not found.")
++    arrear = arrear_snap.to_dict()
++    if arrear.get("status") != "open":
++        raise precondition("This arrear is already closed.")
++
++    pay_amount = float(amount) if isinstance(amount, (int, float)) and amount > 0 else arrear["amount"]
++    pay_amount = min(pay_amount, arrear["amount"])
++    remaining = round((arrear["amount"] - pay_amount) * 100) / 100
++    ts = now_ms()
++    today = today_iso()
++
++    arrear_ref.update({
++        "amount": remaining,
++        "status": "settled" if remaining <= 0 else "open",
++        "settledAmount": arrear.get("settledAmount", 0) + pay_amount,
++        "updatedAt": ts,
++    })
++    db.collection(paths.transactions(chama_id)).document().set({
++        "type": "mgr_contribution",
++        "memberId": arrear["memberId"],
++        "amount": pay_amount,
++        "method": "manual",
++        "ref": "CASH" + str(ts)[-8:],
++        "date": today,
++        "settled": False,
++        "direction": "in",
++        "channel": "app",
++        "note": pot["name"] + " arrear settlement",
++        "potId": pot_id,
++        "createdAt": ts,
++    })
++    _log(db, chama_id, pot_id, "arrear_settled", member_id=arrear["memberId"], amount=pay_amount)
++
++    result = {"ok": True, "remaining": remaining}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++@https_fn.on_call(region=REGION)
++def mgrWriteOffArrear(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    arrear_id = data.get("arrearId")
++    reason = (data.get("reason") or "").strip()
++    if not chama_id or not pot_id or not arrear_id or not reason:
++        raise bad_request("chamaId, potId, arrearId, and a reason are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    _get_pot(db, chama_id, pot_id)
++
++    arrear_ref = db.document(paths.mgr_arrear(chama_id, pot_id, arrear_id))
++    arrear_snap = arrear_ref.get()
++    if not arrear_snap.exists:
++        raise not_found("Arrear not found.")
++    arrear = arrear_snap.to_dict()
++    if arrear.get("status") != "open":
++        raise precondition("This arrear is already closed.")
++
++    arrear_ref.update({"status": "written_off", "writeOffReason": reason, "updatedAt": now_ms()})
++    _log(db, chama_id, pot_id, "arrear_written_off", member_id=arrear["memberId"], amount=arrear["amount"], note=reason)
++    return {"ok": True}
++
++
++# --------------------------------------------------------------------- #
++# Shortfall
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrCoverShortfall(req: https_fn.CallableRequest) -> dict:
++    """Records how a completed round's shortfall (promised payout minus
++    what was actually collected — see mgr_engine.pool_for_round) is being
++    made up: cash injected from the chama's own reserve, or a specific
++    member topping up. Clears pot.pendingShortfall so recordMgrPayoutCash
++    stops refusing to pay out."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    amount = data.get("amount")
++    source = data.get("source")  # 'reserve' | 'member'
++    member_id = data.get("memberId")
++    if not chama_id or not pot_id or source not in ("reserve", "member"):
++        raise bad_request("chamaId, potId, and source ('reserve' or 'member') are required.")
++    if source == "member" and not member_id:
++        raise bad_request("memberId is required when source is 'member'.")
++    if not isinstance(amount, (int, float)) or amount <= 0:
++        raise bad_request("amount must be a positive number.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    current = pot.get("pendingShortfall", 0)
++    if current <= 0:
++        raise precondition("This pot has no outstanding shortfall.")
++
++    covered = min(float(amount), current)
++    remaining = round((current - covered) * 100) / 100
++    ts = now_ms()
++    today = today_iso()
++
++    pot_ref.update({"pendingShortfall": remaining, "updatedAt": ts})
++    db.collection(paths.transactions(chama_id)).document().set({
++        "type": "mgr_contribution",
++        "memberId": member_id or "chama_reserve",
++        "amount": covered,
++        "method": "manual",
++        "ref": "CASH" + str(ts)[-8:],
++        "date": today,
++        "settled": False,
++        "direction": "in",
++        "channel": "app",
++        "note": pot["name"] + " shortfall cover (" + source + ")",
++        "potId": pot_id,
++        "createdAt": ts,
++    })
++    _log(db, chama_id, pot_id, "shortfall_covered", member_id=member_id, amount=covered, note=source)
++
++    result = {"ok": True, "remaining": remaining}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++# --------------------------------------------------------------------- #
++# Exits
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrProposeExit(req: https_fn.CallableRequest) -> dict:
++    """Computes what a member leaving mid-cycle is owed, or owes: their
++    paid-in total this cycle (records with status 'paid', current
++    cycleNumber) minus what they've already received in payouts. Writes a
++    'proposed' exits doc for the admin to review before mgrSettleExit
++    actually moves them out."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    member_id = data.get("memberId")
++    if not chama_id or not pot_id or not member_id:
++        raise bad_request("chamaId, potId, and memberId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    _, pot = _get_pot(db, chama_id, pot_id)
++    if member_id not in pot["memberIds"]:
++        raise bad_request("That member isn't in this pot.")
++
++    records = _all_records(db, chama_id, pot_id)
++    payouts = _all_payouts(db, chama_id, pot_id)
++    paid_in = sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid")
++    received = sum(p["amount"] for p in payouts if p["memberId"] == member_id)
++    net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
++
++    ts = now_ms()
++    ref = db.collection(paths.mgr_exits(chama_id, pot_id)).document()
++    ref.set({"memberId": member_id, "proposedNet": net, "status": "proposed", "createdAt": ts, "updatedAt": ts})
++    return {"exitId": ref.id, "proposedNet": net}
++
++
++@https_fn.on_call(region=REGION)
++def mgrSettleExit(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    exit_id = data.get("exitId")
++    settled_amount = data.get("settledAmount")
++    if not chama_id or not pot_id or not exit_id:
++        raise bad_request("chamaId, potId, and exitId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    exit_ref = db.document(paths.mgr_exit(chama_id, pot_id, exit_id))
++    exit_snap = exit_ref.get()
++    if not exit_snap.exists:
++        raise not_found("Exit proposal not found.")
++    exit_doc = exit_snap.to_dict()
++    if exit_doc.get("status") != "proposed":
++        raise precondition("This exit has already been settled.")
++    if _open_arrear_for(db, chama_id, pot_id, exit_doc["memberId"]):
++        raise precondition("This member has an open arrear — settle or write it off before exiting them.")
++
++    amount = float(settled_amount) if isinstance(settled_amount, (int, float)) else abs(exit_doc["proposedNet"])
++    direction = "pot_to_member" if exit_doc["proposedNet"] >= 0 else "member_to_pot"
++    ts = now_ms()
++    today = today_iso()
++    member_id = exit_doc["memberId"]
++
++    if amount > 0:
++        db.collection(paths.transactions(chama_id)).document().set({
++            "type": "mgr_payout" if direction == "pot_to_member" else "mgr_contribution",
++            "memberId": member_id,
++            "amount": amount,
++            "method": "manual",
++            "ref": "CASH" + str(ts)[-8:],
++            "date": today,
++            "settled": True,
++            "direction": "out" if direction == "pot_to_member" else "in",
++            "channel": "app",
++            "note": pot["name"] + " exit settlement",
++            "potId": pot_id,
++            "createdAt": ts,
++        })
++
++    exit_ref.update({"status": "settled", "settledAmount": amount, "settledDirection": direction, "updatedAt": ts})
++    pot_ref.update({
++        "memberIds": [m for m in pot["memberIds"] if m != member_id],
++        "queue": [m for m in pot["queue"] if m != member_id],
++        "updatedAt": ts,
++    })
++    _log(db, chama_id, pot_id, "exit_settled", member_id=member_id, amount=amount, note=direction)
++
++    result = {"ok": True, "settledAmount": amount, "settledDirection": direction}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++# --------------------------------------------------------------------- #
++# Health, repair & closing
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrRepairPot(req: https_fn.CallableRequest) -> dict:
++    """The only callable allowed to ACT on mgr_engine.health_check's
++    findings: de-dupes the queue, drops queue entries for members who are
++    no longer in the pot, and appends any current member missing from an
++    active pot's queue. Never touches arrears/exits/shortfall — those need
++    a human decision (settle vs write off, which source covers a
++    shortfall), so they're only ever surfaced, never auto-resolved."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    if not chama_id or not pot_id:
++        raise bad_request("chamaId and potId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    member_set = set(pot["memberIds"])
++    seen: set[str] = set()
++    fixed_queue = []
++    for m in pot["queue"]:
++        if m in member_set and m not in seen:
++            fixed_queue.append(m)
++            seen.add(m)
++    if pot["status"] == "active":
++        for m in pot["memberIds"]:
++            if m not in seen:
++                fixed_queue.append(m)
++                seen.add(m)
++
++    changed = fixed_queue != pot["queue"]
++    if changed:
++        pot_ref.update({"queue": fixed_queue, "updatedAt": now_ms()})
++        _log(db, chama_id, pot_id, "repaired", note=f"queue: {len(pot['queue'])} -> {len(fixed_queue)} entries")
++
++    return {"ok": True, "changed": changed, "queue": fixed_queue}
++
++
++@https_fn.on_call(region=REGION)
++def mgrCloseForever(req: https_fn.CallableRequest) -> dict:
++    """Retires a pot. Refuses while money is still unresolved — an open
++    arrear or an uncovered shortfall — so closing a pot can't be used to
++    quietly write off a balance nobody actually decided to forgive."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    if not chama_id or not pot_id:
++        raise bad_request("chamaId and potId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    if pot.get("pendingShortfall", 0) > 0:
++        raise precondition("This pot has an uncovered shortfall — record how it's covered (mgrCoverShortfall) first.")
++    open_arrears = [a for a in _all_arrears(db, chama_id, pot_id) if a.get("status") == "open"]
++    if open_arrears:
++        raise precondition(f"This pot has {len(open_arrears)} open arrear(s) — settle or write them off first.")
++
++    ts = now_ms()
++    pot_ref.update({"status": "closed", "closedAt": ts, "updatedAt": ts})
++    _log(db, chama_id, pot_id, "pot_closed")
++    return {"ok": True}
+diff --git a/functions/mychama/payments.py b/functions/mychama/payments.py
+index c9bdbb2..144af62 100644
+--- a/functions/mychama/payments.py
++++ b/functions/mychama/payments.py
+@@ -17,11 +17,16 @@ component — one callable, one fee/reference/rate-limit/idempotency path,
+ usable for any purpose already in the `purpose` dispatch table below
+ (currently `contribution` and `mgr_contribution` have UI wired to it;
+ `loan_repayment` works identically if a UI ever wants it, with zero
+-backend changes). The phone charged is always read from the target
+-member's own record — never a client-supplied number — so an admin can't
+-redirect someone else's STK prompt to a phone of their choosing. Self-pay
+-(no `memberId`, or `memberId` equal to the caller's own) is unchanged from
+-before and needs no finance-admin role.
++backend changes). The phone charged defaults to the target member's own
++record on file. A finance admin MAY additionally pass `overridePhone` to
++send the STK prompt to a different number instead (e.g. a spouse or agent
++paying on the member's behalf, matching the demo's manual-number-entry
++admin charge screen) — this never changes who the charge is recorded
++against, only whose phone gets the prompt, and every override is stamped
++on the paymentIntent (`phoneOverridden`, `memberPhoneOnFile`) for audit
++rather than silently substituted. Self-pay (no `memberId`, or `memberId`
++equal to the caller's own) is unchanged from before, ignores
++`overridePhone`, and needs no finance-admin role.
+ 
+ setupSettlementAccount / requestSettlementChange / approveSettlementChange
+ create/change the Paystack subaccount + split code a chama's collections
+@@ -233,12 +238,14 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+     db = _db()
+     caller_membership = require_membership(db, uid, chama_id)
+ 
++    phone_overridden = False
++    member_phone_on_file = None
+     if target_member_id and target_member_id != caller_membership.member_id:
+         # Admin-initiated charge on behalf of another member. Only a
+-        # finance admin may do this, and the phone charged always comes
+-        # from the target member's own record — never `data.get("phone")`
+-        # — so this can't be used to push an STK prompt to an arbitrary
+-        # number under someone else's name.
++        # finance admin may do this. Defaults to the target member's own
++        # phone on file; an explicit `overridePhone` from the finance admin
++        # is allowed (see module docstring) but is always logged as an
++        # override rather than silently treated as "the member's phone".
+         require_finance_admin(db, uid, chama_id)
+         target_snap = db.document(paths.member(chama_id, target_member_id)).get()
+         if not target_snap.exists:
+@@ -247,7 +254,13 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+         if target_member.get("status") != "active":
+             raise precondition("This member isn't active.")
+         member_id = target_member_id
+-        phone = target_member.get("phone") or ""
++        member_phone_on_file = target_member.get("phone") or ""
++        override_phone = (data.get("overridePhone") or "").strip()
++        if override_phone:
++            phone = override_phone
++            phone_overridden = phone.strip() != member_phone_on_file.strip()
++        else:
++            phone = member_phone_on_file
+         initiated_by = {"uid": uid, "memberId": caller_membership.member_id, "role": caller_membership.role}
+     else:
+         member_id = caller_membership.member_id
+@@ -313,6 +326,8 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+         "status": "pending",
+         "channel": "app",
+         "initiatedBy": initiated_by,
++        "phoneOverridden": phone_overridden,
++        "memberPhoneOnFile": member_phone_on_file,
+         "contributionId": data.get("contributionId"),
+         "loanId": data.get("loanId"),
+         "installmentNo": data.get("installmentNo"),
+diff --git a/functions/mychama/sms.py b/functions/mychama/sms.py
+index 67ac401..4cb3b7f 100644
+--- a/functions/mychama/sms.py
++++ b/functions/mychama/sms.py
+@@ -199,8 +199,17 @@ def _frequency_ms(frequency: str) -> int:
+ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+     """
+     Dispatches chamas/{chamaId}/smsSchedules entries whose nextRun has
+-    passed. Each schedule doc: { message, audience, memberIds?, frequency,
+-    nextRun (epoch ms), active }.
++    passed. Each schedule doc: { body, audience, memberIds?, frequency,
++    nextRun (epoch ms), status: 'active'|'paused', potId? }.
++
++    Field names here MUST match firestore.rules' smsSchedules validation
++    (`status` and `body`, not `active`/`message` — those were the original
++    field names before the rules were written and this cron was never
++    updated to match, so a schedule created through the rules-sanctioned
++    direct write was silently never picked up. potId is optional and is
++    for the UI's benefit only (which pot a reminder schedule belongs to,
++    e.g. src/features/mgr/MgrPotDetail.tsx's Reminders card) — it plays no
++    part in dispatch.
+     """
+     db = _db()
+     now = now_ms()
+@@ -214,21 +223,23 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+ 
+         due = (
+             db.collection(paths.sms_schedules(chama_id))
+-            .where("active", "==", True)
++            .where("status", "==", "active")
+             .where("nextRun", "<=", now)
+             .stream()
+         )
+         for sched_doc in due:
+             sched = sched_doc.to_dict()
++            body = sched.get("body") or sched.get("message") or ""  # tolerate pre-fix docs written under the old field name
+             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
+             recipients = [m for m in recipients if m.get("phoneNormalized")]
+             cost = round(len(recipients) * rate * 100) / 100
+ 
+             credits = chama.get("smsCredits", 0)
+-            if credits < cost or not recipients:
+-                # Not enough credit or nobody to send to — push nextRun forward
+-                # by one frequency step so it's retried next cycle rather than
+-                # spamming the same failure every 15 minutes.
++            if credits < cost or not recipients or not body:
++                # Not enough credit, nobody to send to, or an empty body —
++                # push nextRun forward by one frequency step so it's retried
++                # next cycle rather than spamming the same failure every 15
++                # minutes.
+                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
+                 continue
+ 
+@@ -241,7 +252,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+                         apikey=HP_APIKEY.value,
+                         sender_id=HP_SENDER_ID.value,
+                         phone_e164=normalize_sms_phone(member["phoneNormalized"]),
+-                        message=sched["message"],
++                        message=body,
+                     )
+                     sent += 1
+                 except Exception:  # noqa: BLE001
+@@ -251,7 +262,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
+             db.collection(paths.sms_log(chama_id)).document().set({
+                 "audience": sched.get("audience", "all"),
+-                "message": sched["message"],
++                "message": body,
+                 "recipientIds": [m["id"] for m in recipients],
+                 "recipientCount": len(recipients),
+                 "sentCount": sent,
+diff --git a/functions/shared/constants.py b/functions/shared/constants.py
+index b6ac266..b7f94a5 100644
+--- a/functions/shared/constants.py
++++ b/functions/shared/constants.py
+@@ -32,6 +32,9 @@ class MC:
+     MGR_POTS = "mgrPots"
+     MGR_RECORDS = "records"
+     MGR_PAYOUTS = "payouts"
++    MGR_ARREARS = "arrears"
++    MGR_EXITS = "exits"
++    MGR_LEDGER = "ledger"
+     PAYMENT_INTENTS = "paymentIntents"
+     SMS_TOPUPS = "smsTopUps"
+     PLAN_BILLING = "planBilling"
+diff --git a/functions/shared/firestore_paths.py b/functions/shared/firestore_paths.py
+index e5f5e2f..8b0a9e8 100644
+--- a/functions/shared/firestore_paths.py
++++ b/functions/shared/firestore_paths.py
+@@ -69,6 +69,26 @@ def mgr_payouts(chama_id: str, pot_id: str) -> str:
+     return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_PAYOUTS}"
+ 
+ 
++def mgr_arrears(chama_id: str, pot_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_ARREARS}"
++
++
++def mgr_arrear(chama_id: str, pot_id: str, arrear_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_ARREARS}/{arrear_id}"
++
++
++def mgr_exits(chama_id: str, pot_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_EXITS}"
++
++
++def mgr_exit(chama_id: str, pot_id: str, exit_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_EXITS}/{exit_id}"
++
++
++def mgr_ledger(chama_id: str, pot_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_LEDGER}"
++
++
+ def payment_intents(chama_id: str) -> str:
+     return f"{MC.CHAMAS}/{chama_id}/{MC.PAYMENT_INTENTS}"
+ 
+diff --git a/functions/shared/mgr_engine.py b/functions/shared/mgr_engine.py
+index f0c9d75..62000eb 100644
+--- a/functions/shared/mgr_engine.py
++++ b/functions/shared/mgr_engine.py
+@@ -110,3 +110,68 @@ def pool_for_round(pot: dict, records: list[dict]) -> RoundInfo:
+ 
+ def pool_estimate(pot: dict) -> float:
+     return pot["amount"] * len(pot["memberIds"]) * pot["periodsPerRound"]
++
++
++def is_short_round(pot: dict) -> bool:
++    """True once the queue can no longer fill a full round of recipients —
++    e.g. members exited mid-cycle. Ported from the demo's mgrIsShortRound;
++    a short round needs build_final_plan instead of the normal equal split."""
++    return 0 < len(pot["queue"]) < pot["recipientsPerRound"]
++
++
++def build_final_plan(pot: dict, records: list[dict]) -> dict:
++    """
++    For a round that can't fill its normal recipient count (membership
++    shrank via exits/removals mid-cycle): splits whatever pool actually
++    exists across whoever is left in the queue instead of leaving a
++    fractional recipient slot unfilled. Read-only projection — the actual
++    payout still goes through recordMgrPayoutCash, which re-derives the
++    same numbers itself rather than trusting a client-cached plan.
++    """
++    info = pool_for_round(pot, records)
++    remaining = pot["queue"]
++    if not remaining:
++        return {"recipients": [], "shareEach": 0.0, "poolExpected": info["expected"], "poolShortfall": info["shortfall"]}
++    share = round((info["expected"] / len(remaining)) * 100) / 100
++    return {
++        "recipients": remaining,
++        "shareEach": share,
++        "poolExpected": info["expected"],
++        "poolShortfall": info["shortfall"],
++        "short": True,
++    }
++
++
++def health_check(pot: dict, records: list[dict], payouts: list[dict], arrears: list[dict]) -> list[dict]:
++    """
++    Pure diagnostics, no writes — safe to run client-side too (mirrored in
++    src/lib/mgrEngine.ts) for an instant Health card. Only mgrRepairPot
++    (server-only) may act on what this finds. Each finding:
++    {code, message, memberId?}.
++    """
++    findings: list[dict] = []
++    member_set = set(pot["memberIds"])
++    queue_set = set(pot["queue"])
++
++    dup_ids = {m for m in pot["queue"] if pot["queue"].count(m) > 1}
++    for m in dup_ids:
++        findings.append({"code": "duplicate_in_queue", "memberId": m, "message": "Appears more than once in the payout queue."})
++
++    for m in queue_set - member_set:
++        findings.append({"code": "orphaned_in_queue", "memberId": m, "message": "In the payout queue but no longer a pot member."})
++
++    for m in member_set - queue_set:
++        if pot["status"] == "active":
++            findings.append({"code": "missing_from_queue", "memberId": m, "message": "A pot member with no place in the payout queue."})
++
++    open_arrear_ids = {a["memberId"] for a in arrears if a.get("status") == "open"}
++    for m in open_arrear_ids - member_set:
++        findings.append({"code": "arrear_for_ex_member", "memberId": m, "message": "Has an open arrear but is no longer a pot member — settle or write off before closing the pot."})
++
++    if pot.get("pendingShortfall", 0) > 0:
++        findings.append({"code": "uncovered_shortfall", "message": f"KES {pot['pendingShortfall']:,.2f} of the last completed round was never covered."})
++
++    if is_short_round(pot) and pot["status"] == "active":
++        findings.append({"code": "short_round", "message": "Fewer members remain than a full round needs — the next payout will use a final settlement plan."})
++
++    return findings
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index b464a79..18e332d 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -167,14 +167,70 @@ class MgrPot(TypedDict):
+     drawDone: bool
+     drawMethod: Optional[Literal["smart", "random"]]
+     autoDemoteLate: bool
+-    status: Literal["draft", "active", "completed"]
++    status: Literal["draft", "active", "completed", "closed"]
+     cycleNumber: int
+     period: int
++    # pending shortfall carried from the last closeMgrPeriod on this pot —
++    # set when the round's collected total falls short of the promised
++    # payout, cleared/decremented by recordMgrShortfallCover. Surfaced to
++    # admins to chase rather than quietly absorbed. See mgr_engine.py.
++    pendingShortfall: NotRequired[float]
++    remindersEnabled: NotRequired[bool]
++    reminderScheduleId: NotRequired[Optional[str]]
++    closedAt: NotRequired[Optional[int]]
+     createdOn: NotRequired[str]
+     createdAt: NotRequired[int]
+     updatedAt: NotRequired[int]
+ 
+ 
++class MgrArrear(TypedDict):
++    """chamas/{c}/mgrPots/{p}/arrears/{id} — one open running balance per
++    member per pot, opened automatically the first time closeMgrPeriod
++    marks them missed, topped up by every subsequent miss."""
++    id: NotRequired[str]
++    memberId: str
++    periods: List[int]           # periods this arrear covers
++    amount: float                # outstanding balance
++    status: Literal["open", "settled", "written_off"]
++    settledAmount: NotRequired[float]
++    writeOffReason: NotRequired[str]
++    createdAt: int
++    updatedAt: int
++
++
++class MgrExit(TypedDict):
++    """chamas/{c}/mgrPots/{p}/exits/{id} — a member leaving the pot
++    mid-cycle. 'proposed' shows the computed net settlement (what they've
++    paid in this cycle minus what they've already received); 'settled'
++    records how the cash actually moved."""
++    id: NotRequired[str]
++    memberId: str
++    proposedNet: float           # positive = pot owes the member; negative = member owes the pot
++    status: Literal["proposed", "settled"]
++    settledAmount: NotRequired[float]
++    settledDirection: NotRequired[Literal["pot_to_member", "member_to_pot"]]
++    createdAt: int
++    updatedAt: int
++
++
++class MgrLedgerEntry(TypedDict):
++    """chamas/{c}/mgrPots/{p}/ledger/{id} — append-only log of every
++    money-moving or membership-changing event on the pot, independent of
++    the main chama transactions collection. This is what lets a pot be
++    audited/repaired on its own, and is the source for per-pot statements."""
++    id: NotRequired[str]
++    kind: Literal[
++        "contribution", "payout", "arrear_opened", "arrear_settled",
++        "arrear_written_off", "shortfall_recorded", "shortfall_covered",
++        "member_added", "member_removed", "exit_settled",
++        "queue_reordered", "period_closed", "pot_closed", "repaired",
++    ]
++    memberId: NotRequired[Optional[str]]
++    amount: NotRequired[float]
++    note: NotRequired[str]
++    createdAt: int
++
++
+ class MgrRecord(TypedDict):
+     id: NotRequired[str]
+     period: int
+@@ -217,6 +273,10 @@ class ChamaTransaction(TypedDict):
+     note: NotRequired[str]
+     channel: Literal["app", "whatsapp"]
+     intentId: NotRequired[str]
++    # Set on every mgr_contribution / mgr_payout / mgr_shortfall_cover /
++    # mgr_exit_settlement row so generateStatement can scope a statement to
++    # one pot without string-matching `note`. See functions/mychama/mgr.py.
++    potId: NotRequired[Optional[str]]
+     createdAt: NotRequired[int]
+ 
+ 
+@@ -242,6 +302,12 @@ class PaymentIntent(TypedDict):
+     provider: Provider
+     status: IntentStatus
+     channel: IntentChannel
++    # Set when a finance admin charging on another member's behalf typed a
++    # different number than the one on file (e.g. a spouse's or agent's
++    # phone). Audit trail only — never changes who the charge is recorded
++    # against. See functions/mychama/payments.py::initiatePayment.
++    phoneOverridden: NotRequired[bool]
++    memberPhoneOnFile: NotRequired[Optional[str]]
+     contributionId: NotRequired[Optional[str]]
+     loanId: NotRequired[Optional[str]]
+     installmentNo: NotRequired[Optional[int]]
+diff --git a/src/app/useMembers.ts b/src/app/useMembers.ts
+index 942a131..f68c66a 100644
+--- a/src/app/useMembers.ts
++++ b/src/app/useMembers.ts
+@@ -37,3 +37,8 @@ export function useMembers(chamaId: string | null, activeOnly = true) {
+ export function memberName(members: ChamaMember[], memberId: string): string {
+   return members.find((m) => m.id === memberId)?.name ?? 'Unknown member';
+ }
++
++/** Phone on file, for pre-filling AdminChargeButton's editable phone field — never used to bypass it. */
++export function memberPhone(members: ChamaMember[], memberId: string): string | undefined {
++  return members.find((m) => m.id === memberId)?.phone;
++}
+diff --git a/src/components/Spinner.tsx b/src/components/Spinner.tsx
+new file mode 100644
+index 0000000..c72590f
+--- /dev/null
++++ b/src/components/Spinner.tsx
+@@ -0,0 +1,11 @@
++/**
++ * Small inline loading spinner. Added as part of the MGR repair pass so
++ * every new async action (charge, settle, repair, close…) has a real
++ * loading state instead of only a disabled button with swapped text.
++ * Uses the `.spinner` class in src/index.css — no extra dependency.
++ */
++export function Spinner({ className = '' }: { className?: string }) {
++  return <span className={`spinner ${className}`.trim()} role="status" aria-label="Loading" />;
++}
++
++export default Spinner;
+diff --git a/src/features/contributions/Contributions.tsx b/src/features/contributions/Contributions.tsx
+index 47312cb..2190192 100644
+--- a/src/features/contributions/Contributions.tsx
++++ b/src/features/contributions/Contributions.tsx
+@@ -3,7 +3,7 @@ import { collection, onSnapshot } from 'firebase/firestore';
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+-import { useMembers, memberName } from '../../app/useMembers';
++import { useMembers, memberName, memberPhone } from '../../app/useMembers';
+ import { recordCashContribution } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
+@@ -147,6 +147,7 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
+                           <AdminChargeButton
+                             chamaId={chamaId}
+                             memberId={c.memberId}
++                            memberPhone={memberPhone(members, c.memberId)}
+                             amount={c.amount - c.paidAmount}
+                             purpose="contribution"
+                             contributionId={c.id}
+diff --git a/src/features/mgr/MgrPotDetail.tsx b/src/features/mgr/MgrPotDetail.tsx
+index 8727b73..05ed035 100644
+--- a/src/features/mgr/MgrPotDetail.tsx
++++ b/src/features/mgr/MgrPotDetail.tsx
+@@ -1,16 +1,41 @@
+-import { useEffect, useState } from 'react';
+-import { collection, doc, onSnapshot } from 'firebase/firestore';
++import { useEffect, useMemo, useState } from 'react';
++import { collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, serverTimestamp } from 'firebase/firestore';
+ import { useNavigate, useParams } from 'react-router-dom';
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+-import { useMembers, memberName } from '../../app/useMembers';
+-import { closeMgrPeriod, recordCashMgrPayment, recordMgrPayoutCash, runMgrDraw } from '../../lib/callables';
++import { useMembers, memberName, memberPhone } from '../../app/useMembers';
++import {
++  closeMgrPeriod,
++  recordCashMgrPayment,
++  recordMgrPayoutCash,
++  runMgrDraw,
++  mgrAddMembers,
++  mgrRemoveMember,
++  mgrReorderQueue,
++  mgrToggleAutoDemote,
++  mgrSettleArrear,
++  mgrWriteOffArrear,
++  mgrCoverShortfall,
++  mgrProposeExit,
++  mgrSettleExit,
++  mgrRepairPot,
++  mgrCloseForever,
++  generateStatement,
++} from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
+-import { lateScore, recentReliability } from '../../lib/mgrEngine';
++import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
++import { Spinner } from '../../components/Spinner';
+ import { AdminChargeButton } from '../payments/AdminChargeButton';
+-import type { MgrPot, MgrRecord } from '../../lib/types';
++import type { MgrArrear, MgrPot, MgrRecord } from '../../lib/types';
++
++const STATUS_COPY: Record<MgrPot['status'], string> = {
++  draft: 'Draft — draw not run yet',
++  active: 'Active',
++  completed: 'Round complete',
++  closed: 'Closed',
++};
+ 
+ export default function MgrPotDetail() {
+   const { potId } = useParams<{ potId: string }>();
+@@ -18,10 +43,23 @@ export default function MgrPotDetail() {
+   const { members } = useMembers(chamaId, false);
+   const [pot, setPot] = useState<MgrPot | null>(null);
+   const [records, setRecords] = useState<MgrRecord[]>([]);
+-  const [busy, setBusy] = useState(false);
++  const [arrears, setArrears] = useState<MgrArrear[]>([]);
++  const [busyKey, setBusyKey] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+-  const [payoutInfo, setPayoutInfo] = useState<{ recipients: string[]; shareEach: number } | null>(null);
++  const [payoutInfo, setPayoutInfo] = useState<{ recipients: string[]; shareEach: number; poolShortfall: number } | null>(null);
++
++  // Queue reorder editor — only committed to the server on "Save order".
++  const [queueDraft, setQueueDraft] = useState<string[] | null>(null);
++  const [addPicker, setAddPicker] = useState<string[] | null>(null); // non-null while "Add members" modal is open
++  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number } | null>(null);
++  const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
++  const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
++  const [shortfallAmount, setShortfallAmount] = useState<number>(0);
++  const [shortfallSource, setShortfallSource] = useState<'reserve' | 'member'>('reserve');
++  const [shortfallMember, setShortfallMember] = useState<string>('');
++  const [acknowledgeShortfall, setAcknowledgeShortfall] = useState(false);
++
+   const navigate = useNavigate();
+ 
+   useEffect(() => {
+@@ -32,12 +70,19 @@ export default function MgrPotDetail() {
+     const unsub2 = onSnapshot(collection(db, paths.mgrRecords(chamaId, potId)), (snap) => {
+       setRecords(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrRecord));
+     });
++    const unsub3 = onSnapshot(collection(db, paths.mgrArrears(chamaId, potId)), (snap) => {
++      setArrears(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrArrear));
++    });
+     return () => {
+       unsub1();
+       unsub2();
++      unsub3();
+     };
+   }, [chamaId, potId]);
+ 
++  const findings = useMemo(() => (pot ? healthCheck(pot, arrears) : []), [pot, arrears]);
++  const openArrears = arrears.filter((a) => a.status === 'open');
++
+   if (!pot || !chamaId || !potId) return <p className="text-forest-900/60">Loading…</p>;
+ 
+   const cid = chamaId;
+@@ -52,74 +97,213 @@ export default function MgrPotDetail() {
+     else setError(message || fallback);
+   }
+ 
+-  async function draw(method: 'smart' | 'random') {
+-    setBusy(true);
++  async function run<T>(key: string, fn: () => Promise<T>, onOk?: (r: T) => void, fallback = 'That action failed.') {
++    setBusyKey(key);
+     setError(null);
+     try {
+-      await runMgrDraw({ chamaId: cid, potId: pid, method });
++      const r = await fn();
++      onOk?.(r);
+     } catch (e) {
+-      handleErr(e, 'Could not run the draw.');
++      handleErr(e, fallback);
+     } finally {
+-      setBusy(false);
++      setBusyKey(null);
+     }
+   }
+ 
+-  async function recordPaid(memberId: string) {
+-    setBusy(true);
+-    setError(null);
+-    try {
+-      await recordCashMgrPayment({ chamaId: cid, potId: pid, memberId });
+-    } catch (e) {
+-      handleErr(e, 'Could not record the contribution.');
+-    } finally {
+-      setBusy(false);
+-    }
+-  }
++  const draw = (method: 'smart' | 'random') => run('draw', () => runMgrDraw({ chamaId: cid, potId: pid, method }));
++
++  const recordPaid = (memberId: string) => run(`pay-${memberId}`, () => recordCashMgrPayment({ chamaId: cid, potId: pid, memberId }));
++
++  const close = () =>
++    run('close', () => closeMgrPeriod({ chamaId: cid, potId: pid }), (res) => {
++      if (res.roundComplete) setPayoutInfo({ recipients: res.recipients, shareEach: res.shareEach, poolShortfall: res.poolShortfall });
++    });
++
++  const payout = () =>
++    run('payout', () => recordMgrPayoutCash({ chamaId: cid, potId: pid, acknowledgeShortfall }), () => {
++      setPayoutInfo(null);
++      setAcknowledgeShortfall(false);
++    });
++
++  const coverShortfall = () =>
++    run('shortfall', () =>
++      mgrCoverShortfall({
++        chamaId: cid,
++        potId: pid,
++        amount: shortfallAmount,
++        source: shortfallSource,
++        memberId: shortfallSource === 'member' ? shortfallMember : undefined,
++      })
++    );
++
++  const repair = () => run('repair', () => mgrRepairPot({ chamaId: cid, potId: pid }));
+ 
+-  async function close() {
+-    setBusy(true);
++  const toggleAutoDemote = () => run('autoDemote', () => mgrToggleAutoDemote({ chamaId: cid, potId: pid }));
++
++  const closeForever = () => {
++    if (!confirm(`Close "${pot.name}" for good? This can't be undone.`)) return;
++    run('closeForever', () => mgrCloseForever({ chamaId: cid, potId: pid }), () => navigate('/app/mgr'));
++  };
++
++  const removeMember = (memberId: string) => {
++    if (!confirm(`Remove ${memberName(members, memberId)} from this pot?`)) return;
++    run(`remove-${memberId}`, () => mgrRemoveMember({ chamaId: cid, potId: pid, memberId }));
++  };
++
++  const addMembers = () =>
++    run('addMembers', () => mgrAddMembers({ chamaId: cid, potId: pid, memberIds: addPicker ?? [] }), () => setAddPicker(null));
++
++  const saveQueue = () =>
++    run('reorder', () => mgrReorderQueue({ chamaId: cid, potId: pid, queue: queueDraft ?? pot.queue }), () => setQueueDraft(null));
++
++  const moveInDraft = (index: number, dir: -1 | 1) => {
++    const q = [...(queueDraft ?? pot.queue)];
++    const j = index + dir;
++    if (j < 0 || j >= q.length) return;
++    [q[index], q[j]] = [q[j], q[index]];
++    setQueueDraft(q);
++  };
++
++  const proposeExit = (memberId: string) =>
++    run(`propose-${memberId}`, () => mgrProposeExit({ chamaId: cid, potId: pid, memberId }), (r) =>
++      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet })
++    );
++
++  const settleExit = () =>
++    exitFor &&
++    run('settleExit', () => mgrSettleExit({ chamaId: cid, potId: pid, exitId: exitFor.exitId }), () => setExitFor(null));
++
++  const settleArrear = (arrearId: string, amount?: number) =>
++    run(`settleArrear-${arrearId}`, () => mgrSettleArrear({ chamaId: cid, potId: pid, arrearId, amount }), () => setSettleArrearId(null));
++
++  const writeOffArrear = (arrearId: string, reason: string) =>
++    run(`writeOff-${arrearId}`, () => mgrWriteOffArrear({ chamaId: cid, potId: pid, arrearId, reason }), () => setWriteOffArrearId(null));
++
++  const toggleReminders = async () => {
++    setBusyKey('reminders');
+     setError(null);
+     try {
+-      const res = await closeMgrPeriod({ chamaId: cid, potId: pid });
+-      if (res.roundComplete) setPayoutInfo({ recipients: res.recipients, shareEach: res.shareEach });
++      if (pot.remindersEnabled && pot.reminderScheduleId) {
++        await deleteDoc(doc(db, paths.smsSchedules(cid), pot.reminderScheduleId));
++        await updateDoc(doc(db, paths.mgrPot(cid, pid)), { remindersEnabled: false, reminderScheduleId: null });
++      } else {
++        const scheduleRef = doc(collection(db, paths.smsSchedules(cid)));
++        await setDoc(scheduleRef, {
++          status: 'active',
++          body: `Reminder: your ${pot.name} contribution of ${kes(pot.amount)} is due.`,
++          audience: 'custom',
++          memberIds: pot.memberIds.filter((m) => !paidThisPeriod.has(m)),
++          frequency: pot.frequency,
++          nextRun: Date.now() + 60 * 1000,
++          potId: pid,
++          createdAt: serverTimestamp(),
++        });
++        await updateDoc(doc(db, paths.mgrPot(cid, pid)), { remindersEnabled: true, reminderScheduleId: scheduleRef.id });
++      }
+     } catch (e) {
+-      handleErr(e, 'Could not close the period.');
++      handleErr(e, 'Could not update reminders.');
+     } finally {
+-      setBusy(false);
++      setBusyKey(null);
+     }
+-  }
++  };
+ 
+-  async function payout() {
+-    setBusy(true);
++  const downloadStatement = async () => {
++    setBusyKey('statement');
+     setError(null);
+     try {
+-      await recordMgrPayoutCash({ chamaId: cid, potId: pid });
+-      setPayoutInfo(null);
++      const { url } = await generateStatement({ chamaId: cid, potId: pid, format: 'csv' });
++      window.open(url, '_blank');
+     } catch (e) {
+-      handleErr(e, 'Could not record the payout.');
++      handleErr(e, 'Could not generate the statement.');
+     } finally {
+-      setBusy(false);
++      setBusyKey(null);
+     }
+-  }
++  };
++
++  const availableToAdd = members.filter((m) => m.status === 'active' && !pot.memberIds.includes(m.id));
++  const short = isShortRound(pot);
++  const displayQueue = queueDraft ?? pot.queue;
+ 
+   return (
+     <div className="space-y-5">
+       <button onClick={() => navigate('/app/mgr')} className="text-sm font-semibold text-forest-700">
+         &larr; All pots
+       </button>
+-      <div>
+-        <h1 className="font-display text-2xl font-semibold text-ink">{pot.name}</h1>
+-        <p className="text-sm text-forest-900/60 mt-1">
+-          {kes(pot.amount)} · {pot.frequency} · period {pot.period} · <span className="chip bg-forest-50 text-forest-700">{pot.status}</span>
+-        </p>
++
++      <div className="mgr-header flex flex-wrap items-center justify-between gap-3">
++        <div>
++          <h1 className="font-display text-2xl font-semibold">{pot.name}</h1>
++          <p className="text-sm text-white/80 mt-1">
++            {kes(pot.amount)} · {pot.frequency} · period {pot.period} · {STATUS_COPY[pot.status]}
++          </p>
++        </div>
++        {isFinanceAdmin && pot.status !== 'closed' && (
++          <div className="flex flex-wrap gap-2">
++            <button onClick={() => setAddPicker([])} className="btn-add text-xs">+ Add members</button>
++            <button onClick={downloadStatement} disabled={busyKey === 'statement'} className="btn-add text-xs flex items-center gap-1.5">
++              {busyKey === 'statement' && <Spinner />} Statement
++            </button>
++            <button onClick={toggleReminders} disabled={busyKey === 'reminders'} className="btn-add text-xs flex items-center gap-1.5">
++              {busyKey === 'reminders' && <Spinner />} {pot.remindersEnabled ? 'Reminders: on' : 'Reminders: off'}
++            </button>
++          </div>
++        )}
+       </div>
+ 
++      {isFinanceAdmin && findings.length > 0 && (
++        <div className="card p-4 border-gold-300 ring-1 ring-gold-200">
++          <h3 className="font-display font-semibold">Health check</h3>
++          <ul className="text-sm text-forest-900/70 mt-2 space-y-1 list-disc pl-5">
++            {findings.map((f, i) => (
++              <li key={i}>{f.memberId ? `${memberName(members, f.memberId)}: ` : ''}{f.message}</li>
++            ))}
++          </ul>
++          {findings.some((f) => ['duplicate_in_queue', 'orphaned_in_queue', 'missing_from_queue'].includes(f.code)) && (
++            <button onClick={repair} disabled={busyKey === 'repair'} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full mt-3 flex items-center gap-2">
++              {busyKey === 'repair' && <Spinner />} {busyKey === 'repair' ? 'Repairing…' : 'Repair queue'}
++            </button>
++          )}
++        </div>
++      )}
++
++      {pot.pendingShortfall != null && pot.pendingShortfall > 0 && isFinanceAdmin && (
++        <div className="card p-4 border-brick-300 ring-1 ring-brick-200">
++          <h3 className="font-display font-semibold text-brick-500">Round shortfall — {kes(pot.pendingShortfall)}</h3>
++          <p className="text-sm text-forest-900/70 mt-1">The last completed round collected less than it promised out. Record how the gap is being covered before paying out.</p>
++          <div className="flex flex-wrap gap-2 items-end mt-3">
++            <label className="text-xs">
++              Amount
++              <input type="number" value={shortfallAmount} onChange={(e) => setShortfallAmount(Number(e.target.value))} className="block border border-forest-200 rounded-lg px-2 py-1 mt-1 w-28" />
++            </label>
++            <label className="text-xs">
++              Source
++              <select value={shortfallSource} onChange={(e) => setShortfallSource(e.target.value as 'reserve' | 'member')} className="block border border-forest-200 rounded-lg px-2 py-1 mt-1">
++                <option value="reserve">Chama reserve</option>
++                <option value="member">A member</option>
++              </select>
++            </label>
++            {shortfallSource === 'member' && (
++              <label className="text-xs">
++                Member
++                <select value={shortfallMember} onChange={(e) => setShortfallMember(e.target.value)} className="block border border-forest-200 rounded-lg px-2 py-1 mt-1">
++                  <option value="">Select…</option>
++                  {pot.memberIds.map((id) => <option key={id} value={id}>{memberName(members, id)}</option>)}
++                </select>
++              </label>
++            )}
++            <button onClick={coverShortfall} disabled={busyKey === 'shortfall' || shortfallAmount <= 0} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-2">
++              {busyKey === 'shortfall' && <Spinner />} Record cover
++            </button>
++          </div>
++        </div>
++      )}
++
+       {isFinanceAdmin && pot.status === 'draft' && (
+         <div className="flex gap-2">
+-          <button onClick={() => draw('smart')} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+-            Run smart draw
++          <button onClick={() => draw('smart')} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
++            {busyKey === 'draw' && <Spinner />} Run smart draw
+           </button>
+-          <button onClick={() => draw('random')} disabled={busy} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">
++          <button onClick={() => draw('random')} disabled={!!busyKey} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">
+             Run random draw
+           </button>
+         </div>
+@@ -127,12 +311,22 @@ export default function MgrPotDetail() {
+ 
+       {payoutInfo && isFinanceAdmin && (
+         <div className="card p-4 border-gold-300 ring-1 ring-gold-200">
+-          <h3 className="font-display font-semibold">Round complete — payout due</h3>
++          <h3 className="font-display font-semibold">Round complete — payout due{short ? ' (final settlement, short round)' : ''}</h3>
+           <p className="text-sm text-forest-900/70 mt-1">
+             {payoutInfo.recipients.map((m) => memberName(members, m)).join(', ')} — {kes(payoutInfo.shareEach)} each
+           </p>
+-          <button onClick={payout} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3">
+-            {busy ? 'Paying…' : 'Confirm cash payout'}
++          {payoutInfo.poolShortfall > 0 && (
++            <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
++              <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
++              <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
++            </label>
++          )}
++          <button
++            onClick={payout}
++            disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
++            className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
++          >
++            {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
+           </button>
+         </div>
+       )}
+@@ -165,14 +359,32 @@ export default function MgrPotDetail() {
+                     <td className="px-4 py-3">{recentReliability(records, id)}%</td>
+                     {isFinanceAdmin && (
+                       <td className="px-4 py-3">
+-                        {!paidThisPeriod.has(id) && (
+-                          <div className="flex flex-col gap-2 items-start">
+-                            <button onClick={() => recordPaid(id)} disabled={busy} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full">
+-                              Record cash
++                        <div className="flex flex-col gap-2 items-start">
++                          {!paidThisPeriod.has(id) && (
++                            <>
++                              <button onClick={() => recordPaid(id)} disabled={!!busyKey} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-2">
++                                {busyKey === `pay-${id}` && <Spinner />} Record cash
++                              </button>
++                              <AdminChargeButton
++                                chamaId={cid}
++                                memberId={id}
++                                memberPhone={memberPhone(members, id)}
++                                amount={pot.amount}
++                                purpose="mgr_contribution"
++                                potId={pid}
++                                potPeriod={pot.period}
++                              />
++                            </>
++                          )}
++                          <div className="flex gap-2">
++                            <button onClick={() => removeMember(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
++                              Remove
++                            </button>
++                            <button onClick={() => proposeExit(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
++                              Exit
+                             </button>
+-                            <AdminChargeButton chamaId={cid} memberId={id} amount={pot.amount} purpose="mgr_contribution" potId={pid} potPeriod={pot.period} />
+                           </div>
+-                        )}
++                        </div>
+                       </td>
+                     )}
+                   </tr>
+@@ -181,18 +393,156 @@ export default function MgrPotDetail() {
+             </table>
+           </div>
+ 
+-          <p className="text-sm text-forest-900/60">Payout queue: {pot.queue.map((m) => memberName(members, m)).join(' → ')}</p>
++          <div className="card p-4">
++            <div className="flex items-center justify-between">
++              <h3 className="font-display font-semibold text-sm">Payout queue</h3>
++              {isFinanceAdmin && (
++                <label className="flex items-center gap-2 text-xs text-forest-900/60">
++                  <input type="checkbox" checked={pot.autoDemoteLate} onChange={toggleAutoDemote} disabled={busyKey === 'autoDemote'} />
++                  Auto-demote late payers
++                </label>
++              )}
++            </div>
++            <ol className="text-sm text-forest-900/70 mt-2 flex flex-col gap-1">
++              {displayQueue.map((m, i) => (
++                <li key={m + i} className="flex items-center gap-2">
++                  <span className="w-5 text-forest-900/40">{i + 1}.</span>
++                  <span className="flex-1">{memberName(members, m)}</span>
++                  {isFinanceAdmin && (
++                    <span className="flex gap-1">
++                      <button onClick={() => moveInDraft(i, -1)} disabled={i === 0} className="text-xs px-1.5 text-forest-900/40 hover:text-forest-700 disabled:opacity-20">▲</button>
++                      <button onClick={() => moveInDraft(i, 1)} disabled={i === displayQueue.length - 1} className="text-xs px-1.5 text-forest-900/40 hover:text-forest-700 disabled:opacity-20">▼</button>
++                    </span>
++                  )}
++                </li>
++              ))}
++            </ol>
++            {isFinanceAdmin && (
++              <div className="flex gap-2 mt-3">
++                <button onClick={() => setQueueDraft(previewSmartOrder(records, pot.queue))} className="text-xs font-semibold text-forest-700">
++                  Suggest smart order
++                </button>
++                {queueDraft && (
++                  <>
++                    <button onClick={saveQueue} disabled={busyKey === 'reorder'} className="btn-primary text-xs font-semibold px-3 py-1 rounded-full flex items-center gap-2">
++                      {busyKey === 'reorder' && <Spinner />} Save order
++                    </button>
++                    <button onClick={() => setQueueDraft(null)} className="text-xs text-forest-900/50">Cancel</button>
++                  </>
++                )}
++              </div>
++            )}
++          </div>
+ 
+           {isFinanceAdmin && (
+-            <button onClick={close} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+-              {busy ? 'Closing…' : 'Close this period'}
++            <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
++              {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
+             </button>
+           )}
+         </>
+       )}
+ 
++      {openArrears.length > 0 && isFinanceAdmin && (
++        <div className="card p-4">
++          <h3 className="font-display font-semibold text-sm">Open arrears</h3>
++          <ul className="mt-2 divide-y divide-forest-50">
++            {openArrears.map((a) => (
++              <li key={a.id} className="py-2 flex flex-wrap items-center justify-between gap-2 text-sm">
++                <span>{memberName(members, a.memberId)} — {kes(a.amount)} ({a.periods.length} period{a.periods.length > 1 ? 's' : ''})</span>
++                <span className="flex gap-2">
++                  {settleArrearId === a.id ? (
++                    <SettleArrearForm amount={a.amount} busy={busyKey === `settleArrear-${a.id}`} onCancel={() => setSettleArrearId(null)} onSubmit={(amt) => settleArrear(a.id, amt)} />
++                  ) : writeOffArrearId === a.id ? (
++                    <WriteOffForm busy={busyKey === `writeOff-${a.id}`} onCancel={() => setWriteOffArrearId(null)} onSubmit={(reason) => writeOffArrear(a.id, reason)} />
++                  ) : (
++                    <>
++                      <button onClick={() => setSettleArrearId(a.id)} className="text-xs font-semibold text-forest-700">Settle</button>
++                      <button onClick={() => setWriteOffArrearId(a.id)} className="text-xs text-forest-900/40 hover:text-brick-500">Write off</button>
++                    </>
++                  )}
++                </span>
++              </li>
++            ))}
++          </ul>
++        </div>
++      )}
++
++      {isFinanceAdmin && pot.status !== 'closed' && (
++        <button onClick={closeForever} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500 flex items-center gap-2">
++          {busyKey === 'closeForever' && <Spinner className="spinner-dark" />} Close this pot forever
++        </button>
++      )}
++
+       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+       {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
++
++      {addPicker !== null && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setAddPicker(null)}>
++          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5 flex flex-col gap-3" onClick={(e) => e.stopPropagation()}>
++            <h3 className="font-semibold text-forest-900">Add members to {pot.name}</h3>
++            <div className="max-h-64 overflow-y-auto flex flex-col gap-1">
++              {availableToAdd.length === 0 && <p className="text-xs text-forest-900/50">Every active member is already in this pot.</p>}
++              {availableToAdd.map((m) => (
++                <label key={m.id} className="flex items-center gap-2 text-sm">
++                  <input
++                    type="checkbox"
++                    checked={addPicker.includes(m.id)}
++                    onChange={(e) => setAddPicker(e.target.checked ? [...addPicker, m.id] : addPicker.filter((id) => id !== m.id))}
++                  />
++                  {m.name}
++                </label>
++              ))}
++            </div>
++            <div className="flex gap-2 justify-end pt-1">
++              <button onClick={() => setAddPicker(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
++              <button onClick={addMembers} disabled={busyKey === 'addMembers' || addPicker.length === 0} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full disabled:opacity-50 flex items-center gap-2">
++                {busyKey === 'addMembers' && <Spinner />} Add {addPicker.length || ''}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
++
++      {exitFor && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setExitFor(null)}>
++          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5 flex flex-col gap-3" onClick={(e) => e.stopPropagation()}>
++            <h3 className="font-semibold text-forest-900">Exit {memberName(members, exitFor.memberId)}</h3>
++            <p className="text-sm text-forest-900/70">
++              {exitFor.proposedNet >= 0
++                ? <>The pot owes them <strong>{kes(exitFor.proposedNet)}</strong> (paid in more than they've received).</>
++                : <>They owe the pot <strong>{kes(Math.abs(exitFor.proposedNet))}</strong> (received a payout already).</>}
++            </p>
++            <div className="flex gap-2 justify-end pt-1">
++              <button onClick={() => setExitFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
++              <button onClick={settleExit} disabled={busyKey === 'settleExit'} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
++                {busyKey === 'settleExit' && <Spinner />} Confirm & remove
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
++
++function SettleArrearForm({ amount, busy, onCancel, onSubmit }: { amount: number; busy: boolean; onCancel: () => void; onSubmit: (amount: number) => void }) {
++  const [value, setValue] = useState(amount);
++  return (
++    <span className="flex items-center gap-1">
++      <input type="number" value={value} onChange={(e) => setValue(Number(e.target.value))} className="w-20 border border-forest-200 rounded px-1 py-0.5 text-xs" />
++      <button onClick={() => onSubmit(value)} disabled={busy} className="text-xs font-semibold text-forest-700 flex items-center gap-1">{busy && <Spinner className="spinner-dark" />} Save</button>
++      <button onClick={onCancel} className="text-xs text-forest-900/40">Cancel</button>
++    </span>
++  );
++}
++
++function WriteOffForm({ busy, onCancel, onSubmit }: { busy: boolean; onCancel: () => void; onSubmit: (reason: string) => void }) {
++  const [reason, setReason] = useState('');
++  return (
++    <span className="flex items-center gap-1">
++      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason" className="w-28 border border-forest-200 rounded px-1 py-0.5 text-xs" />
++      <button onClick={() => reason.trim() && onSubmit(reason.trim())} disabled={busy || !reason.trim()} className="text-xs font-semibold text-brick-500 flex items-center gap-1">{busy && <Spinner className="spinner-dark" />} Confirm</button>
++      <button onClick={onCancel} className="text-xs text-forest-900/40">Cancel</button>
++    </span>
++  );
++}
+diff --git a/src/features/mgr/MgrPots.tsx b/src/features/mgr/MgrPots.tsx
+index 655e4ee..e5d9be3 100644
+--- a/src/features/mgr/MgrPots.tsx
++++ b/src/features/mgr/MgrPots.tsx
+@@ -33,10 +33,13 @@ function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isF
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Merry-Go-Round</h1>
++      <div className="mgr-header flex items-center justify-between flex-wrap gap-3">
++        <div>
++          <h1 className="font-display text-2xl font-semibold">Merry-Go-Round</h1>
++          <p className="text-sm text-white/70 mt-1">{pots.length} pot{pots.length === 1 ? '' : 's'} running</p>
++        </div>
+         {isFinanceAdmin && (
+-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
++          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
+             + New pot
+           </button>
+         )}
+@@ -55,7 +58,12 @@ function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isF
+ 
+       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+         {pots.map((p) => (
+-          <div key={p.id} className="card p-5 cursor-pointer hover:border-forest-300" onClick={() => navigate(`/app/mgr/${p.id}`)}>
++          <div
++            key={p.id}
++            className="card p-5 cursor-pointer hover:border-forest-300 border-l-4"
++            style={{ borderLeftColor: p.status === 'draft' ? 'var(--color-gold-400)' : p.status === 'completed' ? '#B8BDB6' : 'var(--color-forest-700)' }}
++            onClick={() => navigate(`/app/mgr/${p.id}`)}
++          >
+             <h3 className="font-display font-semibold">{p.name}</h3>
+             <p className="text-sm text-forest-900/60 mt-1">
+               {kes(p.amount)} · {p.frequency} · {p.memberIds.length} members
+diff --git a/src/features/payments/AdminChargeButton.tsx b/src/features/payments/AdminChargeButton.tsx
+index c5e0027..4f01e97 100644
+--- a/src/features/payments/AdminChargeButton.tsx
++++ b/src/features/payments/AdminChargeButton.tsx
+@@ -8,21 +8,38 @@
+  *   - src/features/contributions/Contributions.tsx  (purpose: 'contribution')
+  *   - src/features/mgr/MgrPotDetail.tsx              (purpose: 'mgr_contribution')
+  *
+- * The phone charged always comes from the member's own record, resolved
+- * server-side — this component never collects or sends a phone number.
++ * MGR REPAIR PASS: this used to be a single button that always charged the
++ * member's own phone for a fixed amount, sight-unseen. It's now a small
++ * confirm modal so the admin can:
++ *   - edit the amount for a partial/top-up charge, not just the exact
++ *     amount owed;
++ *   - edit the phone the STK prompt goes to (defaults to the member's own
++ *     phone on file — a spouse or agent paying on the member's behalf is
++ *     a normal real-life case, matching the original demo's manual-entry
++ *     admin charge screen). Editing it requires the extra confirmation
++ *     checkbox below and is sent as `overridePhone`, never as `phone` —
++ *     see functions/mychama/payments.py for why that distinction matters.
++ *   - see the fee split BEFORE sending anything, labelled the way the
++ *     demo labelled it: "Transaction Cost" (Paystack's cut) and
++ *     "MyChama Fee" (this app's markup) — both computed with the same
++ *     grossUpForFees() the backend uses, so the number on screen matches
++ *     what actually gets charged.
+  */
+ 
+-import { useState } from 'react';
++import { useMemo, useState } from 'react';
+ import { useChama } from '../../app/ChamaProvider';
+ import { PLANS } from '../../lib/constants';
+ import { initiatePayment } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
++import { contributionFees, mgrContributionFees, kes } from '../../lib/money';
++import { Spinner } from '../../components/Spinner';
+ 
+ type AdminChargePurpose = 'contribution' | 'mgr_contribution';
+ 
+ export function AdminChargeButton({
+   chamaId,
+   memberId,
++  memberPhone,
+   amount,
+   purpose,
+   contributionId,
+@@ -33,7 +50,9 @@ export function AdminChargeButton({
+ }: {
+   chamaId: string;
+   memberId: string;
+-  /** Net amount the member owes for this purpose — same figure "Record cash" would take. */
++  /** Member's phone on file, shown as the modal's default — pass it through so we don't need an extra read. */
++  memberPhone?: string;
++  /** Net amount the member owes for this purpose — same figure "Record cash" would take. Editable in the modal. */
+   amount: number;
+   purpose: AdminChargePurpose;
+   contributionId?: string;
+@@ -43,11 +62,23 @@ export function AdminChargeButton({
+   onCharged?: (result: { reference: string }) => void;
+ }) {
+   const { chama } = useChama();
++  const [open, setOpen] = useState(false);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+   const [sent, setSent] = useState(false);
+ 
++  const [editAmount, setEditAmount] = useState(amount);
++  const [editPhone, setEditPhone] = useState(memberPhone ?? '');
++  const [confirmOverride, setConfirmOverride] = useState(false);
++
++  const phoneChanged = editPhone.trim() !== '' && editPhone.trim() !== (memberPhone ?? '').trim();
++
++  const fees = useMemo(() => {
++    const calc = purpose === 'mgr_contribution' ? mgrContributionFees : contributionFees;
++    return editAmount > 0 ? calc(editAmount) : null;
++  }, [editAmount, purpose]);
++
+   const planAllowsOnline = chama ? PLANS[chama.plan].onlineCollection : false;
+   const hasSettlement = !!chama?.settlementSplitCode;
+ 
+@@ -65,13 +96,34 @@ export function AdminChargeButton({
+     return <span className="text-xs text-forest-700 font-medium">STK prompt sent — waiting for confirmation</span>;
+   }
+ 
++  function openModal() {
++    setEditAmount(amount);
++    setEditPhone(memberPhone ?? '');
++    setConfirmOverride(false);
++    setError(null);
++    setOpen(true);
++  }
++
+   async function charge() {
+-    if (!(amount > 0)) return;
++    if (!(editAmount > 0)) return setError('Enter an amount greater than zero.');
++    if (phoneChanged && !confirmOverride) {
++      return setError('Confirm below that this number belongs to someone paying on the member\'s behalf.');
++    }
+     setError(null);
+     setBusy(true);
+     try {
+-      const res = await initiatePayment({ chamaId, purpose, amount, memberId, contributionId, potId, potPeriod });
++      const res = await initiatePayment({
++        chamaId,
++        purpose,
++        amount: editAmount,
++        memberId,
++        overridePhone: phoneChanged ? editPhone.trim() : undefined,
++        contributionId,
++        potId,
++        potPeriod,
++      });
+       setSent(true);
++      setOpen(false);
+       onCharged?.(res);
+     } catch (e) {
+       const { message, isQueued } = describeCallError(e);
+@@ -91,14 +143,83 @@ export function AdminChargeButton({
+   return (
+     <div className="flex flex-col gap-1">
+       <button
+-        onClick={charge}
+-        disabled={busy || !(amount > 0)}
++        onClick={openModal}
++        disabled={!(amount > 0)}
+         className="border border-forest-200 hover:bg-forest-50 text-xs font-semibold px-3 py-1.5 rounded-full disabled:opacity-50"
+       >
+-        {busy ? 'Sending…' : label}
++        {label}
+       </button>
+-      {error && <p className="text-xs text-brick-500 font-medium">{error}</p>}
+       {queuedMsg && <p className="text-xs text-gold-700 font-medium">{queuedMsg}</p>}
++
++      {open && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !busy && setOpen(false)}>
++          <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5 flex flex-col gap-3" onClick={(e) => e.stopPropagation()}>
++            <h3 className="font-semibold text-forest-900">Charge via Paystack</h3>
++
++            <label className="text-xs font-medium text-forest-900/70">
++              Amount
++              <input
++                type="number"
++                min={1}
++                value={editAmount}
++                onChange={(e) => setEditAmount(Number(e.target.value))}
++                disabled={busy}
++                className="mt-1 w-full border border-forest-200 rounded-lg px-3 py-2 text-sm"
++              />
++            </label>
++
++            <label className="text-xs font-medium text-forest-900/70">
++              Phone to send the STK prompt to
++              <input
++                type="tel"
++                value={editPhone}
++                onChange={(e) => setEditPhone(e.target.value)}
++                disabled={busy}
++                placeholder={memberPhone || "Leave blank to use the member's phone on file"}
++                className="mt-1 w-full border border-forest-200 rounded-lg px-3 py-2 text-sm"
++              />
++            </label>
++
++            {phoneChanged && (
++              <label className="flex items-start gap-2 text-xs text-gold-700 bg-gold-50 rounded-lg p-2">
++                <input
++                  type="checkbox"
++                  checked={confirmOverride}
++                  onChange={(e) => setConfirmOverride(e.target.checked)}
++                  disabled={busy}
++                  className="mt-0.5"
++                />
++                <span>This isn't the member's own number on file. I've confirmed with whoever's paying that they've agreed to pay on the member's behalf.</span>
++              </label>
++            )}
++
++            {fees && (
++              <div className="text-xs bg-forest-50 rounded-lg p-3 flex flex-col gap-1">
++                <div className="flex justify-between"><span className="text-forest-900/60">Member pays</span><span className="font-semibold">{kes(fees.gross)}</span></div>
++                <div className="flex justify-between text-forest-900/60"><span>Transaction Cost</span><span>{kes(fees.paystackFee)}</span></div>
++                <div className="flex justify-between text-forest-900/60"><span>MyChama Fee</span><span>{kes(fees.ourFee)}</span></div>
++                <div className="flex justify-between border-t border-forest-100 pt-1 font-medium"><span>Chama receives</span><span>{kes(fees.net)}</span></div>
++              </div>
++            )}
++
++            {error && <p className="text-xs text-brick-500 font-medium">{error}</p>}
++
++            <div className="flex gap-2 justify-end pt-1">
++              <button onClick={() => setOpen(false)} disabled={busy} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50 disabled:opacity-50">
++                Cancel
++              </button>
++              <button
++                onClick={charge}
++                disabled={busy || !(editAmount > 0)}
++                className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full disabled:opacity-50 flex items-center gap-2"
++              >
++                {busy && <Spinner />}
++                {busy ? 'Sending…' : 'Send STK prompt'}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/index.css b/src/index.css
+index 0ec18e7..9da6173 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -95,3 +95,36 @@ input:focus, select:focus, textarea:focus {
+ 
+ @keyframes toastIn { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+ .toast-in { animation: toastIn .2s ease-out both; }
++
++/* --- MGR repair pass additions --- */
++@keyframes spin { to { transform: rotate(360deg); } }
++.spinner {
++  display: inline-block;
++  width: 14px;
++  height: 14px;
++  border: 2px solid rgba(255, 255, 255, .35);
++  border-top-color: #fff;
++  border-radius: 50%;
++  animation: spin .7s linear infinite;
++  vertical-align: -2px;
++}
++.spinner-dark {
++  border-color: rgba(31, 77, 58, .2);
++  border-top-color: var(--color-forest-700);
++}
++
++/* Cosmetic parity with the original demo's coloured MGR dashboard header. */
++.mgr-header {
++  background: linear-gradient(135deg, var(--color-forest-700), var(--color-forest-800));
++  color: #fff;
++  border-radius: 16px;
++  padding: 20px 22px;
++}
++.mgr-header .btn-add {
++  background: var(--color-gold-400);
++  color: var(--color-ink);
++  font-weight: 700;
++  border-radius: 999px;
++  padding: 8px 18px;
++}
++.mgr-header .btn-add:hover { background: var(--color-gold-500); }
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 19fcb7f..978ea64 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -198,10 +198,68 @@ export const closeMgrPeriod = callable<
+ 
+ /** Added beyond the original Phase 2 contract — see mychama/mgr.py's docstring. */
+ export const recordMgrPayoutCash = callable<
+-  { chamaId: string; potId: string },
++  { chamaId: string; potId: string; acknowledgeShortfall?: boolean },
+   { ok: true; paidTo: string[]; amountEach: number }
+ >('recordMgrPayoutCash', () => 'Record merry-go-round payout');
+ 
++// -- MGR repair pass — membership, arrears, exits, shortfall, health -------
++
++export const mgrAddMembers = callable<{ chamaId: string; potId: string; memberIds: string[] }, { ok: true; added: string[] }>(
++  'mgrAddMembers',
++  (r) => `Add ${r.memberIds.length} member(s) to merry-go-round`
++);
++
++export const mgrRemoveMember = callable<{ chamaId: string; potId: string; memberId: string }, { ok: true }>(
++  'mgrRemoveMember',
++  () => 'Remove member from merry-go-round'
++);
++
++export const mgrReorderQueue = callable<{ chamaId: string; potId: string; queue: string[] }, { ok: true }>(
++  'mgrReorderQueue',
++  () => 'Reorder merry-go-round queue'
++);
++
++export const mgrToggleAutoDemote = callable<{ chamaId: string; potId: string }, { ok: true; autoDemoteLate: boolean }>(
++  'mgrToggleAutoDemote',
++  () => 'Toggle auto-demote for late payers'
++);
++
++export const mgrSettleArrear = callable<
++  { chamaId: string; potId: string; arrearId: string; amount?: number },
++  { ok: true; remaining: number }
++>('mgrSettleArrear', () => 'Settle merry-go-round arrear');
++
++export const mgrWriteOffArrear = callable<{ chamaId: string; potId: string; arrearId: string; reason: string }, { ok: true }>(
++  'mgrWriteOffArrear',
++  () => 'Write off merry-go-round arrear'
++);
++
++export const mgrCoverShortfall = callable<
++  { chamaId: string; potId: string; amount: number; source: 'reserve' | 'member'; memberId?: string },
++  { ok: true; remaining: number }
++>('mgrCoverShortfall', (r) => `Cover KES ${r.amount.toLocaleString()} merry-go-round shortfall`);
++
++/** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
++export const mgrProposeExit = liveCallable<
++  { chamaId: string; potId: string; memberId: string },
++  { exitId: string; proposedNet: number }
++>('mgrProposeExit', 'Working out exit settlement');
++
++export const mgrSettleExit = callable<
++  { chamaId: string; potId: string; exitId: string; settledAmount?: number },
++  { ok: true; settledAmount: number; settledDirection: 'pot_to_member' | 'member_to_pot' }
++>('mgrSettleExit', () => 'Settle merry-go-round exit');
++
++export const mgrRepairPot = callable<{ chamaId: string; potId: string }, { ok: true; changed: boolean; queue: string[] }>(
++  'mgrRepairPot',
++  () => 'Repair merry-go-round pot'
++);
++
++export const mgrCloseForever = callable<{ chamaId: string; potId: string }, { ok: true }>(
++  'mgrCloseForever',
++  () => 'Close merry-go-round pot'
++);
++
+ // ---------------------------------------------------------------------------
+ // Phase 3 — Payments, SMS & Settlement
+ // ---------------------------------------------------------------------------
+@@ -230,8 +288,10 @@ export const approveSettlementChange = callable<
+  *
+  * Admin-on-behalf-of-member charge: pass `memberId` for a member other
+  * than the caller (finance-admin only — see functions/mychama/payments.py).
+- * `phone` is ignored in that case; the server always uses the target
+- * member's phone on file. This is what
++ * `phone` is ignored in that case; the server defaults to the target
++ * member's phone on file, or — pass `overridePhone` to send the STK
++ * prompt to a different number instead (e.g. a spouse/agent paying on
++ * the member's behalf). This is what
+  * src/features/payments/AdminChargeButton.tsx calls, shared across
+  * Contributions and MGR admin screens.
+  */
+@@ -242,6 +302,7 @@ export const initiatePayment = liveCallable<
+     amount: number;
+     phone?: string;
+     memberId?: string;
++    overridePhone?: string;
+     contributionId?: string;
+     loanId?: string;
+     installmentNo?: number;
+@@ -280,6 +341,6 @@ export const upgradePlan = liveCallable<
+  * minutes entry's PDF via minutesId, which ignores from/to/memberId.
+  */
+ export const generateStatement = liveCallable<
+-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string },
++  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string },
+   { url: string }
+ >('generateStatement', 'Generating statement');
+diff --git a/src/lib/constants.ts b/src/lib/constants.ts
+index e5bc78b..efb876c 100644
+--- a/src/lib/constants.ts
++++ b/src/lib/constants.ts
+@@ -18,6 +18,9 @@ export const MC = {
+   MGR_POTS: 'mgrPots',
+   MGR_RECORDS: 'records',
+   MGR_PAYOUTS: 'payouts',
++  MGR_ARREARS: 'arrears',
++  MGR_EXITS: 'exits',
++  MGR_LEDGER: 'ledger',
+   PAYMENT_INTENTS: 'paymentIntents',
+   SMS_TOPUPS: 'smsTopUps',
+   PLAN_BILLING: 'planBilling',
+diff --git a/src/lib/firestorePaths.ts b/src/lib/firestorePaths.ts
+index 5082579..82a0a86 100644
+--- a/src/lib/firestorePaths.ts
++++ b/src/lib/firestorePaths.ts
+@@ -30,6 +30,13 @@ export const paths = {
+   mgrRecord: (chamaId: string, potId: string, recordId: string) =>
+     `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_RECORDS}/${recordId}`,
+   mgrPayouts: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_PAYOUTS}`,
++  mgrArrears: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_ARREARS}`,
++  mgrArrear: (chamaId: string, potId: string, arrearId: string) =>
++    `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_ARREARS}/${arrearId}`,
++  mgrExits: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_EXITS}`,
++  mgrExit: (chamaId: string, potId: string, exitId: string) =>
++    `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_EXITS}/${exitId}`,
++  mgrLedger: (chamaId: string, potId: string) => `${MC.CHAMAS}/${chamaId}/${MC.MGR_POTS}/${potId}/${MC.MGR_LEDGER}`,
+ 
+   paymentIntents: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.PAYMENT_INTENTS}`,
+   paymentIntent: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.PAYMENT_INTENTS}/${reference}`,
+diff --git a/src/lib/mgrEngine.ts b/src/lib/mgrEngine.ts
+index e52d82a..3367101 100644
+--- a/src/lib/mgrEngine.ts
++++ b/src/lib/mgrEngine.ts
+@@ -5,7 +5,7 @@
+  * functions/mychama/mgr.py — nothing here mutates a queue or a record.
+  */
+ 
+-import type { MgrPot, MgrRecord } from './types';
++import type { MgrArrear, MgrPot, MgrRecord } from './types';
+ 
+ const LATE_DECAY = 0.7;
+ 
+@@ -32,3 +32,72 @@ export function missedCount(records: MgrRecord[], memberId: string): number {
+ export function poolEstimate(pot: Pick<MgrPot, 'amount' | 'memberIds' | 'periodsPerRound'>): number {
+   return pot.amount * pot.memberIds.length * pot.periodsPerRound;
+ }
++
++export function isShortRound(pot: Pick<MgrPot, 'queue' | 'recipientsPerRound'>): boolean {
++  return pot.queue.length > 0 && pot.queue.length < pot.recipientsPerRound;
++}
++
++/**
++ * DISPLAY-ONLY preview of what a "smart" reorder would look like — sorts
++ * by late score with no random tie-break (the real draw/close always
++ * shuffles first server-side; see functions/shared/mgr_engine.py). Lets
++ * the queue-reorder UI show a "suggested order" button that fills the
++ * editor instantly, without waiting on a round trip — the admin can still
++ * drag it further before mgrReorderQueue commits anything. Never used to
++ * decide an actual payout.
++ */
++export function previewSmartOrder(records: MgrRecord[], pool: string[]): string[] {
++  return [...pool].sort((a, b) => lateScore(records, a) - lateScore(records, b));
++}
++
++export interface MgrHealthFinding {
++  code: string;
++  memberId?: string;
++  message: string;
++}
++
++/**
++ * Pure diagnostics — mirrors functions/shared/mgr_engine.py::health_check
++ * field for field. Safe to run client-side for an instant Health card;
++ * only mgrRepairPot (server-only) may act on what this finds.
++ */
++export function healthCheck(
++  pot: Pick<MgrPot, 'memberIds' | 'queue' | 'status' | 'pendingShortfall' | 'recipientsPerRound'>,
++  arrears: Pick<MgrArrear, 'memberId' | 'status'>[]
++): MgrHealthFinding[] {
++  const findings: MgrHealthFinding[] = [];
++  const memberSet = new Set(pot.memberIds);
++  const queueSet = new Set(pot.queue);
++
++  const seen = new Set<string>();
++  for (const m of pot.queue) {
++    if (seen.has(m)) findings.push({ code: 'duplicate_in_queue', memberId: m, message: 'Appears more than once in the payout queue.' });
++    seen.add(m);
++  }
++
++  for (const m of queueSet) {
++    if (!memberSet.has(m)) findings.push({ code: 'orphaned_in_queue', memberId: m, message: 'In the payout queue but no longer a pot member.' });
++  }
++
++  if (pot.status === 'active') {
++    for (const m of memberSet) {
++      if (!queueSet.has(m)) findings.push({ code: 'missing_from_queue', memberId: m, message: 'A pot member with no place in the payout queue.' });
++    }
++  }
++
++  for (const a of arrears) {
++    if (a.status === 'open' && !memberSet.has(a.memberId)) {
++      findings.push({ code: 'arrear_for_ex_member', memberId: a.memberId, message: 'Has an open arrear but is no longer a pot member — settle or write off before closing the pot.' });
++    }
++  }
++
++  if ((pot.pendingShortfall ?? 0) > 0) {
++    findings.push({ code: 'uncovered_shortfall', message: `KES ${(pot.pendingShortfall ?? 0).toLocaleString()} of the last completed round was never covered.` });
++  }
++
++  if (isShortRound(pot) && pot.status === 'active') {
++    findings.push({ code: 'short_round', message: "Fewer members remain than a full round needs — the next payout will use a final settlement plan." });
++  }
++
++  return findings;
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index d96dca9..10ca2c1 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -145,14 +145,67 @@ export interface MgrPot {
+   drawDone: boolean;
+   drawMethod: 'smart' | 'random' | null;
+   autoDemoteLate: boolean;
+-  status: 'draft' | 'active' | 'completed';
++  status: 'draft' | 'active' | 'completed' | 'closed';
+   cycleNumber: number;
+   period: number;
++  /** Carried from the last closeMgrPeriod — what the round fell short by. Cleared by mgrCoverShortfall / paid out. */
++  pendingShortfall?: number;
++  remindersEnabled?: boolean;
++  reminderScheduleId?: string | null;
++  closedAt?: number | null;
+   createdOn: string;
+   createdAt?: number;
+   updatedAt?: number;
+ }
+ 
++export interface MgrArrear {
++  id: string;
++  memberId: string;
++  periods: number[];
++  amount: number;
++  status: 'open' | 'settled' | 'written_off';
++  settledAmount?: number;
++  writeOffReason?: string;
++  createdAt: number;
++  updatedAt: number;
++}
++
++export interface MgrExit {
++  id: string;
++  memberId: string;
++  proposedNet: number;
++  status: 'proposed' | 'settled';
++  settledAmount?: number;
++  settledDirection?: 'pot_to_member' | 'member_to_pot';
++  createdAt: number;
++  updatedAt: number;
++}
++
++export type MgrLedgerKind =
++  | 'contribution'
++  | 'payout'
++  | 'arrear_opened'
++  | 'arrear_settled'
++  | 'arrear_written_off'
++  | 'shortfall_recorded'
++  | 'shortfall_covered'
++  | 'member_added'
++  | 'member_removed'
++  | 'exit_settled'
++  | 'queue_reordered'
++  | 'period_closed'
++  | 'pot_closed'
++  | 'repaired';
++
++export interface MgrLedgerEntry {
++  id: string;
++  kind: MgrLedgerKind;
++  memberId?: string | null;
++  amount?: number;
++  note?: string;
++  createdAt: number;
++}
++
+ export interface MgrRecord {
+   id: string;
+   period: number;
+@@ -203,6 +256,8 @@ export interface ChamaTransaction {
+   channel?: 'app' | 'whatsapp';
+   /** paymentIntents document ID when the payment originated on WhatsApp or the app. */
+   intentId?: string;
++  /** Set on mgr_contribution / mgr_payout / shortfall-cover / exit-settlement rows so a statement can be scoped to one pot. */
++  potId?: string | null;
+   createdAt?: number;
+ }
+ 

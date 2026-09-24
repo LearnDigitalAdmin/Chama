@@ -203,10 +203,12 @@ TX_LABEL = {
 }
 
 
-def _fetch_transactions(db, chama_id: str, member_id: str | None, date_from: str, date_to: str) -> list[dict]:
+def _fetch_transactions(db, chama_id: str, member_id: str | None, date_from: str, date_to: str, pot_id: str | None = None) -> list[dict]:
     q = db.collection(paths.transactions(chama_id)).where("date", ">=", date_from).where("date", "<=", date_to)
     if member_id:
         q = q.where("memberId", "==", member_id)
+    if pot_id:
+        q = q.where("potId", "==", pot_id)
     rows = [d.to_dict() for d in q.stream()]
     rows.sort(key=lambda r: (r.get("date", ""), r.get("createdAt", 0)))
     return rows
@@ -364,6 +366,7 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
     date_to = data.get("to")
     fmt = data.get("format")
     minutes_id = data.get("minutesId")  # minimal, documented addition — see TOUCH_BASE.md
+    pot_id = data.get("potId")  # optional — scopes the statement to one MGR pot, see mychama/mgr.py
 
     if not chama_id or fmt not in ("pdf", "csv"):
         raise bad_request("chamaId and a valid format ('pdf' or 'csv') are required.")
@@ -408,15 +411,22 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
         content_type = "application/pdf"
     else:
         names = _member_name_map(db, chama_id)
-        scope_label = names.get(member_id, "Member") if member_id else "Whole chama"
-        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to)
+        pot_label = None
+        if pot_id:
+            pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
+            if not pot_snap.exists:
+                raise not_found("Merry-go-round pot not found.")
+            pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
+        base_label = names.get(member_id, "Member") if member_id else "Whole chama"
+        scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
+        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
         if fmt == "csv":
             content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
             content_type = "text/csv"
         else:
             content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to)
             content_type = "application/pdf"
-        filename = f"statement-{member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
+        filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
 
     url = _upload_and_sign(chama_id, filename, content, content_type)
 

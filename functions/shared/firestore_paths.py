@@ -69,6 +69,26 @@ def mgr_payouts(chama_id: str, pot_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_PAYOUTS}"
 
 
+def mgr_arrears(chama_id: str, pot_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_ARREARS}"
+
+
+def mgr_arrear(chama_id: str, pot_id: str, arrear_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_ARREARS}/{arrear_id}"
+
+
+def mgr_exits(chama_id: str, pot_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_EXITS}"
+
+
+def mgr_exit(chama_id: str, pot_id: str, exit_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_EXITS}/{exit_id}"
+
+
+def mgr_ledger(chama_id: str, pot_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.MGR_POTS}/{pot_id}/{MC.MGR_LEDGER}"
+
+
 def payment_intents(chama_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.PAYMENT_INTENTS}"
 

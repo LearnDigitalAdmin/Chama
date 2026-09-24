@@ -95,3 +95,36 @@ input:focus, select:focus, textarea:focus {
 
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .toast-in { animation: toastIn .2s ease-out both; }
+
+/* --- MGR repair pass additions --- */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, .35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  vertical-align: -2px;
+}
+.spinner-dark {
+  border-color: rgba(31, 77, 58, .2);
+  border-top-color: var(--color-forest-700);
+}
+
+/* Cosmetic parity with the original demo's coloured MGR dashboard header. */
+.mgr-header {
+  background: linear-gradient(135deg, var(--color-forest-700), var(--color-forest-800));
+  color: #fff;
+  border-radius: 16px;
+  padding: 20px 22px;
+}
+.mgr-header .btn-add {
+  background: var(--color-gold-400);
+  color: var(--color-ink);
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 8px 18px;
+}
+.mgr-header .btn-add:hover { background: var(--color-gold-500); }
