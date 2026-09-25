@@ -15,7 +15,9 @@ export default function Payments() {
 
   return (
     <div className="space-y-5">
-      <h1 className="font-display text-2xl font-semibold text-ink">Payments & Settlement</h1>
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">Payments &amp; Settlement</h1>
+      </div>
 
       {!canCollectOnline && (
         <div className="card p-4 border-gold-300 ring-1 ring-gold-200">

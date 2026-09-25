@@ -145,9 +145,14 @@ service cloud.firestore {
                       && request.resource.data.role in ['chair', 'treasurer', 'secretary', 'member'];
 
         // Balances are derived from the ledger — a client may never set them.
+        // 'removed' is a terminal status reachable only through
+        // removeMemberPermanently (Admin SDK, bypasses this rule) — that
+        // callable is where the loan/MGR dependency checks live, so a
+        // direct write can never skip them.
         allow update: if (
                         isFinanceAdmin(chamaId)
                         && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt'])
+                        && request.resource.data.status in ['active', 'inactive', 'suspended']
                       ) || (
                         // A member maintains their own contact details only.
                         isSelf(chamaId, memberId)

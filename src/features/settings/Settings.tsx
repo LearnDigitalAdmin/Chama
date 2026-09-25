@@ -55,7 +55,9 @@ function AdminSettings() {
 
   return (
     <div className="space-y-5 max-w-2xl">
-      <h1 className="font-display text-2xl font-semibold text-ink">Settings</h1>
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">Settings</h1>
+      </div>
 
       <div className="card p-6">
         <div className="flex items-center justify-between mb-3">

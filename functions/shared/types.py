@@ -80,12 +80,14 @@ class ChamaMember(TypedDict):
     idLast4: str
     nationalIdMasked: NotRequired[str]
     joinDate: NotRequired[str]
-    status: Literal["active", "inactive", "suspended"]
+    status: Literal["active", "inactive", "suspended", "removed"]
     totalContributed: float
     creditBalance: float
     avatarColor: NotRequired[str]
     initial: NotRequired[str]
     whatsappOptIn: NotRequired[bool]
+    removedAt: NotRequired[int]
+    removedBy: NotRequired[str]
     createdAt: NotRequired[int]
     updatedAt: NotRequired[int]
 

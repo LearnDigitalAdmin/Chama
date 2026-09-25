@@ -52,12 +52,14 @@ export interface ChamaMember {
   idLast4: string;
   nationalIdMasked: string;
   joinDate: string;
-  status: 'active' | 'inactive' | 'suspended';
+  status: 'active' | 'inactive' | 'suspended' | 'removed';
   totalContributed: number;
   creditBalance: number;
   avatarColor?: string;
   initial?: string;
   whatsappOptIn?: boolean;
+  removedAt?: number;
+  removedBy?: string;
   createdAt?: number;
   updatedAt?: number;
 }
@@ -145,6 +147,10 @@ export interface MgrPot {
   drawDone: boolean;
   drawMethod: 'smart' | 'random' | null;
   autoDemoteLate: boolean;
+  /** % withheld from a departing member's refund on exit (0 = none). Never applied to what a member owes the pot. */
+  exitCutPercent?: number;
+  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. */
+  finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
   status: 'draft' | 'active' | 'completed' | 'closed';
   cycleNumber: number;
   period: number;
@@ -174,6 +180,8 @@ export interface MgrExit {
   id: string;
   memberId: string;
   proposedNet: number;
+  grossNet?: number;
+  exitCutPercent?: number;
   status: 'proposed' | 'settled';
   settledAmount?: number;
   settledDirection?: 'pot_to_member' | 'member_to_pot';
@@ -372,7 +380,7 @@ export interface SettlementAccountRequest {
  * it also doubles as an in-app fallback if the SMS itself failed to land. */
 export interface SmsLogEntry {
   id: string;
-  audience: 'all' | 'overdue' | 'custom';
+  audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
   message: string;
   recipientIds: string[];
   recipientCount: number;
@@ -380,6 +388,24 @@ export interface SmsLogEntry {
   creditsUsed: number;
   sentBy: string;
   createdAt: number;
+}
+
+/** chamas/{chamaId}/smsSchedules/{id} — a client-written doc (see firestore.rules'
+ * smsSchedules match block), dispatched by functions/mychama/sms.py's
+ * run_sms_schedules cron. Field names must match that cron exactly:
+ * `status`/`body`, not `active`/`message`. */
+export interface SmsSchedule {
+  id: string;
+  status: 'active' | 'paused';
+  body: string;
+  audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
+  memberIds?: string[] | null;
+  frequency: 'daily' | 'weekly' | 'monthly';
+  /** Epoch ms — the cron picks up anything with nextRun <= now. */
+  nextRun: number;
+  /** Set only for a reminder schedule created from a specific MGR pot (see MgrPotDetail.tsx). */
+  potId?: string | null;
+  createdAt?: number;
 }
 
 /** APP-ONLY, Phase 4. chamas/{chamaId}/planBilling/{reference} — a plan

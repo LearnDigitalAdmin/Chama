@@ -1,33 +1,47 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { collection, limit as fbLimit, onSnapshot, orderBy, query, where } from 'firebase/firestore';
+import { Link } from 'react-router-dom';
+import { db } from '../../lib/firebase';
+import { paths } from '../../lib/firestorePaths';
 import { useChama } from '../../app/ChamaProvider';
 import { useMembers } from '../../app/useMembers';
-import { addAdmin, addMember, updateMember } from '../../lib/callables';
+import { addAdmin, addMember, removeMemberPermanently, updateMember } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
+import { PLANS } from '../../lib/constants';
 import { kes } from '../../lib/money';
 import { isValidKenyanPhone } from '../../lib/phone';
-import type { ChamaMember, MemberRole } from '../../lib/types';
+import { loanStatusLabel } from '../../lib/loanSchedule';
+import type { ChamaMember, Contribution, Loan, MemberRole } from '../../lib/types';
 
 const STATUS_CHIP: Record<string, string> = {
   active: 'bg-forest-50 text-forest-700',
   inactive: 'bg-forest-50 text-forest-900/50',
   suspended: 'bg-brick-50 text-brick-500',
+  removed: 'bg-forest-900/10 text-forest-900/40',
 };
 
 const ASSIGNABLE_ROLES: Exclude<MemberRole, 'chair'>[] = ['treasurer', 'secretary', 'member'];
-const STATUSES: ChamaMember['status'][] = ['active', 'inactive', 'suspended'];
+const STATUSES: Exclude<ChamaMember['status'], 'removed'>[] = ['active', 'inactive', 'suspended'];
 
 export default function Members() {
-  const { chamaId, isFinanceAdmin } = useChama();
+  const { chamaId, chama, isFinanceAdmin } = useChama();
   const { members, ready } = useMembers(chamaId, false);
   const [showForm, setShowForm] = useState<null | 'member' | 'admin'>(null);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<ChamaMember | null>(null);
 
+  // A permanent removal is a soft, terminal status (see removeMemberPermanently
+  // and firestore.rules) — but the person experiences it as the demo's actual
+  // delete did: gone from the list, not just greyed out.
+  const visibleMembers = useMemo(() => members.filter((m) => m.status !== 'removed'), [members]);
+  const removedCount = members.length - visibleMembers.length;
+  const activeCount = useMemo(() => visibleMembers.filter((m) => m.status === 'active').length, [visibleMembers]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return members;
-    return members.filter((m) => m.name.toLowerCase().includes(q) || m.phone.toLowerCase().includes(q));
-  }, [members, query]);
+    if (!q) return visibleMembers;
+    return visibleMembers.filter((m) => m.name.toLowerCase().includes(q) || m.phone.toLowerCase().includes(q));
+  }, [visibleMembers, query]);
 
   // Keep the open detail panel in sync with live member updates (e.g. after
   // an edit/role/status change commits) rather than holding a stale copy.
@@ -35,23 +49,36 @@ export default function Members() {
 
   if (!ready) return <p className="text-forest-900/60">Loading members…</p>;
 
+  const limit = chama ? PLANS[chama.plan].memberLimit : null;
+  const atLimit = limit !== null && activeCount >= limit;
+
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display text-2xl font-semibold text-ink">Members ({members.length})</h1>
-        {isFinanceAdmin && (
-          <div className="flex gap-2">
-            <button onClick={() => setShowForm('member')} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
-              + Add member
-            </button>
-            <button
-              onClick={() => setShowForm('admin')}
-              className="border border-forest-200 hover:bg-forest-50 text-sm font-semibold px-4 py-2 rounded-full"
-            >
-              + Add admin
-            </button>
-          </div>
-        )}
+      <div className="page-header flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="font-display text-2xl font-semibold">Members ({visibleMembers.length})</h1>
+          {chama && (
+            <p className="text-sm text-white/70 mt-1">
+              {activeCount} of {limit === 999 ? 'unlimited' : limit} active on the {PLANS[chama.plan].name} plan
+              {removedCount > 0 && ` · ${removedCount} permanently removed`}
+            </p>
+          )}
+        </div>
+        {isFinanceAdmin &&
+          (atLimit ? (
+            <Link to="/app/billing" className="btn-add text-sm">
+              Upgrade to add more
+            </Link>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={() => setShowForm('member')} className="btn-add text-sm">
+                + Add member
+              </button>
+              <button onClick={() => setShowForm('admin')} className="btn-ghost text-sm">
+                + Add admin
+              </button>
+            </div>
+          ))}
       </div>
 
       {showForm && <AddPersonForm kind={showForm} chamaId={chamaId!} onDone={() => setShowForm(null)} />}
@@ -115,6 +142,11 @@ export default function Members() {
   );
 }
 
+/** Works best with Safaricom numbers (07xx) — M-Pesa collection and SMS reminders both depend on it. Other networks can still be added, just without those two. */
+function SafaricomHint() {
+  return <span className="text-xs text-forest-900/50 font-normal">Works best with a Safaricom number (07xx) — used for M-Pesa and SMS reminders.</span>;
+}
+
 function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; chamaId: string; onDone: () => void }) {
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
@@ -122,10 +154,12 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
   const [role, setRole] = useState<Exclude<MemberRole, 'member'>>('secretary');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [limitReached, setLimitReached] = useState(false);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
 
   async function submit() {
     setError(null);
+    setLimitReached(false);
     if (!name.trim() || !isValidKenyanPhone(phone) || idNumber.trim().length < 4) {
       setError('Fill in a valid name, phone, and ID number.');
       return;
@@ -139,6 +173,11 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
       }
       onDone();
     } catch (e) {
+      const code = (e as { code?: string } | null)?.code ?? '';
+      if (code.includes('resource-exhausted')) {
+        setLimitReached(true);
+        return;
+      }
       const { message, isQueued } = describeCallError(e);
       if (isQueued) {
         setQueuedMsg(message);
@@ -161,6 +200,7 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
       <label className="flex flex-col gap-1 text-sm font-medium">
         Phone number
         <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="0712345678" disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+        <SafaricomHint />
       </label>
       <label className="flex flex-col gap-1 text-sm font-medium">
         National ID number
@@ -190,6 +230,15 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
       </div>
       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
       {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
+      {limitReached && (
+        <p className="text-sm text-brick-500 font-medium">
+          You've reached this plan's member limit.{' '}
+          <Link to="/app/billing" className="underline">
+            Upgrade your plan
+          </Link>{' '}
+          to add more.
+        </p>
+      )}
     </div>
   );
 }
@@ -210,10 +259,33 @@ function MemberDetailModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+  const [confirmingRemoval, setConfirmingRemoval] = useState(false);
+  const [contributions, setContributions] = useState<Contribution[]>([]);
+  const [loans, setLoans] = useState<Loan[]>([]);
 
   const isChair = member.role === 'chair';
 
-  async function patch(update: Partial<{ name: string; phone: string; role: MemberRole; status: ChamaMember['status'] }>) {
+  // Members audit: "Member detail: contribution history list" / "loan
+  // history list" — both were on the demo's member detail modal and both
+  // got stripped from the live one. Same indexes Contributions.tsx and
+  // Loans.tsx already rely on (memberId + periodKey / memberId + requestedOn),
+  // so no new firestore.indexes.json entries are needed.
+  useEffect(() => {
+    const unsubContrib = onSnapshot(
+      query(collection(db, paths.contributions(chamaId)), where('memberId', '==', member.id), orderBy('periodKey', 'desc'), fbLimit(5)),
+      (s) => setContributions(s.docs.map((d) => ({ id: d.id, ...d.data() }) as Contribution))
+    );
+    const unsubLoans = onSnapshot(
+      query(collection(db, paths.loans(chamaId)), where('memberId', '==', member.id), orderBy('requestedOn', 'desc')),
+      (s) => setLoans(s.docs.map((d) => ({ id: d.id, ...d.data() }) as Loan))
+    );
+    return () => {
+      unsubContrib();
+      unsubLoans();
+    };
+  }, [chamaId, member.id]);
+
+  async function patch(update: Partial<{ name: string; phone: string; role: MemberRole; status: Exclude<ChamaMember['status'], 'removed'> }>) {
     setError(null);
     setBusy(true);
     try {
@@ -233,9 +305,24 @@ function MemberDetailModal({
     }
   }
 
+  async function removePermanently() {
+    setError(null);
+    setBusy(true);
+    try {
+      await removeMemberPermanently({ chamaId, memberId: member.id });
+      onClose();
+    } catch (e) {
+      const { message } = describeCallError(e);
+      setError(message);
+      setConfirmingRemoval(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="fixed inset-0 bg-ink/40 flex items-end sm:items-center justify-center p-4 z-50" onClick={onClose}>
-      <div className="card p-5 max-w-sm w-full flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
+      <div className="card p-5 max-w-sm w-full flex flex-col gap-4 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         {mode === 'view' && (
           <>
             <div className="flex items-start justify-between gap-3">
@@ -266,6 +353,40 @@ function MemberDetailModal({
               <dd>{member.uid ? 'Linked — can log in' : 'Not linked — awaiting first sign-in'}</dd>
             </dl>
 
+            <div className="pt-2 border-t border-forest-100">
+              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mb-2">Recent contributions</p>
+              {contributions.length === 0 ? (
+                <p className="text-xs text-forest-900/40">No contribution history yet.</p>
+              ) : (
+                <ul className="text-sm space-y-1">
+                  {contributions.map((c) => (
+                    <li key={c.id} className="flex items-center justify-between">
+                      <span className="text-forest-900/70">{c.period}</span>
+                      <span className="num">{kes(c.paidAmount)}</span>
+                      <span className={`chip text-xs ${c.status === 'paid' ? 'bg-forest-50 text-forest-700' : 'bg-brick-50 text-brick-500'}`}>{c.status}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div>
+              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mb-2">Loan history</p>
+              {loans.length === 0 ? (
+                <p className="text-xs text-forest-900/40">No loans yet.</p>
+              ) : (
+                <ul className="text-sm space-y-1">
+                  {loans.map((l) => (
+                    <li key={l.id} className="flex items-center justify-between">
+                      <span className="text-forest-900/70">{l.requestedOn}</span>
+                      <span className="num">{kes(l.principal)}</span>
+                      <span className="chip text-xs bg-forest-50 text-forest-700">{loanStatusLabel(l)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
             {canManage && (
               <div className="flex flex-col gap-2 pt-2 border-t border-forest-100">
                 <button onClick={() => setMode('edit')} disabled={busy} className="text-sm font-semibold text-forest-700 text-left">
@@ -288,6 +409,31 @@ function MemberDetailModal({
                     </button>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {canManage && !isChair && (
+              <div className="pt-2 border-t border-forest-100">
+                {!confirmingRemoval ? (
+                  <button onClick={() => setConfirmingRemoval(true)} disabled={busy} className="text-sm font-semibold text-brick-500 text-left">
+                    Permanently remove this member
+                  </button>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <p className="text-xs text-forest-900/60">
+                      This is permanent — {member.name} disappears from every list and can't be re-added under this
+                      record. They must have no unsettled loan and belong to no open merry-go-round pot first.
+                    </p>
+                    <div className="flex gap-2">
+                      <button onClick={removePermanently} disabled={busy} className="text-sm font-semibold px-3 py-1.5 rounded-full bg-brick-500 text-white disabled:opacity-50">
+                        {busy ? 'Removing…' : 'Yes, remove permanently'}
+                      </button>
+                      <button onClick={() => setConfirmingRemoval(false)} disabled={busy} className="text-sm font-semibold text-forest-900/50">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -372,6 +518,7 @@ function EditMemberFields({
         <span className="text-xs text-forest-900/50 font-normal">
           Changing this changes which sign-in matches this member — including WhatsApp bot access.
         </span>
+        <SafaricomHint />
       </label>
       {localError && <p className="text-sm text-brick-500 font-medium">{localError}</p>}
       <div className="flex gap-2">

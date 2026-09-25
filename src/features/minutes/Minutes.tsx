@@ -57,10 +57,10 @@ export default function Minutes() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display text-2xl font-semibold text-ink">Minutes</h1>
+      <div className="page-header flex items-center justify-between flex-wrap gap-3">
+        <h1 className="font-display text-2xl font-semibold">Minutes</h1>
         {canWrite && (
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
             + Record minutes
           </button>
         )}

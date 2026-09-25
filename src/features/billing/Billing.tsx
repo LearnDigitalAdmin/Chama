@@ -31,9 +31,9 @@ export default function Billing() {
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="font-display text-2xl font-semibold text-ink">Plan & billing</h1>
-        <p className="text-sm text-forest-900/50 mt-0.5">
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">Plan &amp; billing</h1>
+        <p className="text-sm text-white/70 mt-0.5">
           You're on <b>{PLANS[chama.plan].name}</b>
           {chama.plan !== 'free' && chama.planExpiry && <> · renews {fmtDate(chama.planExpiry)}</>}.
         </p>

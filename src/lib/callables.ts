@@ -130,6 +130,11 @@ export const updateMember = callable<
   { ok: true }
 >('updateMember', () => 'Update member');
 
+export const removeMemberPermanently = callable<{ chamaId: string; memberId: string }, { ok: true }>(
+  'removeMemberPermanently',
+  () => 'Permanently remove member'
+);
+
 // ---------------------------------------------------------------------------
 // Phase 2 — Core operations
 //
@@ -168,6 +173,8 @@ export const createMgrPot = callable<
     periodsPerRound: number;
     recipientsPerRound: number;
     memberIds: string[];
+    exitCutPercent?: number;
+    finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
   },
   { potId: string }
 >('createMgrPot', (r) => `Create merry-go-round: ${r.name}`);
@@ -242,7 +249,7 @@ export const mgrCoverShortfall = callable<
 /** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
 export const mgrProposeExit = liveCallable<
   { chamaId: string; potId: string; memberId: string },
-  { exitId: string; proposedNet: number }
+  { exitId: string; proposedNet: number; grossNet: number }
 >('mgrProposeExit', 'Working out exit settlement');
 
 export const mgrSettleExit = callable<
@@ -319,7 +326,7 @@ export const purchaseSmsCredits = liveCallable<{ chamaId: string; amountKes: num
 );
 
 export const sendSmsCampaign = callable<
-  { chamaId: string; audience: 'all' | 'overdue' | 'custom'; memberIds?: string[]; message: string },
+  { chamaId: string; audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins'; memberIds?: string[]; message: string },
   { sent: number; creditsUsed: number }
 >('sendSmsCampaign', (r) => `Send SMS to ${r.audience}`);
 

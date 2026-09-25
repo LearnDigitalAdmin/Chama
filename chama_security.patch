@@ -1,0 +1,13 @@
+diff --git a/src/lib/firebase.ts b/src/lib/firebase.ts
+index 0d8cb2b..6d86d40 100644
+--- a/src/lib/firebase.ts
++++ b/src/lib/firebase.ts
+@@ -44,7 +44,7 @@ import {
+ import { getFunctions, type Functions } from 'firebase/functions';
+ 
+ const firebaseConfig = {
+-  apiKey: "AIzaSyDX4hDBp_N4I5K1jyjI1T_FgocvkeauIf8",
++  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+   authDomain: "mychama1.firebaseapp.com",
+   projectId: "mychama1",
+   storageBucket: "mychama1.firebasestorage.app",

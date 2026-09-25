@@ -1,0 +1,1975 @@
+diff --git a/firestore.rules b/firestore.rules
+index 6169ac5..4150a00 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -145,9 +145,14 @@ service cloud.firestore {
+                       && request.resource.data.role in ['chair', 'treasurer', 'secretary', 'member'];
+ 
+         // Balances are derived from the ledger — a client may never set them.
++        // 'removed' is a terminal status reachable only through
++        // removeMemberPermanently (Admin SDK, bypasses this rule) — that
++        // callable is where the loan/MGR dependency checks live, so a
++        // direct write can never skip them.
+         allow update: if (
+                         isFinanceAdmin(chamaId)
+                         && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt'])
++                        && request.resource.data.status in ['active', 'inactive', 'suspended']
+                       ) || (
+                         // A member maintains their own contact details only.
+                         isSelf(chamaId, memberId)
+diff --git a/functions/main.py b/functions/main.py
+index 4f1bd4e..3b3fafe 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -23,6 +23,7 @@ from mychama.identity import (  # noqa: E402,F401
+     claimMyInvites,
+     completeProfile,
+     updateMember,
++    removeMemberPermanently,
+ )
+ from mychama.triggers import on_member_write  # noqa: E402,F401
+ 
+diff --git a/functions/mychama/identity.py b/functions/mychama/identity.py
+index c703cd4..3a8a11a 100644
+--- a/functions/mychama/identity.py
++++ b/functions/mychama/identity.py
+@@ -528,3 +528,97 @@ def updateMember(req: https_fn.CallableRequest) -> dict:
+         )
+ 
+     return {"ok": True}
++
++
++# ---------------------------------------------------------------------------
++# removeMemberPermanently — feature-parity pass with the original demo
++# (Members audit: "Permanent removal (delete from chama)" + "Removal
++# dependency checks").
++#
++# The demo deleted the member document outright. firestore.rules
++# deliberately refuses that here ("Members are deactivated, never deleted —
++# their ledger history must stay resolvable" — see the `members` match
++# block): every transaction, contribution, loan and MGR record references
++# memberId, so a real delete would leave dangling references throughout the
++# chama's financial history. This callable restores the demo's INTENT —
++# "this person is gone for good, stop counting them, stop letting them be
++# re-added to anything" — as a terminal fourth status ('removed'), reachable
++# only from here (the rules' direct-write branch for finance admins now only
++# accepts active/inactive/suspended — see firestore.rules). It's blocked
++# exactly like the demo blocked a removal: while the member has an
++# unsettled loan or still belongs to a not-yet-finished MGR pot, mirroring
++# the mgrCloseForever / exit-settlement dependency-check pattern elsewhere
++# in this codebase.
++# ---------------------------------------------------------------------------
++
++OPEN_LOAN_STATUSES = ("pending_approval", "awaiting_treasurer", "approved", "active", "overdue")
++OPEN_POT_STATUSES = ("draft", "active")
++
++
++@https_fn.on_call(region=REGION)
++def removeMemberPermanently(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    member_id = data.get("memberId")
++    if not chama_id or not member_id:
++        raise bad_request("chamaId and memberId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    member_ref = db.document(paths.member(chama_id, member_id))
++    member_snap = member_ref.get()
++    if not member_snap.exists:
++        raise not_found("Member not found.")
++    member = member_snap.to_dict()
++
++    if member.get("status") == "removed":
++        result = {"ok": True}
++        record_result(db, chama_id, data.get("clientRequestId"), result)
++        return result
++
++    if member.get("role") == "chair":
++        raise denied("The chair can't be removed this way — transfer the chair role first.")
++
++    open_loans = list(
++        db.collection(paths.loans(chama_id))
++        .where("memberId", "==", member_id)
++        .where("status", "in", list(OPEN_LOAN_STATUSES))
++        .stream()
++    )
++    open_pots = list(
++        db.collection(paths.mgr_pots(chama_id))
++        .where("memberIds", "array_contains", member_id)
++        .where("status", "in", list(OPEN_POT_STATUSES))
++        .stream()
++    )
++    if open_loans or open_pots:
++        parts = []
++        if open_loans:
++            parts.append(f"{len(open_loans)} unsettled loan{'s' if len(open_loans) != 1 else ''}")
++        if open_pots:
++            parts.append(f"{len(open_pots)} open merry-go-round pot{'s' if len(open_pots) != 1 else ''}")
++        raise precondition(
++            f"Settle {' and '.join(parts)} before permanently removing this member "
++            "(exit them from any pot and clear their loan first)."
++        )
++
++    ts = now_ms()
++    member_ref.update({"status": "removed", "removedAt": ts, "removedBy": uid, "updatedAt": ts})
++
++    # Same membership-index sync updateMember does for a role/status change —
++    # so a removed member's session immediately reflects they're out, rather
++    # than waiting on the on_member_write trigger.
++    if member.get("uid"):
++        db.document(paths.user_chama_membership(member["uid"], chama_id)).set(
++            {"status": "removed", "updatedAt": ts}, merge=True
++        )
++
++    result = {"ok": True}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
+diff --git a/functions/mychama/mgr.py b/functions/mychama/mgr.py
+index 816da9c..8e52451 100644
+--- a/functions/mychama/mgr.py
++++ b/functions/mychama/mgr.py
+@@ -151,6 +151,14 @@ def createMgrPot(req: https_fn.CallableRequest) -> dict:
+         recipients_per_round = 1
+     recipients_per_round = min(recipients_per_round, len(member_ids) - 1 or 1)
+ 
++    exit_cut_percent = data.get("exitCutPercent", 0)
++    if not isinstance(exit_cut_percent, (int, float)) or not (0 <= exit_cut_percent <= 100):
++        raise bad_request("exitCutPercent must be between 0 and 100.")
++
++    final_round_policy = data.get("finalRoundPolicy", "split")
++    if final_round_policy not in ("split", "carry_over", "close_early"):
++        raise bad_request("finalRoundPolicy must be split, carry_over, or close_early.")
++
+     ts = now_ms()
+     pot_ref = db.collection(paths.mgr_pots(chama_id)).document()
+     pot_ref.set({
+@@ -164,6 +172,8 @@ def createMgrPot(req: https_fn.CallableRequest) -> dict:
+         "drawDone": False,
+         "drawMethod": None,
+         "autoDemoteLate": True,
++        "exitCutPercent": float(exit_cut_percent),
++        "finalRoundPolicy": final_round_policy,
+         "status": "draft",
+         "cycleNumber": 1,
+         "period": 1,
+@@ -801,12 +811,26 @@ def mgrProposeExit(req: https_fn.CallableRequest) -> dict:
+     payouts = _all_payouts(db, chama_id, pot_id)
+     paid_in = sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid")
+     received = sum(p["amount"] for p in payouts if p["memberId"] == member_id)
+-    net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
++    gross_net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
++
++    # Exit cut % (Members/MGR audit: "what's withheld from a removed
++    # member's refund") only ever applies to a refund owed TO the exiting
++    # member — it never increases what a member owes the pot.
++    cut_percent = pot.get("exitCutPercent", 0) or 0
++    net = round(gross_net * (1 - cut_percent / 100) * 100) / 100 if gross_net > 0 else gross_net
+ 
+     ts = now_ms()
+     ref = db.collection(paths.mgr_exits(chama_id, pot_id)).document()
+-    ref.set({"memberId": member_id, "proposedNet": net, "status": "proposed", "createdAt": ts, "updatedAt": ts})
+-    return {"exitId": ref.id, "proposedNet": net}
++    ref.set({
++        "memberId": member_id,
++        "proposedNet": net,
++        "grossNet": gross_net,
++        "exitCutPercent": cut_percent,
++        "status": "proposed",
++        "createdAt": ts,
++        "updatedAt": ts,
++    })
++    return {"exitId": ref.id, "proposedNet": net, "grossNet": gross_net}
+ 
+ 
+ @https_fn.on_call(region=REGION)
+diff --git a/functions/mychama/sms.py b/functions/mychama/sms.py
+index 4cb3b7f..948cd7c 100644
+--- a/functions/mychama/sms.py
++++ b/functions/mychama/sms.py
+@@ -41,16 +41,29 @@ def _recipients(db, chama_id: str, audience: str, member_ids: list[str] | None)
+         docs = [db.document(paths.member(chama_id, mid)).get() for mid in member_ids]
+         return [d.to_dict() | {"id": d.id} for d in docs if d.exists]
+ 
+-    members = list(db.collection(paths.members(chama_id)).where("status", "==", "active").stream())
++    members = [
++        d.to_dict() | {"id": d.id}
++        for d in db.collection(paths.members(chama_id)).where("status", "==", "active").stream()
++    ]
+     if audience == "all":
+-        return [d.to_dict() | {"id": d.id} for d in members]
++        return members
+ 
+     if audience == "overdue":
+         overdue_member_ids = {
+             c.to_dict()["memberId"]
+             for c in db.collection(paths.contributions(chama_id)).where("status", "==", "overdue").stream()
+         }
+-        return [d.to_dict() | {"id": d.id} for d in members if d.id in overdue_member_ids]
++        return [m for m in members if m["id"] in overdue_member_ids]
++
++    if audience == "loan_holders":
++        loan_member_ids = {
++            loan.to_dict()["memberId"]
++            for loan in db.collection(paths.loans(chama_id)).where("status", "in", ["active", "overdue"]).stream()
++        }
++        return [m for m in members if m["id"] in loan_member_ids]
++
++    if audience == "admins":
++        return [m for m in members if m.get("isAdmin")]
+ 
+     return []
+ 
+@@ -63,7 +76,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+     audience = data.get("audience")
+     message = (data.get("message") or "").strip()
+ 
+-    if not chama_id or audience not in ("all", "overdue", "custom") or not message:
++    if not chama_id or audience not in ("all", "overdue", "custom", "loan_holders", "admins") or not message:
+         raise bad_request("chamaId, audience, and message are required.")
+ 
+     db = _db()
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 18e332d..4e0bf34 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -80,12 +80,14 @@ class ChamaMember(TypedDict):
+     idLast4: str
+     nationalIdMasked: NotRequired[str]
+     joinDate: NotRequired[str]
+-    status: Literal["active", "inactive", "suspended"]
++    status: Literal["active", "inactive", "suspended", "removed"]
+     totalContributed: float
+     creditBalance: float
+     avatarColor: NotRequired[str]
+     initial: NotRequired[str]
+     whatsappOptIn: NotRequired[bool]
++    removedAt: NotRequired[int]
++    removedBy: NotRequired[str]
+     createdAt: NotRequired[int]
+     updatedAt: NotRequired[int]
+ 
+diff --git a/src/features/billing/Billing.tsx b/src/features/billing/Billing.tsx
+index e388cea..168c967 100644
+--- a/src/features/billing/Billing.tsx
++++ b/src/features/billing/Billing.tsx
+@@ -31,9 +31,9 @@ export default function Billing() {
+ 
+   return (
+     <div className="space-y-5">
+-      <div>
+-        <h1 className="font-display text-2xl font-semibold text-ink">Plan & billing</h1>
+-        <p className="text-sm text-forest-900/50 mt-0.5">
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">Plan &amp; billing</h1>
++        <p className="text-sm text-white/70 mt-0.5">
+           You're on <b>{PLANS[chama.plan].name}</b>
+           {chama.plan !== 'free' && chama.planExpiry && <> · renews {fmtDate(chama.planExpiry)}</>}.
+         </p>
+diff --git a/src/features/communication/Communication.tsx b/src/features/communication/Communication.tsx
+index 5556fb4..5b85fb8 100644
+--- a/src/features/communication/Communication.tsx
++++ b/src/features/communication/Communication.tsx
+@@ -1,13 +1,22 @@
+-import { useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
++import { collection, deleteDoc, doc, onSnapshot, orderBy, query, serverTimestamp, setDoc, updateDoc, limit as fbLimit } from 'firebase/firestore';
++import { db } from '../../lib/firebase';
++import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers } from '../../app/useMembers';
+ import { sendSmsCampaign, purchaseSmsCredits } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
++import { AUDIENCE_LABEL, PLANS, SMS_SEGMENT_LEN } from '../../lib/constants';
++import { kes } from '../../lib/money';
++import type { SmsLogEntry, SmsSchedule } from '../../lib/types';
++
++type Audience = 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
+ 
+ export default function Communication() {
+-  const { chama, chamaId, chamaReady } = useChama();
++  const { chama, chamaId, chamaReady, isOfficial } = useChama();
+   const { members } = useMembers(chamaId, false);
+-  const [audience, setAudience] = useState<'all' | 'overdue' | 'custom'>('all');
++  const [tab, setTab] = useState<'compose' | 'scheduled'>('compose');
++  const [audience, setAudience] = useState<Audience>('all');
+   const [customIds, setCustomIds] = useState<string[]>([]);
+   const [message, setMessage] = useState('');
+   const [busy, setBusy] = useState(false);
+@@ -16,6 +25,52 @@ export default function Communication() {
+   const [result, setResult] = useState<{ sent: number; creditsUsed: number } | null>(null);
+   const [showTopUp, setShowTopUp] = useState(false);
+ 
++  // Mirrors functions/mychama/sms.py's _recipients() — used only to give the
++  // live cost preview below a realistic recipient count for every audience,
++  // not to decide who actually gets the message (the callable is still the
++  // source of truth for that).
++  const [overdueMemberIds, setOverdueMemberIds] = useState<Set<string>>(new Set());
++  const [loanHolderMemberIds, setLoanHolderMemberIds] = useState<Set<string>>(new Set());
++  const [smsLog, setSmsLog] = useState<SmsLogEntry[]>([]);
++
++  useEffect(() => {
++    if (!chamaId) return;
++    const unsubOverdue = onSnapshot(query(collection(db, paths.contributions(chamaId))), (s) => {
++      const ids = new Set<string>();
++      s.docs.forEach((d) => {
++        if (d.data().status === 'overdue') ids.add(d.data().memberId);
++      });
++      setOverdueMemberIds(ids);
++    });
++    const unsubLoans = onSnapshot(collection(db, paths.loans(chamaId)), (s) => {
++      const ids = new Set<string>();
++      s.docs.forEach((d) => {
++        if (d.data().status === 'active' || d.data().status === 'overdue') ids.add(d.data().memberId);
++      });
++      setLoanHolderMemberIds(ids);
++    });
++    const unsubLog = onSnapshot(query(collection(db, paths.smsLog(chamaId)), orderBy('createdAt', 'desc'), fbLimit(20)), (s) =>
++      setSmsLog(s.docs.map((d) => ({ id: d.id, ...d.data() }) as SmsLogEntry))
++    );
++    return () => {
++      unsubOverdue();
++      unsubLoans();
++      unsubLog();
++    };
++  }, [chamaId]);
++
++  const recipientEstimate = useMemo(() => {
++    const active = members.filter((m) => m.status === 'active');
++    if (audience === 'all') return active.length;
++    if (audience === 'admins') return active.filter((m) => m.isAdmin).length;
++    if (audience === 'overdue') return active.filter((m) => overdueMemberIds.has(m.id)).length;
++    if (audience === 'loan_holders') return active.filter((m) => loanHolderMemberIds.has(m.id)).length;
++    return customIds.length;
++  }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
++
++  const segments = Math.max(1, Math.ceil(message.length / SMS_SEGMENT_LEN));
++  const costEstimate = chama ? segments * recipientEstimate * PLANS[chama.plan].smsRate : 0;
++
+   if (!chamaReady || !chama) return <p className="text-forest-900/60">Loading…</p>;
+ 
+   function toggleCustom(id: string) {
+@@ -50,14 +105,14 @@ export default function Communication() {
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Communication</h1>
+-        <div className="card px-4 py-2 flex items-center gap-3">
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <h1 className="font-display text-2xl font-semibold">Communication</h1>
++        <div className="bg-white/10 rounded-xl px-4 py-2 flex items-center gap-3">
+           <div>
+-            <p className="text-xs text-forest-900/50">SMS credits</p>
++            <p className="text-xs text-white/70">SMS credits</p>
+             <p className="font-display font-semibold">{(chama.smsCredits ?? 0).toLocaleString()}</p>
+           </div>
+-          <button onClick={() => setShowTopUp(true)} className="text-sm font-semibold text-forest-700">
++          <button onClick={() => setShowTopUp(true)} className="text-sm font-semibold text-white underline">
+             Top up
+           </button>
+         </div>
+@@ -65,42 +120,275 @@ export default function Communication() {
+ 
+       {showTopUp && chamaId && <TopUpForm chamaId={chamaId} onDone={() => setShowTopUp(false)} />}
+ 
+-      <div className="card p-5 max-w-lg flex flex-col gap-3">
+-        <h3 className="font-display font-semibold">Send SMS</h3>
+-        <label className="flex flex-col gap-1 text-sm font-medium">
+-          Audience
+-          <select value={audience} onChange={(e) => setAudience(e.target.value as typeof audience)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
+-            <option value="all">All active members</option>
+-            <option value="overdue">Members with overdue contributions</option>
+-            <option value="custom">Choose members</option>
+-          </select>
+-        </label>
+-        {audience === 'custom' && (
+-          <fieldset className="border border-forest-100 rounded-lg p-3 max-h-40 overflow-y-auto">
+-            {members.map((m) => (
+-              <label key={m.id} className="flex items-center gap-2 text-sm py-0.5">
+-                <input type="checkbox" checked={customIds.includes(m.id)} onChange={() => toggleCustom(m.id)} disabled={busy} />
+-                {m.name}
+-              </label>
+-            ))}
+-          </fieldset>
+-        )}
+-        <label className="flex flex-col gap-1 text-sm font-medium">
+-          Message
+-          <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-        </label>
+-        <p className="text-xs text-forest-900/50">{message.length}/400 characters</p>
+-        <button onClick={send} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
+-          {busy ? 'Sending…' : 'Send SMS'}
++      <div className="flex gap-2 border-b border-forest-100">
++        <button
++          onClick={() => setTab('compose')}
++          className={`text-sm font-semibold px-3 py-2 border-b-2 -mb-px ${tab === 'compose' ? 'border-forest-700 text-forest-900' : 'border-transparent text-forest-900/50'}`}
++        >
++          Compose
+         </button>
+-        {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+-        {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
+-        {result && (
+-          <p className="text-sm text-forest-700 font-medium">
+-            Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credits used.
+-          </p>
++        {isOfficial && (
++          <button
++            onClick={() => setTab('scheduled')}
++            className={`text-sm font-semibold px-3 py-2 border-b-2 -mb-px ${tab === 'scheduled' ? 'border-forest-700 text-forest-900' : 'border-transparent text-forest-900/50'}`}
++          >
++            Scheduled &amp; recurring
++          </button>
+         )}
+       </div>
++
++      {tab === 'compose' && (
++        <>
++          <div className="card p-5 max-w-lg flex flex-col gap-3">
++            <h3 className="font-display font-semibold">Send SMS</h3>
++            <label className="flex flex-col gap-1 text-sm font-medium">
++              Audience
++              <select value={audience} onChange={(e) => setAudience(e.target.value as Audience)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
++                <option value="all">All active members</option>
++                <option value="overdue">Members with overdue contributions</option>
++                <option value="loan_holders">Members with active loans</option>
++                <option value="admins">Admins only</option>
++                <option value="custom">Choose members</option>
++              </select>
++            </label>
++            {audience === 'custom' && (
++              <fieldset className="border border-forest-100 rounded-lg p-3 max-h-40 overflow-y-auto">
++                {members.map((m) => (
++                  <label key={m.id} className="flex items-center gap-2 text-sm py-0.5">
++                    <input type="checkbox" checked={customIds.includes(m.id)} onChange={() => toggleCustom(m.id)} disabled={busy} />
++                    {m.name}
++                  </label>
++                ))}
++              </fieldset>
++            )}
++            <label className="flex flex-col gap-1 text-sm font-medium">
++              Message
++              <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++            </label>
++            <p className="text-xs text-forest-900/50">
++              {message.length}/400 characters · {segments} segment{segments === 1 ? '' : 's'} × {recipientEstimate} recipient
++              {recipientEstimate === 1 ? '' : 's'} ≈ {kes(costEstimate)}
++            </p>
++            <button onClick={send} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
++              {busy ? 'Sending…' : 'Send SMS'}
++            </button>
++            {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
++            {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
++            {result && (
++              <p className="text-sm text-forest-700 font-medium">
++                Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credits used.
++              </p>
++            )}
++          </div>
++
++          <div className="card p-5 max-w-lg">
++            <h3 className="font-display font-semibold mb-3">Message history</h3>
++            {smsLog.length === 0 ? (
++              <p className="text-sm text-forest-900/50">No campaigns sent yet.</p>
++            ) : (
++              <ul className="space-y-3">
++                {smsLog.map((m) => (
++                  <li key={m.id} className="border-b border-forest-50 last:border-0 pb-3 last:pb-0">
++                    <p className="text-sm text-ink">{m.message}</p>
++                    <div className="flex items-center justify-between mt-1 flex-wrap gap-1">
++                      <span className="chip bg-forest-50 text-forest-900/50 text-xs">{AUDIENCE_LABEL[m.audience] ?? m.audience}</span>
++                      <span className="text-xs text-forest-900/50">
++                        {m.sentCount}/{m.recipientCount} delivered{m.sentCount < m.recipientCount ? ` · ${m.recipientCount - m.sentCount} failed` : ''}
++                      </span>
++                      <span className="text-xs text-forest-900/40">{new Date(m.createdAt).toLocaleString('en-KE')}</span>
++                    </div>
++                  </li>
++                ))}
++              </ul>
++            )}
++          </div>
++        </>
++      )}
++
++      {tab === 'scheduled' && chamaId && isOfficial && <ScheduledTab chamaId={chamaId} members={members} />}
++    </div>
++  );
++}
++
++const FREQUENCY_LABEL: Record<string, string> = { daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly' };
++
++/**
++ * Communication audit: "Scheduled & recurring messages — the entire tab" was
++ * the single highest-value fix in the audit — functions/mychama/sms.py's
++ * run_sms_schedules cron has been live in production reading
++ * chamas/{chamaId}/smsSchedules the whole time, with no UI to create, edit,
++ * pause, or delete one. firestore.rules already lets any official write
++ * this collection directly (see the smsSchedules match block) — the same
++ * pattern src/features/mgr/MgrPotDetail.tsx's per-pot reminder toggle
++ * already uses — so this is a screen, not a new backend.
++ */
++function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: string; name: string }[] }) {
++  const [schedules, setSchedules] = useState<SmsSchedule[]>([]);
++  const [showForm, setShowForm] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    return onSnapshot(query(collection(db, paths.smsSchedules(chamaId)), orderBy('nextRun', 'asc')), (s) =>
++      setSchedules(s.docs.map((d) => ({ id: d.id, ...d.data() }) as SmsSchedule))
++    );
++  }, [chamaId]);
++
++  async function toggle(sched: SmsSchedule) {
++    setError(null);
++    try {
++      await updateDoc(doc(db, paths.smsSchedules(chamaId), sched.id), { status: sched.status === 'active' ? 'paused' : 'active' });
++    } catch {
++      setError('Could not update that schedule — please try again.');
++    }
++  }
++
++  async function remove(id: string) {
++    if (!confirm('Delete this schedule?')) return;
++    setError(null);
++    try {
++      await deleteDoc(doc(db, paths.smsSchedules(chamaId), id));
++    } catch {
++      setError('Could not delete that schedule — please try again.');
++    }
++  }
++
++  return (
++    <div className="space-y-4 max-w-lg">
++      <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start">
++        + New schedule
++      </button>
++
++      {showForm && (
++        <ScheduleForm
++          chamaId={chamaId}
++          members={members}
++          onDone={() => setShowForm(false)}
++          onError={setError}
++        />
++      )}
++
++      {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
++
++      {schedules.length === 0 ? (
++        <p className="text-sm text-forest-900/50">No recurring or scheduled messages yet.</p>
++      ) : (
++        <ul className="space-y-3">
++          {schedules.map((s) => (
++            <li key={s.id} className="card p-4">
++              <p className="text-sm text-ink">{s.body}</p>
++              <div className="flex items-center justify-between mt-2 flex-wrap gap-2">
++                <span className="chip bg-forest-50 text-forest-900/50 text-xs">
++                  {AUDIENCE_LABEL[s.audience] ?? s.audience} · {FREQUENCY_LABEL[s.frequency] ?? s.frequency}
++                  {s.potId ? ' · linked to a merry-go-round pot' : ''}
++                </span>
++                <span className={`chip text-xs ${s.status === 'active' ? 'bg-forest-50 text-forest-700' : 'bg-forest-900/10 text-forest-900/50'}`}>{s.status}</span>
++              </div>
++              <div className="flex gap-3 mt-2">
++                <button onClick={() => toggle(s)} className="text-xs font-semibold text-forest-700">
++                  {s.status === 'active' ? 'Pause' : 'Resume'}
++                </button>
++                <button onClick={() => remove(s.id)} className="text-xs font-semibold text-brick-500">
++                  Delete
++                </button>
++              </div>
++            </li>
++          ))}
++        </ul>
++      )}
++    </div>
++  );
++}
++
++function ScheduleForm({
++  chamaId,
++  members,
++  onDone,
++  onError,
++}: {
++  chamaId: string;
++  members: { id: string; name: string }[];
++  onDone: () => void;
++  onError: (msg: string | null) => void;
++}) {
++  const [body, setBody] = useState('');
++  const [audience, setAudience] = useState<Audience>('all');
++  const [customIds, setCustomIds] = useState<string[]>([]);
++  const [frequency, setFrequency] = useState<'daily' | 'weekly' | 'monthly'>('monthly');
++  const [busy, setBusy] = useState(false);
++
++  function toggleCustom(id: string) {
++    setCustomIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
++  }
++
++  async function submit() {
++    onError(null);
++    if (!body.trim()) {
++      onError('Write a message first.');
++      return;
++    }
++    setBusy(true);
++    try {
++      await setDoc(doc(collection(db, paths.smsSchedules(chamaId))), {
++        status: 'active',
++        body: body.trim(),
++        audience,
++        memberIds: audience === 'custom' ? customIds : null,
++        frequency,
++        nextRun: Date.now() + 60 * 1000,
++        createdAt: serverTimestamp(),
++      });
++      onDone();
++    } catch {
++      onError('Could not create that schedule — please try again.');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="card p-5 flex flex-col gap-3">
++      <h3 className="font-display font-semibold">New schedule</h3>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Message
++        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++      </label>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Audience
++        <select value={audience} onChange={(e) => setAudience(e.target.value as Audience)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
++          <option value="all">All active members</option>
++          <option value="overdue">Members with overdue contributions</option>
++          <option value="loan_holders">Members with active loans</option>
++          <option value="admins">Admins only</option>
++          <option value="custom">Choose members</option>
++        </select>
++      </label>
++      {audience === 'custom' && (
++        <fieldset className="border border-forest-100 rounded-lg p-3 max-h-32 overflow-y-auto">
++          {members.map((m) => (
++            <label key={m.id} className="flex items-center gap-2 text-sm py-0.5">
++              <input type="checkbox" checked={customIds.includes(m.id)} onChange={() => toggleCustom(m.id)} disabled={busy} />
++              {m.name}
++            </label>
++          ))}
++        </fieldset>
++      )}
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Repeats
++        <select value={frequency} onChange={(e) => setFrequency(e.target.value as typeof frequency)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
++          <option value="daily">Daily</option>
++          <option value="weekly">Weekly</option>
++          <option value="monthly">Monthly</option>
++        </select>
++      </label>
++      <p className="text-xs text-forest-900/50">Starts within about 15 minutes, then repeats on this cadence until paused or deleted.</p>
++      <div className="flex gap-2">
++        <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
++          {busy ? 'Saving…' : 'Create schedule'}
++        </button>
++        <button onClick={onDone} disabled={busy} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">
++          Cancel
++        </button>
++      </div>
+     </div>
+   );
+ }
+diff --git a/src/features/contributions/Contributions.tsx b/src/features/contributions/Contributions.tsx
+index 2190192..143a5c9 100644
+--- a/src/features/contributions/Contributions.tsx
++++ b/src/features/contributions/Contributions.tsx
+@@ -81,8 +81,8 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Contributions</h1>
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <h1 className="font-display text-2xl font-semibold">Contributions</h1>
+         <select value={activePeriod ?? ''} onChange={(e) => setPeriodKey(e.target.value)} className="px-3 py-2 rounded-lg border border-forest-100 text-sm">
+           {periods.map((p) => (
+             <option key={p} value={p}>
+diff --git a/src/features/dashboard/AdminDashboard.tsx b/src/features/dashboard/AdminDashboard.tsx
+index 02b952e..d30d0a9 100644
+--- a/src/features/dashboard/AdminDashboard.tsx
++++ b/src/features/dashboard/AdminDashboard.tsx
+@@ -12,6 +12,14 @@
+  * not thousands) the read cost of this is trivial. If a chama's history
+  * grows very large, the per-KPI counts (not the feed, which should stay a
+  * listener) are the first candidates to switch to `getCountFromServer`.
++ *
++ * Dashboard audit fixes: the goal ring, "needs your attention" feed, group
++ * balance figure, and dynamic MGR banner below were all 🔴 in the feature
++ * audit ("just numbers", "4 generic static links", nothing). The open-
++ * arrears count for the MGR banner is the one figure here that isn't on the
++ * pot doc itself, so it fans out one small onSnapshot per active/completed
++ * pot's arrears subcollection — same "trivial at chama scale" reasoning as
++ * everything else on this page.
+  */
+ 
+ import { useEffect, useMemo, useState } from 'react';
+@@ -34,6 +42,42 @@ const TX_LABEL: Record<string, string> = {
+   mgr_payout: 'MGR payout',
+ };
+ 
++/** Hand-rolled SVG progress ring — no charting library needed for one number. */
++function GoalRing({ percent, label }: { percent: number; label: string }) {
++  const clamped = Math.max(0, Math.min(100, percent));
++  const r = 30;
++  const c = 2 * Math.PI * r;
++  return (
++    <div className="flex items-center gap-3">
++      <svg width="72" height="72" viewBox="0 0 72 72" className="shrink-0">
++        <circle cx="36" cy="36" r={r} fill="none" stroke="rgba(255,255,255,.25)" strokeWidth="8" />
++        <circle
++          cx="36"
++          cy="36"
++          r={r}
++          fill="none"
++          stroke="var(--color-gold-400)"
++          strokeWidth="8"
++          strokeLinecap="round"
++          strokeDasharray={c}
++          strokeDashoffset={c - (clamped / 100) * c}
++          transform="rotate(-90 36 36)"
++        />
++        <text x="36" y="41" textAnchor="middle" fontSize="18" fontWeight="700" fill="#fff">
++          {Math.round(clamped)}%
++        </text>
++      </svg>
++      <p className="text-sm text-white/80">{label}</p>
++    </div>
++  );
++}
++
++const BANNER_TONE: Record<string, string> = {
++  brick: 'bg-brick-50 border-brick-300 ring-brick-200 text-brick-500',
++  gold: 'bg-gold-50 border-gold-300 ring-gold-200 text-gold-700',
++  forest: 'bg-forest-50 border-forest-300 ring-forest-200 text-forest-700',
++};
++
+ export default function AdminDashboard() {
+   const { chama, chamaId, chamaReady, isFinanceAdmin } = useChama();
+   const { members } = useMembers(chamaId, true);
+@@ -42,8 +86,10 @@ export default function AdminDashboard() {
+   const [loans, setLoans] = useState<Loan[]>([]);
+   const [pots, setPots] = useState<MgrPot[]>([]);
+   const [txns, setTxns] = useState<ChamaTransaction[]>([]);
++  const [allTxns, setAllTxns] = useState<ChamaTransaction[]>([]);
+   const [messages, setMessages] = useState<SmsLogEntry[]>([]);
+   const [minutes, setMinutes] = useState<Minute[]>([]);
++  const [openArrearsCount, setOpenArrearsCount] = useState(0);
+ 
+   const currentPeriod = periodKeyOf();
+ 
+@@ -58,6 +104,9 @@ export default function AdminDashboard() {
+       onSnapshot(query(collection(db, paths.transactions(chamaId)), orderBy('createdAt', 'desc'), fbLimit(10)), (s) =>
+         setTxns(s.docs.map((d) => ({ id: d.id, ...d.data() }) as ChamaTransaction))
+       ),
++      // Group balance needs every transaction, not just the recent-10 feed
++      // slice above — trivial at chama scale (see file header note).
++      onSnapshot(collection(db, paths.transactions(chamaId)), (s) => setAllTxns(s.docs.map((d) => ({ id: d.id, ...d.data() }) as ChamaTransaction))),
+       onSnapshot(query(collection(db, paths.smsLog(chamaId)), orderBy('createdAt', 'desc'), fbLimit(5)), (s) =>
+         setMessages(s.docs.map((d) => ({ id: d.id, ...d.data() }) as SmsLogEntry))
+       ),
+@@ -68,6 +117,25 @@ export default function AdminDashboard() {
+     return () => unsubs.forEach((u) => u());
+   }, [chamaId, currentPeriod]);
+ 
++  // One small arrears listener per active/completed pot — see file header.
++  useEffect(() => {
++    if (!chamaId) return;
++    const relevant = pots.filter((p) => p.status === 'active' || p.status === 'completed');
++    if (relevant.length === 0) {
++      setOpenArrearsCount(0);
++      return;
++    }
++    const counts: Record<string, number> = {};
++    const unsubs = relevant.map((p) =>
++      onSnapshot(query(collection(db, paths.mgrArrears(chamaId, p.id)), where('status', '==', 'open')), (s) => {
++        counts[p.id] = s.size;
++        setOpenArrearsCount(Object.values(counts).reduce((a, b) => a + b, 0));
++      })
++    );
++    return () => unsubs.forEach((u) => u());
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [chamaId, pots.map((p) => `${p.id}:${p.status}`).join(',')]);
++
+   const feed = useMemo(() => {
+     const items = [
+       ...txns.map((t) => ({
+@@ -93,18 +161,46 @@ export default function AdminDashboard() {
+   const activeLoans = loans.filter((l) => l.status === 'active' || l.status === 'overdue');
+   const overdueLoans = loans.filter((l) => l.status === 'overdue');
+   const pendingLoans = loans.filter((l) => l.status === 'pending_approval' || l.status === 'awaiting_treasurer');
++  const overdueContributions = contributions.filter((c) => c.status === 'overdue');
+   const activePots = pots.filter((p) => p.status === 'active');
+   const draftPots = pots.filter((p) => p.status === 'draft');
+   const plan = PLANS[chama.plan];
++  const groupBalance = allTxns.reduce((s, t) => s + (t.direction === 'in' ? t.amount : -t.amount), 0);
++  const goalPercent = members.length ? (paidThisPeriod / members.length) * 100 : 0;
++
++  const attentionItems: { key: string; text: string; to: string }[] = [
++    ...pendingLoans.map((l) => ({ key: 'pl-' + l.id, text: `Loan approval needed — ${memberName(members, l.memberId)} · ${kes(l.principal)}`, to: '/app/loans' })),
++    ...overdueLoans.map((l) => ({ key: 'ol-' + l.id, text: `Overdue loan — ${memberName(members, l.memberId)}`, to: '/app/loans' })),
++    ...overdueContributions.map((c) => ({ key: 'oc-' + c.id, text: `Overdue contribution — ${memberName(members, c.memberId)}`, to: '/app/contributions' })),
++  ].slice(0, 8);
++
++  const shortfallTotal = pots.reduce((s, p) => s + (p.pendingShortfall || 0), 0);
++  const shortfallPot = pots.find((p) => (p.pendingShortfall || 0) > 0);
++  const completedPot = pots.find((p) => p.status === 'completed');
++  const soleActivePot = pots.find((p) => p.status === 'active');
++
++  const mgrBanner =
++    shortfallTotal > 0
++      ? { tone: 'brick', text: `${kes(shortfallTotal)} MGR shortfall needs covering${shortfallPot ? ` in ${shortfallPot.name}` : ''}.`, to: shortfallPot ? `/app/mgr/${shortfallPot.id}` : '/app/mgr' }
++      : completedPot
++        ? { tone: 'gold', text: `Payout due in ${completedPot.name}.`, to: `/app/mgr/${completedPot.id}` }
++        : openArrearsCount > 0
++          ? { tone: 'gold', text: `${openArrearsCount} MGR arrear${openArrearsCount === 1 ? '' : 's'} to recover.`, to: '/app/mgr' }
++          : soleActivePot
++            ? { tone: 'forest', text: `${soleActivePot.name} is mid-cycle — period ${soleActivePot.period} of the current round.`, to: `/app/mgr/${soleActivePot.id}` }
++            : null;
+ 
+   return (
+     <div className="space-y-5">
+-      <div>
+-        <h1 className="font-display text-2xl font-semibold text-ink">{chama.name}</h1>
+-        {chama.motto && <p className="text-sm text-forest-900/50 mt-0.5">{chama.motto}</p>}
++      <div className="page-header flex items-center justify-between flex-wrap gap-4">
++        <div>
++          <h1 className="font-display text-2xl font-semibold">{chama.name}</h1>
++          {chama.motto && <p className="text-sm text-white/70 mt-0.5">{chama.motto}</p>}
++        </div>
++        <GoalRing percent={goalPercent} label={`${paidThisPeriod} of ${members.length} paid this period`} />
+       </div>
+ 
+-      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
++      <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-4">
+         <div className="card p-5">
+           <p className="text-xs font-semibold text-forest-900/50">Members</p>
+           <p className="font-display text-2xl font-semibold mt-1">{members.length}</p>
+@@ -117,6 +213,11 @@ export default function AdminDashboard() {
+             {paidThisPeriod} of {members.length} paid · target {kes(expectedThisPeriod)}
+           </p>
+         </div>
++        <div className="card p-5">
++          <p className="text-xs font-semibold text-forest-900/50">Group balance</p>
++          <p className="font-display text-2xl font-semibold mt-1">{kes(groupBalance)}</p>
++          <p className="text-xs text-forest-900/45 mt-1">Net across every recorded transaction</p>
++        </div>
+         <div className="card p-5">
+           <p className="text-xs font-semibold text-forest-900/50">Loans</p>
+           <p className="font-display text-2xl font-semibold mt-1">{activeLoans.length} active</p>
+@@ -144,7 +245,32 @@ export default function AdminDashboard() {
+         </div>
+       )}
+ 
++      {mgrBanner && (
++        <Link to={mgrBanner.to} className={`card p-4 border ring-1 flex items-center justify-between gap-2 ${BANNER_TONE[mgrBanner.tone]}`}>
++          <p className="text-sm font-semibold">{mgrBanner.text}</p>
++          <span className="text-sm font-semibold whitespace-nowrap">View →</span>
++        </Link>
++      )}
++
+       <div className="grid lg:grid-cols-3 gap-4">
++        <div className="card p-5">
++          <h3 className="font-display font-semibold mb-3">Needs your attention</h3>
++          {attentionItems.length ? (
++            <ul className="divide-y divide-forest-50">
++              {attentionItems.map((a) => (
++                <li key={a.key} className="py-2.5">
++                  <Link to={a.to} className="text-sm flex items-center justify-between gap-3 hover:text-forest-700">
++                    <span>{a.text}</span>
++                    <span className="text-xs font-semibold whitespace-nowrap">→</span>
++                  </Link>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="text-sm text-forest-900/50">Nothing pending — you're all caught up.</p>
++          )}
++        </div>
++
+         <div className="lg:col-span-2 card p-5">
+           <h3 className="font-display font-semibold mb-3">Recent activity</h3>
+           {feed.length ? (
+@@ -160,24 +286,6 @@ export default function AdminDashboard() {
+             <p className="text-sm text-forest-900/50">Nothing recorded yet.</p>
+           )}
+         </div>
+-
+-        <div className="card p-5">
+-          <h3 className="font-display font-semibold mb-3">Quick links</h3>
+-          <div className="flex flex-col gap-2">
+-            <Link to="/app/contributions" className="text-sm font-semibold text-forest-700 hover:underline">
+-              Record a contribution →
+-            </Link>
+-            <Link to="/app/loans" className="text-sm font-semibold text-forest-700 hover:underline">
+-              Review loan applications →
+-            </Link>
+-            <Link to="/app/mgr" className="text-sm font-semibold text-forest-700 hover:underline">
+-              Manage merry-go-round →
+-            </Link>
+-            <Link to="/app/reports" className="text-sm font-semibold text-forest-700 hover:underline">
+-              Generate a statement →
+-            </Link>
+-          </div>
+-        </div>
+       </div>
+     </div>
+   );
+diff --git a/src/features/dashboard/MemberDashboard.tsx b/src/features/dashboard/MemberDashboard.tsx
+index ea150b4..f70d83f 100644
+--- a/src/features/dashboard/MemberDashboard.tsx
++++ b/src/features/dashboard/MemberDashboard.tsx
+@@ -58,8 +58,8 @@ export default function MemberDashboard() {
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="card p-6 bg-forest-700 border-forest-700 text-white">
+-        <p className="text-forest-100/70 text-sm">Total contributed to date</p>
++      <div className="page-header">
++        <p className="text-white/70 text-sm">Total contributed to date</p>
+         <p className="font-display text-3xl font-semibold mt-1">{kes(me.totalContributed)}</p>
+         {overdue.length ? (
+           <p className="text-gold-300 text-xs mt-3">{overdue.length} overdue cycle{overdue.length === 1 ? '' : 's'} — settle to stay in good standing.</p>
+diff --git a/src/features/loans/LoanProducts.tsx b/src/features/loans/LoanProducts.tsx
+index 279e86a..09d3d3b 100644
+--- a/src/features/loans/LoanProducts.tsx
++++ b/src/features/loans/LoanProducts.tsx
+@@ -33,15 +33,13 @@ export default function LoanProducts() {
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <div>
+-          <Link to="/app/loans" className="text-sm font-semibold text-forest-700">
+-            &larr; Loans
+-          </Link>
+-          <h1 className="font-display text-2xl font-semibold text-ink mt-1">Loan products</h1>
+-        </div>
++      <Link to="/app/loans" className="text-sm font-semibold text-forest-700">
++        &larr; Loans
++      </Link>
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <h1 className="font-display text-2xl font-semibold">Loan products</h1>
+         {isFinanceAdmin && (
+-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
++          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
+             + New product
+           </button>
+         )}
+diff --git a/src/features/loans/Loans.tsx b/src/features/loans/Loans.tsx
+index da530f2..d8d3174 100644
+--- a/src/features/loans/Loans.tsx
++++ b/src/features/loans/Loans.tsx
+@@ -80,15 +80,15 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Loans</h1>
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <h1 className="font-display text-2xl font-semibold">Loans</h1>
+         <div className="flex gap-2">
+           {isFinanceAdmin && (
+-            <Link to="/app/loan-products" className="border border-forest-200 hover:bg-forest-50 text-sm font-semibold px-4 py-2 rounded-full">
++            <Link to="/app/loan-products" className="btn-ghost text-sm">
+               Loan products
+             </Link>
+           )}
+-          <button onClick={() => setShowApply(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
++          <button onClick={() => setShowApply(true)} className="btn-add text-sm">
+             + Apply for a loan
+           </button>
+         </div>
+@@ -334,9 +334,9 @@ function LoanDetail({
+       <button onClick={onBack} className="text-sm font-semibold text-forest-700">
+         &larr; All loans
+       </button>
+-      <div>
+-        <h1 className="font-display text-2xl font-semibold text-ink">{memberLabel}</h1>
+-        <p className="text-sm text-forest-900/60 mt-1">
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">{memberLabel}</h1>
++        <p className="text-sm text-white/70 mt-1">
+           {product?.name} · {kes(loan.principal)} · {loan.term} months ·{' '}
+           <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loanStatusLabel(loan)}</span>
+         </p>
+diff --git a/src/features/members/Members.tsx b/src/features/members/Members.tsx
+index f2fa53d..9a8ded2 100644
+--- a/src/features/members/Members.tsx
++++ b/src/features/members/Members.tsx
+@@ -1,33 +1,47 @@
+-import { useMemo, useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
++import { collection, limit as fbLimit, onSnapshot, orderBy, query, where } from 'firebase/firestore';
++import { Link } from 'react-router-dom';
++import { db } from '../../lib/firebase';
++import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers } from '../../app/useMembers';
+-import { addAdmin, addMember, updateMember } from '../../lib/callables';
++import { addAdmin, addMember, removeMemberPermanently, updateMember } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
++import { PLANS } from '../../lib/constants';
+ import { kes } from '../../lib/money';
+ import { isValidKenyanPhone } from '../../lib/phone';
+-import type { ChamaMember, MemberRole } from '../../lib/types';
++import { loanStatusLabel } from '../../lib/loanSchedule';
++import type { ChamaMember, Contribution, Loan, MemberRole } from '../../lib/types';
+ 
+ const STATUS_CHIP: Record<string, string> = {
+   active: 'bg-forest-50 text-forest-700',
+   inactive: 'bg-forest-50 text-forest-900/50',
+   suspended: 'bg-brick-50 text-brick-500',
++  removed: 'bg-forest-900/10 text-forest-900/40',
+ };
+ 
+ const ASSIGNABLE_ROLES: Exclude<MemberRole, 'chair'>[] = ['treasurer', 'secretary', 'member'];
+-const STATUSES: ChamaMember['status'][] = ['active', 'inactive', 'suspended'];
++const STATUSES: Exclude<ChamaMember['status'], 'removed'>[] = ['active', 'inactive', 'suspended'];
+ 
+ export default function Members() {
+-  const { chamaId, isFinanceAdmin } = useChama();
++  const { chamaId, chama, isFinanceAdmin } = useChama();
+   const { members, ready } = useMembers(chamaId, false);
+   const [showForm, setShowForm] = useState<null | 'member' | 'admin'>(null);
+   const [query, setQuery] = useState('');
+   const [selected, setSelected] = useState<ChamaMember | null>(null);
+ 
++  // A permanent removal is a soft, terminal status (see removeMemberPermanently
++  // and firestore.rules) — but the person experiences it as the demo's actual
++  // delete did: gone from the list, not just greyed out.
++  const visibleMembers = useMemo(() => members.filter((m) => m.status !== 'removed'), [members]);
++  const removedCount = members.length - visibleMembers.length;
++  const activeCount = useMemo(() => visibleMembers.filter((m) => m.status === 'active').length, [visibleMembers]);
++
+   const filtered = useMemo(() => {
+     const q = query.trim().toLowerCase();
+-    if (!q) return members;
+-    return members.filter((m) => m.name.toLowerCase().includes(q) || m.phone.toLowerCase().includes(q));
+-  }, [members, query]);
++    if (!q) return visibleMembers;
++    return visibleMembers.filter((m) => m.name.toLowerCase().includes(q) || m.phone.toLowerCase().includes(q));
++  }, [visibleMembers, query]);
+ 
+   // Keep the open detail panel in sync with live member updates (e.g. after
+   // an edit/role/status change commits) rather than holding a stale copy.
+@@ -35,23 +49,36 @@ export default function Members() {
+ 
+   if (!ready) return <p className="text-forest-900/60">Loading members…</p>;
+ 
++  const limit = chama ? PLANS[chama.plan].memberLimit : null;
++  const atLimit = limit !== null && activeCount >= limit;
++
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Members ({members.length})</h1>
+-        {isFinanceAdmin && (
+-          <div className="flex gap-2">
+-            <button onClick={() => setShowForm('member')} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+-              + Add member
+-            </button>
+-            <button
+-              onClick={() => setShowForm('admin')}
+-              className="border border-forest-200 hover:bg-forest-50 text-sm font-semibold px-4 py-2 rounded-full"
+-            >
+-              + Add admin
+-            </button>
+-          </div>
+-        )}
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <div>
++          <h1 className="font-display text-2xl font-semibold">Members ({visibleMembers.length})</h1>
++          {chama && (
++            <p className="text-sm text-white/70 mt-1">
++              {activeCount} of {limit === 999 ? 'unlimited' : limit} active on the {PLANS[chama.plan].name} plan
++              {removedCount > 0 && ` · ${removedCount} permanently removed`}
++            </p>
++          )}
++        </div>
++        {isFinanceAdmin &&
++          (atLimit ? (
++            <Link to="/app/billing" className="btn-add text-sm">
++              Upgrade to add more
++            </Link>
++          ) : (
++            <div className="flex gap-2">
++              <button onClick={() => setShowForm('member')} className="btn-add text-sm">
++                + Add member
++              </button>
++              <button onClick={() => setShowForm('admin')} className="btn-ghost text-sm">
++                + Add admin
++              </button>
++            </div>
++          ))}
+       </div>
+ 
+       {showForm && <AddPersonForm kind={showForm} chamaId={chamaId!} onDone={() => setShowForm(null)} />}
+@@ -115,6 +142,11 @@ export default function Members() {
+   );
+ }
+ 
++/** Works best with Safaricom numbers (07xx) — M-Pesa collection and SMS reminders both depend on it. Other networks can still be added, just without those two. */
++function SafaricomHint() {
++  return <span className="text-xs text-forest-900/50 font-normal">Works best with a Safaricom number (07xx) — used for M-Pesa and SMS reminders.</span>;
++}
++
+ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; chamaId: string; onDone: () => void }) {
+   const [name, setName] = useState('');
+   const [phone, setPhone] = useState('');
+@@ -122,10 +154,12 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+   const [role, setRole] = useState<Exclude<MemberRole, 'member'>>('secretary');
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
++  const [limitReached, setLimitReached] = useState(false);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+ 
+   async function submit() {
+     setError(null);
++    setLimitReached(false);
+     if (!name.trim() || !isValidKenyanPhone(phone) || idNumber.trim().length < 4) {
+       setError('Fill in a valid name, phone, and ID number.');
+       return;
+@@ -139,6 +173,11 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+       }
+       onDone();
+     } catch (e) {
++      const code = (e as { code?: string } | null)?.code ?? '';
++      if (code.includes('resource-exhausted')) {
++        setLimitReached(true);
++        return;
++      }
+       const { message, isQueued } = describeCallError(e);
+       if (isQueued) {
+         setQueuedMsg(message);
+@@ -161,6 +200,7 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         Phone number
+         <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="0712345678" disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        <SafaricomHint />
+       </label>
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         National ID number
+@@ -190,6 +230,15 @@ function AddPersonForm({ kind, chamaId, onDone }: { kind: 'member' | 'admin'; ch
+       </div>
+       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+       {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
++      {limitReached && (
++        <p className="text-sm text-brick-500 font-medium">
++          You've reached this plan's member limit.{' '}
++          <Link to="/app/billing" className="underline">
++            Upgrade your plan
++          </Link>{' '}
++          to add more.
++        </p>
++      )}
+     </div>
+   );
+ }
+@@ -210,10 +259,33 @@ function MemberDetailModal({
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
++  const [confirmingRemoval, setConfirmingRemoval] = useState(false);
++  const [contributions, setContributions] = useState<Contribution[]>([]);
++  const [loans, setLoans] = useState<Loan[]>([]);
+ 
+   const isChair = member.role === 'chair';
+ 
+-  async function patch(update: Partial<{ name: string; phone: string; role: MemberRole; status: ChamaMember['status'] }>) {
++  // Members audit: "Member detail: contribution history list" / "loan
++  // history list" — both were on the demo's member detail modal and both
++  // got stripped from the live one. Same indexes Contributions.tsx and
++  // Loans.tsx already rely on (memberId + periodKey / memberId + requestedOn),
++  // so no new firestore.indexes.json entries are needed.
++  useEffect(() => {
++    const unsubContrib = onSnapshot(
++      query(collection(db, paths.contributions(chamaId)), where('memberId', '==', member.id), orderBy('periodKey', 'desc'), fbLimit(5)),
++      (s) => setContributions(s.docs.map((d) => ({ id: d.id, ...d.data() }) as Contribution))
++    );
++    const unsubLoans = onSnapshot(
++      query(collection(db, paths.loans(chamaId)), where('memberId', '==', member.id), orderBy('requestedOn', 'desc')),
++      (s) => setLoans(s.docs.map((d) => ({ id: d.id, ...d.data() }) as Loan))
++    );
++    return () => {
++      unsubContrib();
++      unsubLoans();
++    };
++  }, [chamaId, member.id]);
++
++  async function patch(update: Partial<{ name: string; phone: string; role: MemberRole; status: Exclude<ChamaMember['status'], 'removed'> }>) {
+     setError(null);
+     setBusy(true);
+     try {
+@@ -233,9 +305,24 @@ function MemberDetailModal({
+     }
+   }
+ 
++  async function removePermanently() {
++    setError(null);
++    setBusy(true);
++    try {
++      await removeMemberPermanently({ chamaId, memberId: member.id });
++      onClose();
++    } catch (e) {
++      const { message } = describeCallError(e);
++      setError(message);
++      setConfirmingRemoval(false);
++    } finally {
++      setBusy(false);
++    }
++  }
++
+   return (
+     <div className="fixed inset-0 bg-ink/40 flex items-end sm:items-center justify-center p-4 z-50" onClick={onClose}>
+-      <div className="card p-5 max-w-sm w-full flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
++      <div className="card p-5 max-w-sm w-full flex flex-col gap-4 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+         {mode === 'view' && (
+           <>
+             <div className="flex items-start justify-between gap-3">
+@@ -266,6 +353,40 @@ function MemberDetailModal({
+               <dd>{member.uid ? 'Linked — can log in' : 'Not linked — awaiting first sign-in'}</dd>
+             </dl>
+ 
++            <div className="pt-2 border-t border-forest-100">
++              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mb-2">Recent contributions</p>
++              {contributions.length === 0 ? (
++                <p className="text-xs text-forest-900/40">No contribution history yet.</p>
++              ) : (
++                <ul className="text-sm space-y-1">
++                  {contributions.map((c) => (
++                    <li key={c.id} className="flex items-center justify-between">
++                      <span className="text-forest-900/70">{c.period}</span>
++                      <span className="num">{kes(c.paidAmount)}</span>
++                      <span className={`chip text-xs ${c.status === 'paid' ? 'bg-forest-50 text-forest-700' : 'bg-brick-50 text-brick-500'}`}>{c.status}</span>
++                    </li>
++                  ))}
++                </ul>
++              )}
++            </div>
++
++            <div>
++              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mb-2">Loan history</p>
++              {loans.length === 0 ? (
++                <p className="text-xs text-forest-900/40">No loans yet.</p>
++              ) : (
++                <ul className="text-sm space-y-1">
++                  {loans.map((l) => (
++                    <li key={l.id} className="flex items-center justify-between">
++                      <span className="text-forest-900/70">{l.requestedOn}</span>
++                      <span className="num">{kes(l.principal)}</span>
++                      <span className="chip text-xs bg-forest-50 text-forest-700">{loanStatusLabel(l)}</span>
++                    </li>
++                  ))}
++                </ul>
++              )}
++            </div>
++
+             {canManage && (
+               <div className="flex flex-col gap-2 pt-2 border-t border-forest-100">
+                 <button onClick={() => setMode('edit')} disabled={busy} className="text-sm font-semibold text-forest-700 text-left">
+@@ -290,6 +411,31 @@ function MemberDetailModal({
+                 </div>
+               </div>
+             )}
++
++            {canManage && !isChair && (
++              <div className="pt-2 border-t border-forest-100">
++                {!confirmingRemoval ? (
++                  <button onClick={() => setConfirmingRemoval(true)} disabled={busy} className="text-sm font-semibold text-brick-500 text-left">
++                    Permanently remove this member
++                  </button>
++                ) : (
++                  <div className="flex flex-col gap-2">
++                    <p className="text-xs text-forest-900/60">
++                      This is permanent — {member.name} disappears from every list and can't be re-added under this
++                      record. They must have no unsettled loan and belong to no open merry-go-round pot first.
++                    </p>
++                    <div className="flex gap-2">
++                      <button onClick={removePermanently} disabled={busy} className="text-sm font-semibold px-3 py-1.5 rounded-full bg-brick-500 text-white disabled:opacity-50">
++                        {busy ? 'Removing…' : 'Yes, remove permanently'}
++                      </button>
++                      <button onClick={() => setConfirmingRemoval(false)} disabled={busy} className="text-sm font-semibold text-forest-900/50">
++                        Cancel
++                      </button>
++                    </div>
++                  </div>
++                )}
++              </div>
++            )}
+           </>
+         )}
+ 
+@@ -372,6 +518,7 @@ function EditMemberFields({
+         <span className="text-xs text-forest-900/50 font-normal">
+           Changing this changes which sign-in matches this member — including WhatsApp bot access.
+         </span>
++        <SafaricomHint />
+       </label>
+       {localError && <p className="text-sm text-brick-500 font-medium">{localError}</p>}
+       <div className="flex gap-2">
+diff --git a/src/features/messages/Messages.tsx b/src/features/messages/Messages.tsx
+index 395c20b..3a9cc16 100644
+--- a/src/features/messages/Messages.tsx
++++ b/src/features/messages/Messages.tsx
+@@ -3,14 +3,9 @@ import { collection, onSnapshot, orderBy, query, limit as fbLimit } from 'fireba
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
++import { AUDIENCE_LABEL } from '../../lib/constants';
+ import type { SmsLogEntry } from '../../lib/types';
+ 
+-const AUDIENCE_LABEL: Record<string, string> = {
+-  all: 'To everyone',
+-  overdue: 'To overdue contributors',
+-  custom: 'To selected members',
+-};
+-
+ /**
+  * Every message a campaign addressed to this member — see
+  * functions/mychama/sms.py's recipientIds addition (TOUCH_BASE.md). This
+@@ -33,7 +28,9 @@ export default function Messages() {
+ 
+   return (
+     <div className="space-y-4 max-w-2xl">
+-      <h1 className="font-display text-2xl font-semibold text-ink">Messages</h1>
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">Messages</h1>
++      </div>
+       {messages.length ? (
+         <ul className="space-y-3">
+           {messages.map((m) => (
+diff --git a/src/features/mgr/MgrPotDetail.tsx b/src/features/mgr/MgrPotDetail.tsx
+index 05ed035..37047a4 100644
+--- a/src/features/mgr/MgrPotDetail.tsx
++++ b/src/features/mgr/MgrPotDetail.tsx
+@@ -28,7 +28,7 @@ import { kes } from '../../lib/money';
+ import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
+ import { Spinner } from '../../components/Spinner';
+ import { AdminChargeButton } from '../payments/AdminChargeButton';
+-import type { MgrArrear, MgrPot, MgrRecord } from '../../lib/types';
++import type { MgrArrear, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
+ 
+ const STATUS_COPY: Record<MgrPot['status'], string> = {
+   draft: 'Draft — draw not run yet',
+@@ -44,6 +44,7 @@ export default function MgrPotDetail() {
+   const [pot, setPot] = useState<MgrPot | null>(null);
+   const [records, setRecords] = useState<MgrRecord[]>([]);
+   const [arrears, setArrears] = useState<MgrArrear[]>([]);
++  const [payouts, setPayouts] = useState<MgrPayout[]>([]);
+   const [busyKey, setBusyKey] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+@@ -52,7 +53,7 @@ export default function MgrPotDetail() {
+   // Queue reorder editor — only committed to the server on "Save order".
+   const [queueDraft, setQueueDraft] = useState<string[] | null>(null);
+   const [addPicker, setAddPicker] = useState<string[] | null>(null); // non-null while "Add members" modal is open
+-  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number } | null>(null);
++  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number; grossNet: number } | null>(null);
+   const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
+   const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
+   const [shortfallAmount, setShortfallAmount] = useState<number>(0);
+@@ -73,10 +74,14 @@ export default function MgrPotDetail() {
+     const unsub3 = onSnapshot(collection(db, paths.mgrArrears(chamaId, potId)), (snap) => {
+       setArrears(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrArrear));
+     });
++    const unsub4 = onSnapshot(collection(db, paths.mgrPayouts(chamaId, potId)), (snap) => {
++      setPayouts(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrPayout));
++    });
+     return () => {
+       unsub1();
+       unsub2();
+       unsub3();
++      unsub4();
+     };
+   }, [chamaId, potId]);
+ 
+@@ -166,7 +171,7 @@ export default function MgrPotDetail() {
+ 
+   const proposeExit = (memberId: string) =>
+     run(`propose-${memberId}`, () => mgrProposeExit({ chamaId: cid, potId: pid, memberId }), (r) =>
+-      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet })
++      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet, grossNet: r.grossNet })
+     );
+ 
+   const settleExit = () =>
+@@ -315,19 +320,35 @@ export default function MgrPotDetail() {
+           <p className="text-sm text-forest-900/70 mt-1">
+             {payoutInfo.recipients.map((m) => memberName(members, m)).join(', ')} — {kes(payoutInfo.shareEach)} each
+           </p>
+-          {payoutInfo.poolShortfall > 0 && (
+-            <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
+-              <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
+-              <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
+-            </label>
++          {short && pot.finalRoundPolicy === 'close_early' ? (
++            <div className="mt-3 flex flex-col gap-2">
++              <p className="text-xs text-forest-900/60">This pot is set to close instead of paying out a short final round.</p>
++              <button onClick={closeForever} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start flex items-center gap-2">
++                {busyKey === 'closeForever' && <Spinner />} Close this pot instead
++              </button>
++            </div>
++          ) : (
++            <>
++              {short && pot.finalRoundPolicy === 'carry_over' && (
++                <p className="text-xs text-forest-900/60 mt-2">
++                  This pot is set to carry a short round over rather than force a partial payout — pay out now, or leave this and come back once more contributions land.
++                </p>
++              )}
++              {payoutInfo.poolShortfall > 0 && (
++                <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
++                  <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
++                  <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
++                </label>
++              )}
++              <button
++                onClick={payout}
++                disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
++                className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
++              >
++                {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
++              </button>
++            </>
+           )}
+-          <button
+-            onClick={payout}
+-            disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
+-            className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
+-          >
+-            {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
+-          </button>
+         </div>
+       )}
+ 
+@@ -435,9 +456,21 @@ export default function MgrPotDetail() {
+           </div>
+ 
+           {isFinanceAdmin && (
+-            <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
+-              {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
+-            </button>
++            <div className="flex items-center gap-3 flex-wrap">
++              <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
++                {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
++              </button>
++              <button
++                onClick={() => {
++                  if (!confirm('Re-draw the remaining queue? This reshuffles who\'s left — anyone already paid out stays out.')) return;
++                  draw('smart');
++                }}
++                disabled={!!busyKey}
++                className="text-xs font-semibold text-forest-700 flex items-center gap-1"
++              >
++                {busyKey === 'draw' && <Spinner className="spinner-dark" />} Re-draw remaining queue
++              </button>
++            </div>
+           )}
+         </>
+       )}
+@@ -467,6 +500,44 @@ export default function MgrPotDetail() {
+         </div>
+       )}
+ 
++      {isFinanceAdmin && (records.length > 0 || payouts.length > 0) && (
++        <div className="card p-4">
++          <h3 className="font-display font-semibold text-sm">Books</h3>
++          {(() => {
++            const collected = records.filter((r) => r.status === 'paid').reduce((s, r) => s + r.amount, 0);
++            const paidOut = payouts.reduce((s, p) => s + p.amount, 0);
++            return (
++              <dl className="text-sm grid grid-cols-3 gap-y-1 mt-2">
++                <dt className="text-forest-900/50">Collected</dt>
++                <dd className="num col-span-2">{kes(collected)}</dd>
++                <dt className="text-forest-900/50">Paid out</dt>
++                <dd className="num col-span-2">{kes(paidOut)}</dd>
++                <dt className="text-forest-900/50">Balance</dt>
++                <dd className="num col-span-2 font-semibold">{kes(collected - paidOut)}</dd>
++                <dt className="text-forest-900/50">Entries</dt>
++                <dd className="num col-span-2">{records.length} contributions · {payouts.length} payouts</dd>
++              </dl>
++            );
++          })()}
++          {payouts.length > 0 && (
++            <>
++              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mt-4 mb-1">Payout history</p>
++              <ul className="divide-y divide-forest-50">
++                {[...payouts]
++                  .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
++                  .map((p) => (
++                    <li key={p.id} className="py-2 flex items-center justify-between gap-2 text-sm">
++                      <span>Round {p.round} — {memberName(members, p.memberId)}</span>
++                      <span className="num">{kes(p.amount)}</span>
++                      <span className="text-xs text-forest-900/40 whitespace-nowrap">{p.date}</span>
++                    </li>
++                  ))}
++              </ul>
++            </>
++          )}
++        </div>
++      )}
++
+       {isFinanceAdmin && pot.status !== 'closed' && (
+         <button onClick={closeForever} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500 flex items-center gap-2">
+           {busyKey === 'closeForever' && <Spinner className="spinner-dark" />} Close this pot forever
+@@ -512,6 +583,11 @@ export default function MgrPotDetail() {
+                 ? <>The pot owes them <strong>{kes(exitFor.proposedNet)}</strong> (paid in more than they've received).</>
+                 : <>They owe the pot <strong>{kes(Math.abs(exitFor.proposedNet))}</strong> (received a payout already).</>}
+             </p>
++            {exitFor.grossNet !== exitFor.proposedNet && (
++              <p className="text-xs text-forest-900/50">
++                Before this pot's {pot.exitCutPercent}% exit cut, the refund would have been {kes(exitFor.grossNet)}.
++              </p>
++            )}
+             <div className="flex gap-2 justify-end pt-1">
+               <button onClick={() => setExitFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
+               <button onClick={settleExit} disabled={busyKey === 'settleExit'} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
+diff --git a/src/features/mgr/MgrPots.tsx b/src/features/mgr/MgrPots.tsx
+index e5d9be3..eb261d6 100644
+--- a/src/features/mgr/MgrPots.tsx
++++ b/src/features/mgr/MgrPots.tsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useState } from 'react';
+-import { collection, onSnapshot } from 'firebase/firestore';
++import { collection, doc, onSnapshot, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
+ import { useNavigate } from 'react-router-dom';
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+@@ -8,7 +8,7 @@ import { useMembers } from '../../app/useMembers';
+ import { createMgrPot } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { kes } from '../../lib/money';
+-import { poolEstimate } from '../../lib/mgrEngine';
++import { healthCheck, poolEstimate } from '../../lib/mgrEngine';
+ import type { MgrPot } from '../../lib/types';
+ import MyMgr from './MyMgr';
+ 
+@@ -57,28 +57,39 @@ function AdminMgrPots({ chamaId, isFinanceAdmin }: { chamaId: string | null; isF
+       )}
+ 
+       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+-        {pots.map((p) => (
+-          <div
+-            key={p.id}
+-            className="card p-5 cursor-pointer hover:border-forest-300 border-l-4"
+-            style={{ borderLeftColor: p.status === 'draft' ? 'var(--color-gold-400)' : p.status === 'completed' ? '#B8BDB6' : 'var(--color-forest-700)' }}
+-            onClick={() => navigate(`/app/mgr/${p.id}`)}
+-          >
+-            <h3 className="font-display font-semibold">{p.name}</h3>
+-            <p className="text-sm text-forest-900/60 mt-1">
+-              {kes(p.amount)} · {p.frequency} · {p.memberIds.length} members
+-            </p>
+-            <p className="text-sm text-forest-900/60">
+-              {p.status === 'draft' ? (
+-                <span className="chip bg-gold-50 text-gold-700">Needs a draw</span>
+-              ) : p.status === 'completed' ? (
+-                <span className="chip bg-forest-50 text-forest-900/50">Cycle complete</span>
+-              ) : (
+-                `Pool ~${kes(poolEstimate(p))}`
+-              )}
+-            </p>
+-          </div>
+-        ))}
++        {pots.map((p) => {
++          // List-level health check: only findings derivable from the pot doc
++          // itself (duplicate/orphaned/missing-from-queue, uncovered
++          // shortfall, short round) — the one finding that needs the arrears
++          // subcollection (arrear_for_ex_member) still only shows once you
++          // open the pot, to avoid an extra listener per card.
++          const findings = isFinanceAdmin ? healthCheck(p, []) : [];
++          return (
++            <div
++              key={p.id}
++              className="card p-5 cursor-pointer hover:border-forest-300 border-l-4"
++              style={{ borderLeftColor: p.status === 'draft' ? 'var(--color-gold-400)' : p.status === 'completed' ? '#B8BDB6' : 'var(--color-forest-700)' }}
++              onClick={() => navigate(`/app/mgr/${p.id}`)}
++            >
++              <div className="flex items-start justify-between gap-2">
++                <h3 className="font-display font-semibold">{p.name}</h3>
++                {findings.length > 0 && <span className="chip bg-gold-50 text-gold-700 text-xs shrink-0">Needs attention</span>}
++              </div>
++              <p className="text-sm text-forest-900/60 mt-1">
++                {kes(p.amount)} · {p.frequency} · {p.memberIds.length} members
++              </p>
++              <p className="text-sm text-forest-900/60">
++                {p.status === 'draft' ? (
++                  <span className="chip bg-gold-50 text-gold-700">Needs a draw</span>
++                ) : p.status === 'completed' ? (
++                  <span className="chip bg-forest-50 text-forest-900/50">Cycle complete</span>
++                ) : (
++                  `Pool ~${kes(poolEstimate(p))}`
++                )}
++              </p>
++            </div>
++          );
++        })}
+         {!pots.length && <p className="text-forest-900/50">No merry-go-rounds yet.</p>}
+       </div>
+     </div>
+@@ -91,6 +102,9 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+   const [frequency, setFrequency] = useState<'daily' | 'weekly' | 'monthly'>('daily');
+   const [periodsPerRound, setPeriodsPerRound] = useState('1');
+   const [recipientsPerRound, setRecipientsPerRound] = useState('1');
++  const [exitCutPercent, setExitCutPercent] = useState('0');
++  const [finalRoundPolicy, setFinalRoundPolicy] = useState<'split' | 'carry_over' | 'close_early'>('split');
++  const [sendReminders, setSendReminders] = useState(false);
+   const [selected, setSelected] = useState<string[]>(memberIds);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -101,6 +115,16 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+   }
+ 
++  // Demo audit: "Live preview while creating a pot (pool size, # of payout
++  // rounds, whether the last round will be short)" — this mirrors
++  // mgrEngine.ts's poolEstimate/isShortRound math against the in-progress
++  // form instead of a saved pot, since there's no pot doc yet to run those
++  // against.
++  const recipients = Math.max(1, Number(recipientsPerRound) || 1);
++  const previewPool = Number(amount || 0) * selected.length * Math.max(1, Number(periodsPerRound) || 1);
++  const previewRounds = selected.length ? Math.ceil(selected.length / recipients) : 0;
++  const previewShort = selected.length > 0 && selected.length % recipients !== 0;
++
+   async function submit() {
+     setError(null);
+     if (selected.length < 2) {
+@@ -117,7 +141,26 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+         periodsPerRound: Number(periodsPerRound),
+         recipientsPerRound: Number(recipientsPerRound),
+         memberIds: selected,
++        exitCutPercent: Number(exitCutPercent) || 0,
++        finalRoundPolicy,
+       });
++      if (sendReminders && res.potId) {
++        // Same direct write src/features/mgr/MgrPotDetail.tsx's own
++        // Reminders toggle uses — firestore.rules lets any official write
++        // smsSchedules directly (see that file's match block).
++        const scheduleRef = doc(collection(db, paths.smsSchedules(chamaId)));
++        await setDoc(scheduleRef, {
++          status: 'active',
++          body: `Reminder: your ${name.trim() || 'Merry-go-round'} contribution of ${kes(Number(amount))} is due.`,
++          audience: 'custom',
++          memberIds: selected,
++          frequency,
++          nextRun: Date.now() + 60 * 1000,
++          potId: res.potId,
++          createdAt: serverTimestamp(),
++        });
++        await updateDoc(doc(db, paths.mgrPot(chamaId, res.potId)), { remindersEnabled: true, reminderScheduleId: scheduleRef.id });
++      }
+       onDone(res.potId);
+     } catch (e) {
+       const { message, isQueued } = describeCallError(e);
+@@ -159,6 +202,23 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+         Recipients per payout
+         <input type="number" min={1} value={recipientsPerRound} onChange={(e) => setRecipientsPerRound(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+       </label>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Exit cut %
++        <input type="number" min={0} max={100} value={exitCutPercent} onChange={(e) => setExitCutPercent(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        <span className="text-xs text-forest-900/50 font-normal">Withheld from a departing member's refund if they exit mid-cycle. 0 = none.</span>
++      </label>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        If the last round doesn't fill
++        <select value={finalRoundPolicy} onChange={(e) => setFinalRoundPolicy(e.target.value as typeof finalRoundPolicy)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
++          <option value="split">Split what's collected evenly</option>
++          <option value="carry_over">Let it run an extra period instead of a partial payout</option>
++          <option value="close_early">Close the pot instead of a partial payout</option>
++        </select>
++      </label>
++      <label className="flex items-center gap-2 text-sm font-medium">
++        <input type="checkbox" checked={sendReminders} onChange={(e) => setSendReminders(e.target.checked)} disabled={busy} />
++        Send reminders automatically
++      </label>
+       <fieldset className="border border-forest-100 rounded-lg p-3">
+         <legend className="text-xs font-semibold px-1">Members ({selected.length} selected)</legend>
+         <div className="max-h-40 overflow-y-auto flex flex-col gap-1">
+@@ -170,6 +230,14 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+           ))}
+         </div>
+       </fieldset>
++
++      {selected.length > 0 && (
++        <p className="text-xs bg-forest-50 text-forest-900/70 rounded-lg px-3 py-2">
++          Pool ~{kes(previewPool)} · {previewRounds} payout round{previewRounds === 1 ? '' : 's'}
++          {previewShort && ' · the last round will be short — see the policy above'}
++        </p>
++      )}
++
+       <div className="flex gap-2">
+         <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+           {busy ? 'Creating…' : 'Create'}
+diff --git a/src/features/minutes/Minutes.tsx b/src/features/minutes/Minutes.tsx
+index 376655c..c2c284d 100644
+--- a/src/features/minutes/Minutes.tsx
++++ b/src/features/minutes/Minutes.tsx
+@@ -57,10 +57,10 @@ export default function Minutes() {
+ 
+   return (
+     <div className="space-y-5">
+-      <div className="flex items-center justify-between flex-wrap gap-3">
+-        <h1 className="font-display text-2xl font-semibold text-ink">Minutes</h1>
++      <div className="page-header flex items-center justify-between flex-wrap gap-3">
++        <h1 className="font-display text-2xl font-semibold">Minutes</h1>
+         {canWrite && (
+-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
++          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
+             + Record minutes
+           </button>
+         )}
+diff --git a/src/features/payments/Payments.tsx b/src/features/payments/Payments.tsx
+index 4e64b8f..71ea64f 100644
+--- a/src/features/payments/Payments.tsx
++++ b/src/features/payments/Payments.tsx
+@@ -15,7 +15,9 @@ export default function Payments() {
+ 
+   return (
+     <div className="space-y-5">
+-      <h1 className="font-display text-2xl font-semibold text-ink">Payments & Settlement</h1>
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">Payments &amp; Settlement</h1>
++      </div>
+ 
+       {!canCollectOnline && (
+         <div className="card p-4 border-gold-300 ring-1 ring-gold-200">
+diff --git a/src/features/profile/Profile.tsx b/src/features/profile/Profile.tsx
+index 0cee55c..3eb28cf 100644
+--- a/src/features/profile/Profile.tsx
++++ b/src/features/profile/Profile.tsx
+@@ -41,7 +41,9 @@ export default function Profile() {
+ 
+   return (
+     <div className="space-y-4 max-w-lg">
+-      <h1 className="font-display text-2xl font-semibold text-ink">My profile</h1>
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">My profile</h1>
++      </div>
+ 
+       <div className="card p-6 flex items-center gap-4">
+         <div
+diff --git a/src/features/reports/Reports.tsx b/src/features/reports/Reports.tsx
+index b05f0e9..56969e5 100644
+--- a/src/features/reports/Reports.tsx
++++ b/src/features/reports/Reports.tsx
+@@ -77,7 +77,9 @@ export default function Reports() {
+ 
+   return (
+     <div className="space-y-5">
+-      <h1 className="font-display text-2xl font-semibold text-ink">Reports & exports</h1>
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">Reports &amp; exports</h1>
++      </div>
+ 
+       {!exportsAllowed ? (
+         <div className="card p-5">
+diff --git a/src/features/settings/Settings.tsx b/src/features/settings/Settings.tsx
+index 421ecf4..f3ea8b9 100644
+--- a/src/features/settings/Settings.tsx
++++ b/src/features/settings/Settings.tsx
+@@ -55,7 +55,9 @@ function AdminSettings() {
+ 
+   return (
+     <div className="space-y-5 max-w-2xl">
+-      <h1 className="font-display text-2xl font-semibold text-ink">Settings</h1>
++      <div className="page-header">
++        <h1 className="font-display text-2xl font-semibold">Settings</h1>
++      </div>
+ 
+       <div className="card p-6">
+         <div className="flex items-center justify-between mb-3">
+diff --git a/src/index.css b/src/index.css
+index 9da6173..503e90e 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -113,18 +113,38 @@ input:focus, select:focus, textarea:focus {
+   border-top-color: var(--color-forest-700);
+ }
+ 
+-/* Cosmetic parity with the original demo's coloured MGR dashboard header. */
+-.mgr-header {
++/* Cosmetic parity with the original demo's coloured MGR dashboard header.
++   .page-header is the same treatment generalised for every other top-level
++   screen (Members, Contributions, Loans, Communication, Payments, Minutes,
++   Reports, Billing, Settings, Messages, Profile, both dashboards) so the
++   whole app reads as one design language instead of MGR being the one
++   colourful corner of it. */
++.mgr-header, .page-header {
+   background: linear-gradient(135deg, var(--color-forest-700), var(--color-forest-800));
+   color: #fff;
+   border-radius: 16px;
+   padding: 20px 22px;
+ }
+-.mgr-header .btn-add {
++.mgr-header .btn-add, .page-header .btn-add {
+   background: var(--color-gold-400);
+   color: var(--color-ink);
+   font-weight: 700;
+   border-radius: 999px;
+   padding: 8px 18px;
+ }
+-.mgr-header .btn-add:hover { background: var(--color-gold-500); }
++.mgr-header .btn-add:hover, .page-header .btn-add:hover { background: var(--color-gold-500); }
++
++/* Secondary/bordered actions and links that live inside a dark header need
++   a light-on-dark treatment instead of the app's default dark-on-light one. */
++.page-header .btn-ghost {
++  border: 1px solid rgba(255, 255, 255, .35);
++  color: #fff;
++  font-weight: 600;
++  border-radius: 999px;
++  padding: 8px 18px;
++  background: transparent;
++  white-space: nowrap;
++}
++.page-header .btn-ghost:hover { background: rgba(255, 255, 255, .12); }
++.page-header a.link-quiet { color: #fff; opacity: .85; text-decoration: none; }
++.page-header a.link-quiet:hover { opacity: 1; text-decoration: underline; }
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 978ea64..d1bc35b 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -130,6 +130,11 @@ export const updateMember = callable<
+   { ok: true }
+ >('updateMember', () => 'Update member');
+ 
++export const removeMemberPermanently = callable<{ chamaId: string; memberId: string }, { ok: true }>(
++  'removeMemberPermanently',
++  () => 'Permanently remove member'
++);
++
+ // ---------------------------------------------------------------------------
+ // Phase 2 — Core operations
+ //
+@@ -168,6 +173,8 @@ export const createMgrPot = callable<
+     periodsPerRound: number;
+     recipientsPerRound: number;
+     memberIds: string[];
++    exitCutPercent?: number;
++    finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
+   },
+   { potId: string }
+ >('createMgrPot', (r) => `Create merry-go-round: ${r.name}`);
+@@ -242,7 +249,7 @@ export const mgrCoverShortfall = callable<
+ /** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
+ export const mgrProposeExit = liveCallable<
+   { chamaId: string; potId: string; memberId: string },
+-  { exitId: string; proposedNet: number }
++  { exitId: string; proposedNet: number; grossNet: number }
+ >('mgrProposeExit', 'Working out exit settlement');
+ 
+ export const mgrSettleExit = callable<
+@@ -319,7 +326,7 @@ export const purchaseSmsCredits = liveCallable<{ chamaId: string; amountKes: num
+ );
+ 
+ export const sendSmsCampaign = callable<
+-  { chamaId: string; audience: 'all' | 'overdue' | 'custom'; memberIds?: string[]; message: string },
++  { chamaId: string; audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins'; memberIds?: string[]; message: string },
+   { sent: number; creditsUsed: number }
+ >('sendSmsCampaign', (r) => `Send SMS to ${r.audience}`);
+ 
+diff --git a/src/lib/constants.ts b/src/lib/constants.ts
+index efb876c..93362b1 100644
+--- a/src/lib/constants.ts
++++ b/src/lib/constants.ts
+@@ -169,3 +169,14 @@ export const SECURITY = {
+   MAX_INTENTS_PER_HOUR: 10,
+   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
+ } as const;
++
++/** GSM-7 segment length used for the Communication page's live cost preview — matches HostPinnacle's own segmenting. */
++export const SMS_SEGMENT_LEN = 160;
++
++export const AUDIENCE_LABEL: Record<string, string> = {
++  all: 'To everyone',
++  overdue: 'To overdue contributors',
++  loan_holders: 'To active loan holders',
++  admins: 'To admins only',
++  custom: 'To selected members',
++};
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 10ca2c1..6c234b4 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -52,12 +52,14 @@ export interface ChamaMember {
+   idLast4: string;
+   nationalIdMasked: string;
+   joinDate: string;
+-  status: 'active' | 'inactive' | 'suspended';
++  status: 'active' | 'inactive' | 'suspended' | 'removed';
+   totalContributed: number;
+   creditBalance: number;
+   avatarColor?: string;
+   initial?: string;
+   whatsappOptIn?: boolean;
++  removedAt?: number;
++  removedBy?: string;
+   createdAt?: number;
+   updatedAt?: number;
+ }
+@@ -145,6 +147,10 @@ export interface MgrPot {
+   drawDone: boolean;
+   drawMethod: 'smart' | 'random' | null;
+   autoDemoteLate: boolean;
++  /** % withheld from a departing member's refund on exit (0 = none). Never applied to what a member owes the pot. */
++  exitCutPercent?: number;
++  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. */
++  finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
+   status: 'draft' | 'active' | 'completed' | 'closed';
+   cycleNumber: number;
+   period: number;
+@@ -174,6 +180,8 @@ export interface MgrExit {
+   id: string;
+   memberId: string;
+   proposedNet: number;
++  grossNet?: number;
++  exitCutPercent?: number;
+   status: 'proposed' | 'settled';
+   settledAmount?: number;
+   settledDirection?: 'pot_to_member' | 'member_to_pot';
+@@ -372,7 +380,7 @@ export interface SettlementAccountRequest {
+  * it also doubles as an in-app fallback if the SMS itself failed to land. */
+ export interface SmsLogEntry {
+   id: string;
+-  audience: 'all' | 'overdue' | 'custom';
++  audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
+   message: string;
+   recipientIds: string[];
+   recipientCount: number;
+@@ -382,6 +390,24 @@ export interface SmsLogEntry {
+   createdAt: number;
+ }
+ 
++/** chamas/{chamaId}/smsSchedules/{id} — a client-written doc (see firestore.rules'
++ * smsSchedules match block), dispatched by functions/mychama/sms.py's
++ * run_sms_schedules cron. Field names must match that cron exactly:
++ * `status`/`body`, not `active`/`message`. */
++export interface SmsSchedule {
++  id: string;
++  status: 'active' | 'paused';
++  body: string;
++  audience: 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
++  memberIds?: string[] | null;
++  frequency: 'daily' | 'weekly' | 'monthly';
++  /** Epoch ms — the cron picks up anything with nextRun <= now. */
++  nextRun: number;
++  /** Set only for a reminder schedule created from a specific MGR pot (see MgrPotDetail.tsx). */
++  potId?: string | null;
++  createdAt?: number;
++}
++
+ /** APP-ONLY, Phase 4. chamas/{chamaId}/planBilling/{reference} — a plan
+  * payment, pending until the PAY repo's webhook settles it (mirrors
+  * PaymentIntent/smsTopUps exactly — see functions/mychama/billing.py). */

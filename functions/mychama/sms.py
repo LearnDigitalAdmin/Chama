@@ -26,6 +26,7 @@ from shared.idempotency import already_applied, record_result
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone, normalize_sms_phone
 from shared.roles import require_official
 from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
+import logging
 
 REGION = "africa-south1"
 
@@ -41,18 +42,32 @@ def _recipients(db, chama_id: str, audience: str, member_ids: list[str] | None) 
         docs = [db.document(paths.member(chama_id, mid)).get() for mid in member_ids]
         return [d.to_dict() | {"id": d.id} for d in docs if d.exists]
 
-    members = list(db.collection(paths.members(chama_id)).where("status", "==", "active").stream())
+    members = [
+        d.to_dict() | {"id": d.id}
+        for d in db.collection(paths.members(chama_id)).where("status", "==", "active").stream()
+    ]
     if audience == "all":
-        return [d.to_dict() | {"id": d.id} for d in members]
+        return members
 
     if audience == "overdue":
         overdue_member_ids = {
             c.to_dict()["memberId"]
             for c in db.collection(paths.contributions(chama_id)).where("status", "==", "overdue").stream()
         }
-        return [d.to_dict() | {"id": d.id} for d in members if d.id in overdue_member_ids]
+        return [m for m in members if m["id"] in overdue_member_ids]
+
+    if audience == "loan_holders":
+        loan_member_ids = {
+            loan.to_dict()["memberId"]
+            for loan in db.collection(paths.loans(chama_id)).where("status", "in", ["active", "overdue"]).stream()
+        }
+        return [m for m in members if m["id"] in loan_member_ids]
+
+    if audience == "admins":
+        return [m for m in members if m.get("isAdmin")]
 
     return []
+
 
 
 @https_fn.on_call(region=REGION, secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID])
@@ -63,49 +78,93 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
     audience = data.get("audience")
     message = (data.get("message") or "").strip()
 
-    if not chama_id or audience not in ("all", "overdue", "custom") or not message:
+    logging.info(
+        "sendSmsCampaign: start uid=%s chamaId=%s audience=%s msgLen=%d clientRequestId=%s",
+        uid, chama_id, audience, len(message), data.get("clientRequestId"),
+    )
+
+    if not chama_id or audience not in ("all", "overdue", "custom", "loan_holders", "admins") or not message:
+        logging.warning(
+            "sendSmsCampaign: validation failed chamaId=%s audience=%s msgEmpty=%s",
+            chama_id, audience, not message,
+        )
         raise bad_request("chamaId, audience, and message are required.")
 
     db = _db()
     require_official(db, uid, chama_id)
+    logging.info("sendSmsCampaign: uid=%s confirmed official for chamaId=%s", uid, chama_id)
 
     dedup = already_applied(db, chama_id, data.get("clientRequestId"))
     if dedup is not None:
+        logging.info(
+            "sendSmsCampaign: short-circuiting on dedup clientRequestId=%s result=%s",
+            data.get("clientRequestId"), dedup,
+        )
         return dedup
 
     chama_ref = db.document(paths.chama(chama_id))
     chama_snap = chama_ref.get()
     if not chama_snap.exists:
+        logging.warning("sendSmsCampaign: chama not found chamaId=%s", chama_id)
         raise not_found("Chama not found.")
     chama = chama_snap.to_dict()
     plan = chama.get("plan", "free")
     rate = PLANS.get(plan, PLANS["free"])["smsRate"]
+    logging.info("sendSmsCampaign: chamaId=%s plan=%s rate=%s", chama_id, plan, rate)
 
     recipients = _recipients(db, chama_id, audience, data.get("memberIds"))
+    pre_filter_count = len(recipients)
     recipients = [m for m in recipients if m.get("phoneNormalized") and m.get("whatsappOptIn", True) is not False]
+    logging.info(
+        "sendSmsCampaign: recipients raw=%d after phone/optIn filter=%d",
+        pre_filter_count, len(recipients),
+    )
     if not recipients:
+        logging.warning(
+            "sendSmsCampaign: no eligible recipients after filtering chamaId=%s audience=%s",
+            chama_id, audience,
+        )
         return {"sent": 0, "creditsUsed": 0}
 
     cost = round(len(recipients) * rate * 100) / 100
     credits = chama.get("smsCredits", 0)
+    logging.info(
+        "sendSmsCampaign: cost=%s available credits=%s recipients=%d",
+        cost, credits, len(recipients),
+    )
     if credits < cost:
+        logging.warning(
+            "sendSmsCampaign: insufficient credits chamaId=%s need=%s have=%s",
+            chama_id, cost, credits,
+        )
         raise rate_limited(f"Not enough SMS credits — this send needs {cost}, you have {credits}. Top up first.")
 
     sent = 0
+    failed = 0
     ts = now_ms()
+    logging.info("sendSmsCampaign: entering send loop, %d recipients", len(recipients))
     for member in recipients:
+        phone = member.get("phoneNormalized")
         try:
             send_sms(
                 userid=HP_USERID.value,
                 password=HP_PASSWORD.value,
                 apikey=HP_APIKEY.value,
                 sender_id=HP_SENDER_ID.value,
-                phone_e164=normalize_sms_phone(member["phoneNormalized"]),
+                phone_e164=normalize_sms_phone(phone),
                 message=message,
             )
             sent += 1
-        except Exception:  # noqa: BLE001 — one failed send must not abort the whole campaign
+            logging.info("sendSmsCampaign: sent OK memberId=%s phone=%s", member.get("id"), phone)
+        except Exception as e:  # noqa: BLE001 — one failed send must not abort the whole campaign
+            failed += 1
+            logging.error(
+                "sendSmsCampaign: send FAILED memberId=%s phone=%s error=%s: %s",
+                member.get("id"), phone, type(e).__name__, e,
+            )
             continue
+
+    logging.info("sendSmsCampaign: send loop done sent=%d failed=%d", sent, failed)
 
     actual_cost = round(sent * rate * 100) / 100
     chama_ref.update({"smsCredits": credits - actual_cost, "updatedAt": ts})
@@ -125,6 +184,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
     })
 
     result = {"sent": sent, "creditsUsed": actual_cost}
+    logging.info("sendSmsCampaign: complete result=%s", result)
     record_result(db, chama_id, data.get("clientRequestId"), result)
     return result
 
@@ -191,7 +251,7 @@ def _frequency_ms(frequency: str) -> int:
 
 
 @scheduler_fn.on_schedule(
-    schedule="every 15 minutes",
+    schedule="every 60 minutes",
     region="us-central1",
     timezone=scheduler_fn.Timezone("Africa/Nairobi"),
     secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID],

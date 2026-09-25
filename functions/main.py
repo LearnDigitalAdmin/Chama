@@ -23,6 +23,7 @@ from mychama.identity import (  # noqa: E402,F401
     claimMyInvites,
     completeProfile,
     updateMember,
+    removeMemberPermanently,
 )
 from mychama.triggers import on_member_write  # noqa: E402,F401
 

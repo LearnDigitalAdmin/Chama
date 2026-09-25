@@ -3,13 +3,8 @@ import { collection, onSnapshot, orderBy, query, limit as fbLimit } from 'fireba
 import { db } from '../../lib/firebase';
 import { paths } from '../../lib/firestorePaths';
 import { useChama } from '../../app/ChamaProvider';
+import { AUDIENCE_LABEL } from '../../lib/constants';
 import type { SmsLogEntry } from '../../lib/types';
-
-const AUDIENCE_LABEL: Record<string, string> = {
-  all: 'To everyone',
-  overdue: 'To overdue contributors',
-  custom: 'To selected members',
-};
 
 /**
  * Every message a campaign addressed to this member — see
@@ -33,7 +28,9 @@ export default function Messages() {
 
   return (
     <div className="space-y-4 max-w-2xl">
-      <h1 className="font-display text-2xl font-semibold text-ink">Messages</h1>
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">Messages</h1>
+      </div>
       {messages.length ? (
         <ul className="space-y-3">
           {messages.map((m) => (

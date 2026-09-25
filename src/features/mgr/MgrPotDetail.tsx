@@ -28,7 +28,7 @@ import { kes } from '../../lib/money';
 import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
 import { Spinner } from '../../components/Spinner';
 import { AdminChargeButton } from '../payments/AdminChargeButton';
-import type { MgrArrear, MgrPot, MgrRecord } from '../../lib/types';
+import type { MgrArrear, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
 
 const STATUS_COPY: Record<MgrPot['status'], string> = {
   draft: 'Draft — draw not run yet',
@@ -44,6 +44,7 @@ export default function MgrPotDetail() {
   const [pot, setPot] = useState<MgrPot | null>(null);
   const [records, setRecords] = useState<MgrRecord[]>([]);
   const [arrears, setArrears] = useState<MgrArrear[]>([]);
+  const [payouts, setPayouts] = useState<MgrPayout[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
@@ -52,7 +53,7 @@ export default function MgrPotDetail() {
   // Queue reorder editor — only committed to the server on "Save order".
   const [queueDraft, setQueueDraft] = useState<string[] | null>(null);
   const [addPicker, setAddPicker] = useState<string[] | null>(null); // non-null while "Add members" modal is open
-  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number } | null>(null);
+  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number; grossNet: number } | null>(null);
   const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
   const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
   const [shortfallAmount, setShortfallAmount] = useState<number>(0);
@@ -73,10 +74,14 @@ export default function MgrPotDetail() {
     const unsub3 = onSnapshot(collection(db, paths.mgrArrears(chamaId, potId)), (snap) => {
       setArrears(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrArrear));
     });
+    const unsub4 = onSnapshot(collection(db, paths.mgrPayouts(chamaId, potId)), (snap) => {
+      setPayouts(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrPayout));
+    });
     return () => {
       unsub1();
       unsub2();
       unsub3();
+      unsub4();
     };
   }, [chamaId, potId]);
 
@@ -166,7 +171,7 @@ export default function MgrPotDetail() {
 
   const proposeExit = (memberId: string) =>
     run(`propose-${memberId}`, () => mgrProposeExit({ chamaId: cid, potId: pid, memberId }), (r) =>
-      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet })
+      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet, grossNet: r.grossNet })
     );
 
   const settleExit = () =>
@@ -315,19 +320,35 @@ export default function MgrPotDetail() {
           <p className="text-sm text-forest-900/70 mt-1">
             {payoutInfo.recipients.map((m) => memberName(members, m)).join(', ')} — {kes(payoutInfo.shareEach)} each
           </p>
-          {payoutInfo.poolShortfall > 0 && (
-            <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
-              <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
-              <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
-            </label>
+          {short && pot.finalRoundPolicy === 'close_early' ? (
+            <div className="mt-3 flex flex-col gap-2">
+              <p className="text-xs text-forest-900/60">This pot is set to close instead of paying out a short final round.</p>
+              <button onClick={closeForever} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start flex items-center gap-2">
+                {busyKey === 'closeForever' && <Spinner />} Close this pot instead
+              </button>
+            </div>
+          ) : (
+            <>
+              {short && pot.finalRoundPolicy === 'carry_over' && (
+                <p className="text-xs text-forest-900/60 mt-2">
+                  This pot is set to carry a short round over rather than force a partial payout — pay out now, or leave this and come back once more contributions land.
+                </p>
+              )}
+              {payoutInfo.poolShortfall > 0 && (
+                <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
+                  <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
+                  <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
+                </label>
+              )}
+              <button
+                onClick={payout}
+                disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
+                className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
+              >
+                {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
+              </button>
+            </>
           )}
-          <button
-            onClick={payout}
-            disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
-            className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
-          >
-            {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
-          </button>
         </div>
       )}
 
@@ -435,9 +456,21 @@ export default function MgrPotDetail() {
           </div>
 
           {isFinanceAdmin && (
-            <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
-              {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
-            </button>
+            <div className="flex items-center gap-3 flex-wrap">
+              <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
+                {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
+              </button>
+              <button
+                onClick={() => {
+                  if (!confirm('Re-draw the remaining queue? This reshuffles who\'s left — anyone already paid out stays out.')) return;
+                  draw('smart');
+                }}
+                disabled={!!busyKey}
+                className="text-xs font-semibold text-forest-700 flex items-center gap-1"
+              >
+                {busyKey === 'draw' && <Spinner className="spinner-dark" />} Re-draw remaining queue
+              </button>
+            </div>
           )}
         </>
       )}
@@ -464,6 +497,44 @@ export default function MgrPotDetail() {
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {isFinanceAdmin && (records.length > 0 || payouts.length > 0) && (
+        <div className="card p-4">
+          <h3 className="font-display font-semibold text-sm">Books</h3>
+          {(() => {
+            const collected = records.filter((r) => r.status === 'paid').reduce((s, r) => s + r.amount, 0);
+            const paidOut = payouts.reduce((s, p) => s + p.amount, 0);
+            return (
+              <dl className="text-sm grid grid-cols-3 gap-y-1 mt-2">
+                <dt className="text-forest-900/50">Collected</dt>
+                <dd className="num col-span-2">{kes(collected)}</dd>
+                <dt className="text-forest-900/50">Paid out</dt>
+                <dd className="num col-span-2">{kes(paidOut)}</dd>
+                <dt className="text-forest-900/50">Balance</dt>
+                <dd className="num col-span-2 font-semibold">{kes(collected - paidOut)}</dd>
+                <dt className="text-forest-900/50">Entries</dt>
+                <dd className="num col-span-2">{records.length} contributions · {payouts.length} payouts</dd>
+              </dl>
+            );
+          })()}
+          {payouts.length > 0 && (
+            <>
+              <p className="text-xs font-semibold text-forest-900/50 uppercase tracking-wide mt-4 mb-1">Payout history</p>
+              <ul className="divide-y divide-forest-50">
+                {[...payouts]
+                  .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+                  .map((p) => (
+                    <li key={p.id} className="py-2 flex items-center justify-between gap-2 text-sm">
+                      <span>Round {p.round} — {memberName(members, p.memberId)}</span>
+                      <span className="num">{kes(p.amount)}</span>
+                      <span className="text-xs text-forest-900/40 whitespace-nowrap">{p.date}</span>
+                    </li>
+                  ))}
+              </ul>
+            </>
+          )}
         </div>
       )}
 
@@ -512,6 +583,11 @@ export default function MgrPotDetail() {
                 ? <>The pot owes them <strong>{kes(exitFor.proposedNet)}</strong> (paid in more than they've received).</>
                 : <>They owe the pot <strong>{kes(Math.abs(exitFor.proposedNet))}</strong> (received a payout already).</>}
             </p>
+            {exitFor.grossNet !== exitFor.proposedNet && (
+              <p className="text-xs text-forest-900/50">
+                Before this pot's {pot.exitCutPercent}% exit cut, the refund would have been {kes(exitFor.grossNet)}.
+              </p>
+            )}
             <div className="flex gap-2 justify-end pt-1">
               <button onClick={() => setExitFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
               <button onClick={settleExit} disabled={busyKey === 'settleExit'} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">

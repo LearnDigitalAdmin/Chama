@@ -77,7 +77,9 @@ export default function Reports() {
 
   return (
     <div className="space-y-5">
-      <h1 className="font-display text-2xl font-semibold text-ink">Reports & exports</h1>
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">Reports &amp; exports</h1>
+      </div>
 
       {!exportsAllowed ? (
         <div className="card p-5">

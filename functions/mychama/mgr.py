@@ -151,6 +151,14 @@ def createMgrPot(req: https_fn.CallableRequest) -> dict:
         recipients_per_round = 1
     recipients_per_round = min(recipients_per_round, len(member_ids) - 1 or 1)
 
+    exit_cut_percent = data.get("exitCutPercent", 0)
+    if not isinstance(exit_cut_percent, (int, float)) or not (0 <= exit_cut_percent <= 100):
+        raise bad_request("exitCutPercent must be between 0 and 100.")
+
+    final_round_policy = data.get("finalRoundPolicy", "split")
+    if final_round_policy not in ("split", "carry_over", "close_early"):
+        raise bad_request("finalRoundPolicy must be split, carry_over, or close_early.")
+
     ts = now_ms()
     pot_ref = db.collection(paths.mgr_pots(chama_id)).document()
     pot_ref.set({
@@ -164,6 +172,8 @@ def createMgrPot(req: https_fn.CallableRequest) -> dict:
         "drawDone": False,
         "drawMethod": None,
         "autoDemoteLate": True,
+        "exitCutPercent": float(exit_cut_percent),
+        "finalRoundPolicy": final_round_policy,
         "status": "draft",
         "cycleNumber": 1,
         "period": 1,
@@ -801,12 +811,26 @@ def mgrProposeExit(req: https_fn.CallableRequest) -> dict:
     payouts = _all_payouts(db, chama_id, pot_id)
     paid_in = sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid")
     received = sum(p["amount"] for p in payouts if p["memberId"] == member_id)
-    net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
+    gross_net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
+
+    # Exit cut % (Members/MGR audit: "what's withheld from a removed
+    # member's refund") only ever applies to a refund owed TO the exiting
+    # member — it never increases what a member owes the pot.
+    cut_percent = pot.get("exitCutPercent", 0) or 0
+    net = round(gross_net * (1 - cut_percent / 100) * 100) / 100 if gross_net > 0 else gross_net
 
     ts = now_ms()
     ref = db.collection(paths.mgr_exits(chama_id, pot_id)).document()
-    ref.set({"memberId": member_id, "proposedNet": net, "status": "proposed", "createdAt": ts, "updatedAt": ts})
-    return {"exitId": ref.id, "proposedNet": net}
+    ref.set({
+        "memberId": member_id,
+        "proposedNet": net,
+        "grossNet": gross_net,
+        "exitCutPercent": cut_percent,
+        "status": "proposed",
+        "createdAt": ts,
+        "updatedAt": ts,
+    })
+    return {"exitId": ref.id, "proposedNet": net, "grossNet": gross_net}
 
 
 @https_fn.on_call(region=REGION)

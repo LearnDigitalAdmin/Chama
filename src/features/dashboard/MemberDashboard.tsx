@@ -58,8 +58,8 @@ export default function MemberDashboard() {
 
   return (
     <div className="space-y-5">
-      <div className="card p-6 bg-forest-700 border-forest-700 text-white">
-        <p className="text-forest-100/70 text-sm">Total contributed to date</p>
+      <div className="page-header">
+        <p className="text-white/70 text-sm">Total contributed to date</p>
         <p className="font-display text-3xl font-semibold mt-1">{kes(me.totalContributed)}</p>
         {overdue.length ? (
           <p className="text-gold-300 text-xs mt-3">{overdue.length} overdue cycle{overdue.length === 1 ? '' : 's'} — settle to stay in good standing.</p>

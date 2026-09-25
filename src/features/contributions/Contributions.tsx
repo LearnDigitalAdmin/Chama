@@ -81,8 +81,8 @@ function AdminContributions({ chamaId, isFinanceAdmin }: { chamaId: string | nul
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display text-2xl font-semibold text-ink">Contributions</h1>
+      <div className="page-header flex items-center justify-between flex-wrap gap-3">
+        <h1 className="font-display text-2xl font-semibold">Contributions</h1>
         <select value={activePeriod ?? ''} onChange={(e) => setPeriodKey(e.target.value)} className="px-3 py-2 rounded-lg border border-forest-100 text-sm">
           {periods.map((p) => (
             <option key={p} value={p}>

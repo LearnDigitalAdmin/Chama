@@ -528,3 +528,97 @@ def updateMember(req: https_fn.CallableRequest) -> dict:
         )
 
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# removeMemberPermanently — feature-parity pass with the original demo
+# (Members audit: "Permanent removal (delete from chama)" + "Removal
+# dependency checks").
+#
+# The demo deleted the member document outright. firestore.rules
+# deliberately refuses that here ("Members are deactivated, never deleted —
+# their ledger history must stay resolvable" — see the `members` match
+# block): every transaction, contribution, loan and MGR record references
+# memberId, so a real delete would leave dangling references throughout the
+# chama's financial history. This callable restores the demo's INTENT —
+# "this person is gone for good, stop counting them, stop letting them be
+# re-added to anything" — as a terminal fourth status ('removed'), reachable
+# only from here (the rules' direct-write branch for finance admins now only
+# accepts active/inactive/suspended — see firestore.rules). It's blocked
+# exactly like the demo blocked a removal: while the member has an
+# unsettled loan or still belongs to a not-yet-finished MGR pot, mirroring
+# the mgrCloseForever / exit-settlement dependency-check pattern elsewhere
+# in this codebase.
+# ---------------------------------------------------------------------------
+
+OPEN_LOAN_STATUSES = ("pending_approval", "awaiting_treasurer", "approved", "active", "overdue")
+OPEN_POT_STATUSES = ("draft", "active")
+
+
+@https_fn.on_call(region=REGION)
+def removeMemberPermanently(req: https_fn.CallableRequest) -> dict:
+    uid = require_auth(req)
+    data = req.data or {}
+    chama_id = data.get("chamaId")
+    member_id = data.get("memberId")
+    if not chama_id or not member_id:
+        raise bad_request("chamaId and memberId are required.")
+
+    db = _db()
+    require_finance_admin(db, uid, chama_id)
+
+    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
+    if dedup is not None:
+        return dedup
+
+    member_ref = db.document(paths.member(chama_id, member_id))
+    member_snap = member_ref.get()
+    if not member_snap.exists:
+        raise not_found("Member not found.")
+    member = member_snap.to_dict()
+
+    if member.get("status") == "removed":
+        result = {"ok": True}
+        record_result(db, chama_id, data.get("clientRequestId"), result)
+        return result
+
+    if member.get("role") == "chair":
+        raise denied("The chair can't be removed this way — transfer the chair role first.")
+
+    open_loans = list(
+        db.collection(paths.loans(chama_id))
+        .where("memberId", "==", member_id)
+        .where("status", "in", list(OPEN_LOAN_STATUSES))
+        .stream()
+    )
+    open_pots = list(
+        db.collection(paths.mgr_pots(chama_id))
+        .where("memberIds", "array_contains", member_id)
+        .where("status", "in", list(OPEN_POT_STATUSES))
+        .stream()
+    )
+    if open_loans or open_pots:
+        parts = []
+        if open_loans:
+            parts.append(f"{len(open_loans)} unsettled loan{'s' if len(open_loans) != 1 else ''}")
+        if open_pots:
+            parts.append(f"{len(open_pots)} open merry-go-round pot{'s' if len(open_pots) != 1 else ''}")
+        raise precondition(
+            f"Settle {' and '.join(parts)} before permanently removing this member "
+            "(exit them from any pot and clear their loan first)."
+        )
+
+    ts = now_ms()
+    member_ref.update({"status": "removed", "removedAt": ts, "removedBy": uid, "updatedAt": ts})
+
+    # Same membership-index sync updateMember does for a role/status change —
+    # so a removed member's session immediately reflects they're out, rather
+    # than waiting on the on_member_write trigger.
+    if member.get("uid"):
+        db.document(paths.user_chama_membership(member["uid"], chama_id)).set(
+            {"status": "removed", "updatedAt": ts}, merge=True
+        )
+
+    result = {"ok": True}
+    record_result(db, chama_id, data.get("clientRequestId"), result)
+    return result

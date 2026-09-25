@@ -10,6 +10,7 @@ go through the PAY webhook; the actual sending never does.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import requests
@@ -44,6 +45,24 @@ def send_sms(*, userid: str, password: str, apikey: str, sender_id: str, phone_e
         "output": "json",
         "duplicatecheck": "true",
     }
-    resp = requests.post(SMS_API_URL, json=payload, timeout=20)
+    # HostPinnacle's SMSApi/send expects form-encoded fields, NOT a JSON
+    # body — posting with json= sends Content-Type: application/json,
+    # which HP doesn't parse, and it comes back with a non-JSON body
+    # (blank/HTML/plain-text), producing a bare JSONDecodeError downstream.
+    resp = requests.post(SMS_API_URL, data=payload, timeout=20)
+
+    logging.info(
+        "send_sms: HP responded mobile=%s status=%s body=%r",
+        payload["mobile"], resp.status_code, resp.text[:500],
+    )
+
     resp.raise_for_status()
-    return resp.json()
+
+    try:
+        return resp.json()
+    except ValueError as e:
+        # HP returned 2xx but a body that isn't valid JSON — surface the
+        # actual text instead of a bare "Expecting value" traceback.
+        raise RuntimeError(
+            f"HostPinnacle returned non-JSON response (status {resp.status_code}): {resp.text[:300]!r}"
+        ) from e

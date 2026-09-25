@@ -33,15 +33,13 @@ export default function LoanProducts() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <Link to="/app/loans" className="text-sm font-semibold text-forest-700">
-            &larr; Loans
-          </Link>
-          <h1 className="font-display text-2xl font-semibold text-ink mt-1">Loan products</h1>
-        </div>
+      <Link to="/app/loans" className="text-sm font-semibold text-forest-700">
+        &larr; Loans
+      </Link>
+      <div className="page-header flex items-center justify-between flex-wrap gap-3">
+        <h1 className="font-display text-2xl font-semibold">Loan products</h1>
         {isFinanceAdmin && (
-          <button onClick={() => setShowForm(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+          <button onClick={() => setShowForm(true)} className="btn-add text-sm">
             + New product
           </button>
         )}

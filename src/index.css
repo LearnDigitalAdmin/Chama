@@ -113,18 +113,38 @@ input:focus, select:focus, textarea:focus {
   border-top-color: var(--color-forest-700);
 }
 
-/* Cosmetic parity with the original demo's coloured MGR dashboard header. */
-.mgr-header {
+/* Cosmetic parity with the original demo's coloured MGR dashboard header.
+   .page-header is the same treatment generalised for every other top-level
+   screen (Members, Contributions, Loans, Communication, Payments, Minutes,
+   Reports, Billing, Settings, Messages, Profile, both dashboards) so the
+   whole app reads as one design language instead of MGR being the one
+   colourful corner of it. */
+.mgr-header, .page-header {
   background: linear-gradient(135deg, var(--color-forest-700), var(--color-forest-800));
   color: #fff;
   border-radius: 16px;
   padding: 20px 22px;
 }
-.mgr-header .btn-add {
+.mgr-header .btn-add, .page-header .btn-add {
   background: var(--color-gold-400);
   color: var(--color-ink);
   font-weight: 700;
   border-radius: 999px;
   padding: 8px 18px;
 }
-.mgr-header .btn-add:hover { background: var(--color-gold-500); }
+.mgr-header .btn-add:hover, .page-header .btn-add:hover { background: var(--color-gold-500); }
+
+/* Secondary/bordered actions and links that live inside a dark header need
+   a light-on-dark treatment instead of the app's default dark-on-light one. */
+.page-header .btn-ghost {
+  border: 1px solid rgba(255, 255, 255, .35);
+  color: #fff;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 8px 18px;
+  background: transparent;
+  white-space: nowrap;
+}
+.page-header .btn-ghost:hover { background: rgba(255, 255, 255, .12); }
+.page-header a.link-quiet { color: #fff; opacity: .85; text-decoration: none; }
+.page-header a.link-quiet:hover { opacity: 1; text-decoration: underline; }

@@ -80,15 +80,15 @@ function AdminLoans({ chamaId, membership, isFinanceAdmin }: { chamaId: string |
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display text-2xl font-semibold text-ink">Loans</h1>
+      <div className="page-header flex items-center justify-between flex-wrap gap-3">
+        <h1 className="font-display text-2xl font-semibold">Loans</h1>
         <div className="flex gap-2">
           {isFinanceAdmin && (
-            <Link to="/app/loan-products" className="border border-forest-200 hover:bg-forest-50 text-sm font-semibold px-4 py-2 rounded-full">
+            <Link to="/app/loan-products" className="btn-ghost text-sm">
               Loan products
             </Link>
           )}
-          <button onClick={() => setShowApply(true)} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full">
+          <button onClick={() => setShowApply(true)} className="btn-add text-sm">
             + Apply for a loan
           </button>
         </div>
@@ -334,9 +334,9 @@ function LoanDetail({
       <button onClick={onBack} className="text-sm font-semibold text-forest-700">
         &larr; All loans
       </button>
-      <div>
-        <h1 className="font-display text-2xl font-semibold text-ink">{memberLabel}</h1>
-        <p className="text-sm text-forest-900/60 mt-1">
+      <div className="page-header">
+        <h1 className="font-display text-2xl font-semibold">{memberLabel}</h1>
+        <p className="text-sm text-white/70 mt-1">
           {product?.name} · {kes(loan.principal)} · {loan.term} months ·{' '}
           <span className={`chip ${STATUS_CHIP[loan.status]}`}>{loanStatusLabel(loan)}</span>
         </p>

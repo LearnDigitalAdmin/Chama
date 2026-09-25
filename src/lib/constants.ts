@@ -169,3 +169,14 @@ export const SECURITY = {
   MAX_INTENTS_PER_HOUR: 10,
   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
 } as const;
+
+/** GSM-7 segment length used for the Communication page's live cost preview — matches HostPinnacle's own segmenting. */
+export const SMS_SEGMENT_LEN = 160;
+
+export const AUDIENCE_LABEL: Record<string, string> = {
+  all: 'To everyone',
+  overdue: 'To overdue contributors',
+  loan_holders: 'To active loan holders',
+  admins: 'To admins only',
+  custom: 'To selected members',
+};
