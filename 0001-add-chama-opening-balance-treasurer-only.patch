@@ -1,0 +1,385 @@
+diff --git a/API_CONTRACT.md b/API_CONTRACT.md
+index 99644b0..45b005c 100644
+--- a/API_CONTRACT.md
++++ b/API_CONTRACT.md
+@@ -33,11 +33,17 @@ Creates the `chamas` doc, a `members` doc for the caller with
+ ```ts
+ Request:  { name: string; motto?: string; contributionAmount: number;
+             contributionCycle: 'daily'|'weekly'|'monthly';
++            openingBalance?: number;  // what the chama already had banked; defaults to 0
+             adminName: string; adminPhone: string; adminIdNumber: string }
+ Response: { chamaId: string; memberId: string }
+ Errors:   failed-precondition (email not verified), invalid-argument
+ ```
+ 
++`openingBalance`, once set, may only be changed afterward by the chama's
++`treasurer` — via a direct client update gated in `firestore.rules`, not a
++callable. It seeds the dashboard's Group balance figure alongside the
++transactions ledger (see `AdminDashboard.tsx`).
++
+ ### `addAdmin` / `addMember`
+ Caller: `chair` or `treasurer` of `chamaId` (finance admin).
+ Creates a `members` doc (`uid: null`, `status: "active"`) and an `invites`
+diff --git a/docs/API_CONTRACT (2).md b/docs/API_CONTRACT (2).md
+index 99644b0..45b005c 100644
+--- a/docs/API_CONTRACT (2).md	
++++ b/docs/API_CONTRACT (2).md	
+@@ -33,11 +33,17 @@ Creates the `chamas` doc, a `members` doc for the caller with
+ ```ts
+ Request:  { name: string; motto?: string; contributionAmount: number;
+             contributionCycle: 'daily'|'weekly'|'monthly';
++            openingBalance?: number;  // what the chama already had banked; defaults to 0
+             adminName: string; adminPhone: string; adminIdNumber: string }
+ Response: { chamaId: string; memberId: string }
+ Errors:   failed-precondition (email not verified), invalid-argument
+ ```
+ 
++`openingBalance`, once set, may only be changed afterward by the chama's
++`treasurer` — via a direct client update gated in `firestore.rules`, not a
++callable. It seeds the dashboard's Group balance figure alongside the
++transactions ledger (see `AdminDashboard.tsx`).
++
+ ### `addAdmin` / `addMember`
+ Caller: `chair` or `treasurer` of `chamaId` (finance admin).
+ Creates a `members` doc (`uid: null`, `status: "active"`) and an `invites`
+diff --git a/docs/API_CONTRACT.md b/docs/API_CONTRACT.md
+index 99644b0..45b005c 100644
+--- a/docs/API_CONTRACT.md
++++ b/docs/API_CONTRACT.md
+@@ -33,11 +33,17 @@ Creates the `chamas` doc, a `members` doc for the caller with
+ ```ts
+ Request:  { name: string; motto?: string; contributionAmount: number;
+             contributionCycle: 'daily'|'weekly'|'monthly';
++            openingBalance?: number;  // what the chama already had banked; defaults to 0
+             adminName: string; adminPhone: string; adminIdNumber: string }
+ Response: { chamaId: string; memberId: string }
+ Errors:   failed-precondition (email not verified), invalid-argument
+ ```
+ 
++`openingBalance`, once set, may only be changed afterward by the chama's
++`treasurer` — via a direct client update gated in `firestore.rules`, not a
++callable. It seeds the dashboard's Group balance figure alongside the
++transactions ledger (see `AdminDashboard.tsx`).
++
+ ### `addAdmin` / `addMember`
+ Caller: `chair` or `treasurer` of `chamaId` (finance admin).
+ Creates a `members` doc (`uid: null`, `status: "active"`) and an `invites`
+diff --git a/firestore.rules b/firestore.rules
+index 4150a00..84bfb68 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -113,15 +113,30 @@ service cloud.firestore {
+       // Plan, billing, settlement routing and SMS credits stay server-owned:
+       // letting a client move settlementSplitCode would redirect the
+       // chama's money, and letting it set `plan` directly would grant paid
+-      // features without a completed payment.
+-      allow update: if isFinanceAdmin(chamaId)
+-                    && untouched([
+-                         'plan', 'planExpiry',
+-                         'settlementAccount', 'settlementSplitCode',
+-                         'autoSettle', 'settlementFreq', 'lastSettlement',
+-                         'smsCredits', 'minutesExportsUsedThisMonth',
+-                         'status', 'createdAt'
+-                       ]);
++      // features without a completed payment. openingBalance is carved out
++      // of this branch entirely — it's money, so like every other
++      // financial figure in this schema it's off limits to a chair acting
++      // alone; see the treasurer-only branch below.
++      allow update: if (
++                        isFinanceAdmin(chamaId)
++                        && untouched([
++                             'plan', 'planExpiry',
++                             'settlementAccount', 'settlementSplitCode',
++                             'autoSettle', 'settlementFreq', 'lastSettlement',
++                             'smsCredits', 'minutesExportsUsedThisMonth',
++                             'status', 'createdAt', 'openingBalance'
++                           ])
++                      ) || (
++                        // The treasurer alone corrects the chama's opening
++                        // balance — the one non-ledger figure the
++                        // dashboard's Group balance is seeded from (see
++                        // AdminDashboard.tsx). Nothing else may ride along
++                        // on this write.
++                        isTreasurer(chamaId)
++                        && onlyChanged(['openingBalance', 'updatedAt'])
++                        && isNumber(request.resource.data.openingBalance)
++                        && request.resource.data.openingBalance >= 0
++                      );
+ 
+       allow delete: if false;
+ 
+diff --git a/firestoreData.json b/firestoreData.json
+index 9471853..990d04a 100644
+--- a/firestoreData.json
++++ b/firestoreData.json
+@@ -60,6 +60,7 @@
+         "autoRenew": { "type": "boolean" },
+         "contributionAmount": { "type": "number", "required": true, "note": "Default per-cycle contribution used when generating contribution documents." },
+         "contributionCycle": { "type": "string", "enum": ["daily", "weekly", "monthly"], "required": true },
++        "openingBalance": { "type": "number", "default": 0, "note": "What the chama already had banked before joining the app. Set once at createChama; afterwards only the treasurer may change it (see firestore.rules)." },
+         "smsCredits": { "type": "number" },
+         "settlementAccount": { "type": "string", "note": "Display label only, e.g. 'M-Pesa Paybill •••521'. Never the raw account." },
+         "settlementSplitCode": { "type": "string", "note": "Paystack split code. The bot refuses to raise a payment intent without it." },
+@@ -80,6 +81,7 @@
+         "autoRenew": true,
+         "contributionAmount": 1000,
+         "contributionCycle": "monthly",
++        "openingBalance": 15000,
+         "smsCredits": 842,
+         "settlementAccount": "M-Pesa Paybill •••521",
+         "settlementSplitCode": "SPL_K3F9QW2",
+@@ -534,6 +536,7 @@
+       "plan": "growth",
+       "contributionAmount": 1000,
+       "contributionCycle": "monthly",
++      "openingBalance": 5000,
+       "settlementSplitCode": "SPL_TESTSPLIT",
+       "settlementAccount": "M-Pesa Paybill •••521",
+       "autoSettle": true,
+diff --git a/functions/mychama/identity.py b/functions/mychama/identity.py
+index 3a8a11a..51d2040 100644
+--- a/functions/mychama/identity.py
++++ b/functions/mychama/identity.py
+@@ -93,6 +93,12 @@ def createChama(req: https_fn.CallableRequest) -> dict:
+     admin_name = (data.get("adminName") or "").strip()
+     admin_phone = data.get("adminPhone") or ""
+     admin_id_number = data.get("adminIdNumber") or ""
++    # Opening balance: what the chama already had banked before joining the
++    # app. Optional (defaults to 0) so the dashboard's Group balance isn't
++    # misleadingly zero for a group that's been running for years. Only
++    # settable here because there's no treasurer yet to gate it — every
++    # later change goes through the treasurer-only path in firestore.rules.
++    opening_balance = data.get("openingBalance", 0)
+ 
+     if not name:
+         raise bad_request("Chama name is required.")
+@@ -100,6 +106,8 @@ def createChama(req: https_fn.CallableRequest) -> dict:
+         raise bad_request("contributionCycle must be daily, weekly, or monthly.")
+     if not isinstance(contribution_amount, (int, float)) or contribution_amount <= 0:
+         raise bad_request("contributionAmount must be a positive number.")
++    if not isinstance(opening_balance, (int, float)) or opening_balance < 0:
++        raise bad_request("openingBalance must be zero or a positive number.")
+ 
+     db = _db()
+     chama_ref = db.collection(paths.MC.CHAMAS).document()
+@@ -125,6 +133,7 @@ def createChama(req: https_fn.CallableRequest) -> dict:
+             "plan": "free",
+             "contributionAmount": float(contribution_amount),
+             "contributionCycle": contribution_cycle,
++            "openingBalance": float(opening_balance),
+             "smsCredits": 0,
+             "settlementAccount": None,
+             "settlementSplitCode": None,
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 4e0bf34..3b202eb 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -53,6 +53,11 @@ class Chama(TypedDict):
+     autoRenew: NotRequired[bool]
+     contributionAmount: float
+     contributionCycle: Frequency
++    # What the chama already had banked before joining the app. Set once at
++    # createChama (defaults to 0); afterwards only the treasurer may change
++    # it (see firestore.rules) — everything else the Group balance figure
++    # reflects comes from the transactions ledger, not from client writes.
++    openingBalance: NotRequired[float]
+     smsCredits: NotRequired[float]
+     settlementAccount: NotRequired[str]
+     settlementSplitCode: NotRequired[str]
+diff --git a/src/app/ChamaProvider.tsx b/src/app/ChamaProvider.tsx
+index e82f056..f8fcd41 100644
+--- a/src/app/ChamaProvider.tsx
++++ b/src/app/ChamaProvider.tsx
+@@ -24,6 +24,7 @@ interface ChamaContextValue {
+   setChamaId: (id: string) => void;
+   isFinanceAdmin: boolean;
+   isOfficial: boolean;
++  isTreasurer: boolean;
+ }
+ 
+ const ChamaContext = createContext<ChamaContextValue>({
+@@ -35,6 +36,7 @@ const ChamaContext = createContext<ChamaContextValue>({
+   setChamaId: () => {},
+   isFinanceAdmin: false,
+   isOfficial: false,
++  isTreasurer: false,
+ });
+ 
+ export function ChamaProvider({ children }: { children: ReactNode }) {
+@@ -79,6 +81,7 @@ export function ChamaProvider({ children }: { children: ReactNode }) {
+       setChamaId: setSelected,
+       isFinanceAdmin: membership?.role === 'chair' || membership?.role === 'treasurer',
+       isOfficial: membership?.role === 'chair' || membership?.role === 'treasurer' || membership?.role === 'secretary',
++      isTreasurer: membership?.role === 'treasurer',
+     }),
+     [selected, membership, chama, chamaReady, memberships]
+   );
+diff --git a/src/features/dashboard/AdminDashboard.tsx b/src/features/dashboard/AdminDashboard.tsx
+index d30d0a9..60005e5 100644
+--- a/src/features/dashboard/AdminDashboard.tsx
++++ b/src/features/dashboard/AdminDashboard.tsx
+@@ -165,7 +165,11 @@ export default function AdminDashboard() {
+   const activePots = pots.filter((p) => p.status === 'active');
+   const draftPots = pots.filter((p) => p.status === 'draft');
+   const plan = PLANS[chama.plan];
+-  const groupBalance = allTxns.reduce((s, t) => s + (t.direction === 'in' ? t.amount : -t.amount), 0);
++  // Seeded from the chama's opening balance (what it had banked before
++  // joining the app — set at creation, correctable only by the treasurer in
++  // Settings) plus everything the ledger has recorded since.
++  const groupBalance =
++    (chama.openingBalance ?? 0) + allTxns.reduce((s, t) => s + (t.direction === 'in' ? t.amount : -t.amount), 0);
+   const goalPercent = members.length ? (paidThisPeriod / members.length) * 100 : 0;
+ 
+   const attentionItems: { key: string; text: string; to: string }[] = [
+diff --git a/src/features/settings/Settings.tsx b/src/features/settings/Settings.tsx
+index f3ea8b9..6f5c6cc 100644
+--- a/src/features/settings/Settings.tsx
++++ b/src/features/settings/Settings.tsx
+@@ -14,12 +14,13 @@ export default function Settings() {
+ }
+ 
+ function AdminSettings() {
+-  const { chama, chamaId, chamaReady, isFinanceAdmin } = useChama();
++  const { chama, chamaId, chamaReady, isFinanceAdmin, isTreasurer } = useChama();
+   const { members } = useMembers(chamaId, true);
+   const admins = members.filter((m) => m.isAdmin);
+   const [name, setName] = useState('');
+   const [motto, setMotto] = useState('');
+   const [contributionAmount, setContributionAmount] = useState('');
++  const [openingBalance, setOpeningBalance] = useState('');
+   const [editing, setEditing] = useState(false);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -30,6 +31,7 @@ function AdminSettings() {
+     setName(chama!.name);
+     setMotto(chama!.motto ?? '');
+     setContributionAmount(String(chama!.contributionAmount));
++    setOpeningBalance(String(chama!.openingBalance ?? 0));
+     setEditing(true);
+   }
+ 
+@@ -37,12 +39,25 @@ function AdminSettings() {
+     setBusy(true);
+     setError(null);
+     try {
++      // Two writes, not one: firestore.rules gates the balance separately
++      // from the rest of the chama profile (treasurer-only vs. any finance
++      // admin), so a single combined update would be rejected whenever a
++      // non-treasurer chair edits the profile alongside it.
+       await updateDoc(doc(db, paths.chama(chamaId!)), {
+         name: name.trim(),
+         motto: motto.trim() || null,
+         contributionAmount: Number(contributionAmount),
+         updatedAt: Date.now(),
+       });
++      if (isTreasurer) {
++        const newBalance = Number(openingBalance);
++        if (newBalance !== (chama!.openingBalance ?? 0)) {
++          await updateDoc(doc(db, paths.chama(chamaId!)), {
++            openingBalance: newBalance,
++            updatedAt: Date.now(),
++          });
++        }
++      }
+       setEditing(false);
+     } catch {
+       setError("Couldn't save — please try again.");
+@@ -82,6 +97,15 @@ function AdminSettings() {
+               Contribution amount (KES / {chama.contributionCycle})
+               <input type="number" value={contributionAmount} onChange={(e) => setContributionAmount(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+             </label>
++            {isTreasurer ? (
++              <label className="flex flex-col gap-1 text-sm font-medium">
++                Opening balance (KES)
++                <input type="number" min={0} value={openingBalance} onChange={(e) => setOpeningBalance(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++                <span className="text-xs font-normal text-forest-900/50">Only the treasurer can update this. Feeds directly into the Group balance on the dashboard.</span>
++              </label>
++            ) : (
++              <p className="text-xs text-forest-900/50">Opening balance (KES {chama.openingBalance?.toLocaleString('en-KE') ?? 0}) can only be updated by the treasurer.</p>
++            )}
+             <div className="flex gap-2">
+               <button onClick={save} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+                 {busy ? 'Saving…' : 'Save'}
+@@ -105,6 +129,9 @@ function AdminSettings() {
+             <p>
+               <span className="text-forest-900/50">Contribution:</span> KES {chama.contributionAmount.toLocaleString('en-KE')} / {chama.contributionCycle}
+             </p>
++            <p>
++              <span className="text-forest-900/50">Opening balance:</span> KES {(chama.openingBalance ?? 0).toLocaleString('en-KE')}
++            </p>
+             <p>
+               <span className="text-forest-900/50">Plan:</span> {PLANS[chama.plan].name}
+             </p>
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index d1bc35b..ab3abc8 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -80,6 +80,8 @@ export const createChama = liveCallable<
+     motto?: string;
+     contributionAmount: number;
+     contributionCycle: 'daily' | 'weekly' | 'monthly';
++    /** What the chama already had banked before joining the app. Defaults to 0 server-side. */
++    openingBalance?: number;
+     adminName: string;
+     adminPhone: string;
+     adminIdNumber: string;
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 6c234b4..8f50d09 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -24,6 +24,10 @@ export interface Chama {
+   autoRenew?: boolean;
+   contributionAmount: number;
+   contributionCycle: 'daily' | 'weekly' | 'monthly';
++  /** What the chama already had banked before joining the app. Set at creation
++   *  (defaults to 0); afterwards only the treasurer may change it — see
++   *  firestore.rules and AdminDashboard's Group balance calculation. */
++  openingBalance?: number;
+   smsCredits?: number;
+   settlementAccount?: string;
+   settlementSplitCode?: string;
+diff --git a/src/onboarding/CreateChama.tsx b/src/onboarding/CreateChama.tsx
+index 75ff12f..348538a 100644
+--- a/src/onboarding/CreateChama.tsx
++++ b/src/onboarding/CreateChama.tsx
+@@ -17,6 +17,7 @@ export default function CreateChama() {
+   const [motto, setMotto] = useState('');
+   const [contributionAmount, setContributionAmount] = useState('');
+   const [contributionCycle, setContributionCycle] = useState<'daily' | 'weekly' | 'monthly'>('monthly');
++  const [openingBalance, setOpeningBalance] = useState('');
+   const [adminName, setAdminName] = useState(user?.displayName ?? '');
+   const [adminPhone, setAdminPhone] = useState('');
+   const [adminIdNumber, setAdminIdNumber] = useState('');
+@@ -25,9 +26,11 @@ export default function CreateChama() {
+   const navigate = useNavigate();
+ 
+   const amount = Number(contributionAmount);
++  const openingBalanceAmount = openingBalance.trim() === '' ? 0 : Number(openingBalance);
+   const canSubmit =
+     name.trim().length > 1 &&
+     amount > 0 &&
++    openingBalanceAmount >= 0 &&
+     adminName.trim().length > 1 &&
+     isValidKenyanPhone(adminPhone) &&
+     adminIdNumber.trim().length >= 4;
+@@ -42,6 +45,7 @@ export default function CreateChama() {
+         motto: motto.trim() || undefined,
+         contributionAmount: amount,
+         contributionCycle,
++        openingBalance: openingBalanceAmount,
+         adminName: adminName.trim(),
+         adminPhone,
+         adminIdNumber,
+@@ -77,6 +81,12 @@ export default function CreateChama() {
+           <option value="monthly">Monthly</option>
+         </select>
+       </FormField>
++      <FormField label="Opening balance (KES, optional)">
++        <input type="number" min={0} placeholder="0" value={openingBalance} onChange={(e) => setOpeningBalance(e.target.value)} disabled={busy} className={inputClass} />
++      </FormField>
++      <p className="text-xs text-forest-900/50 -mt-2">
++        Already have money set aside for this chama? Enter it here so your balance is accurate from day one. You can only update this later as treasurer.
++      </p>
+ 
+       <hr className="border-forest-100" />
+       <p className="text-sm font-semibold text-ink">Your details, as chair</p>

@@ -17,10 +17,12 @@ import {
   mgrSettleArrear,
   mgrWriteOffArrear,
   mgrCoverShortfall,
-  mgrProposeExit,
-  mgrSettleExit,
+  mgrExitMember,
+  mgrSettleExitRefund,
+  mgrSettleExitClawback,
   mgrRepairPot,
   mgrCloseForever,
+  mgrStartNewCycle,
   generateStatement,
 } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
@@ -28,13 +30,19 @@ import { kes } from '../../lib/money';
 import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
 import { Spinner } from '../../components/Spinner';
 import { AdminChargeButton } from '../payments/AdminChargeButton';
-import type { MgrArrear, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
+import type { MgrArrear, MgrExit, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
 
 const STATUS_COPY: Record<MgrPot['status'], string> = {
   draft: 'Draft — draw not run yet',
   active: 'Active',
-  completed: 'Round complete',
+  completed: 'Cycle complete',
   closed: 'Closed',
+};
+
+const FINAL_POLICY_COPY: Record<'split' | 'carry_over' | 'close_early', string> = {
+  split: "This pot splits whatever's collected evenly across who's left.",
+  carry_over: 'This pot pays everyone their full share, then starts a new cycle automatically.',
+  close_early: 'This pot pays everyone their full share, then rests once this cycle is done.',
 };
 
 export default function MgrPotDetail() {
@@ -45,15 +53,24 @@ export default function MgrPotDetail() {
   const [records, setRecords] = useState<MgrRecord[]>([]);
   const [arrears, setArrears] = useState<MgrArrear[]>([]);
   const [payouts, setPayouts] = useState<MgrPayout[]>([]);
+  const [exits, setExits] = useState<MgrExit[]>([]);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
   const [payoutInfo, setPayoutInfo] = useState<{ recipients: string[]; shareEach: number; poolShortfall: number } | null>(null);
 
   // Queue reorder editor — only committed to the server on "Save order".
   const [queueDraft, setQueueDraft] = useState<string[] | null>(null);
   const [addPicker, setAddPicker] = useState<string[] | null>(null); // non-null while "Add members" modal is open
-  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number; grossNet: number } | null>(null);
+  // Confirm-before-removing modal — mirrors the demo's openMgrRemoveMember:
+  // shows what this member has contributed/received (computed client-side
+  // from records/payouts we already have) and lets the cut % be overridden
+  // for this one removal, before mgrExitMember actually takes them out.
+  const [exitConfirmFor, setExitConfirmFor] = useState<{ memberId: string; contributed: number; received: number } | null>(null);
+  const [exitCutInput, setExitCutInput] = useState<number>(0);
+  const [settleRefundId, setSettleRefundId] = useState<string | null>(null);
+  const [settleClawbackId, setSettleClawbackId] = useState<string | null>(null);
   const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
   const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
   const [shortfallAmount, setShortfallAmount] = useState<number>(0);
@@ -77,16 +94,21 @@ export default function MgrPotDetail() {
     const unsub4 = onSnapshot(collection(db, paths.mgrPayouts(chamaId, potId)), (snap) => {
       setPayouts(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrPayout));
     });
+    const unsub5 = onSnapshot(collection(db, paths.mgrExits(chamaId, potId)), (snap) => {
+      setExits(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrExit));
+    });
     return () => {
       unsub1();
       unsub2();
       unsub3();
       unsub4();
+      unsub5();
     };
   }, [chamaId, potId]);
 
   const findings = useMemo(() => (pot ? healthCheck(pot, arrears) : []), [pot, arrears]);
   const openArrears = arrears.filter((a) => a.status === 'open');
+  const openExits = exits.filter((x) => x.status === 'open');
 
   if (!pot || !chamaId || !potId) return <p className="text-forest-900/60">Loading…</p>;
 
@@ -125,9 +147,10 @@ export default function MgrPotDetail() {
     });
 
   const payout = () =>
-    run('payout', () => recordMgrPayoutCash({ chamaId: cid, potId: pid, acknowledgeShortfall }), () => {
+    run('payout', () => recordMgrPayoutCash({ chamaId: cid, potId: pid, acknowledgeShortfall }), (res) => {
       setPayoutInfo(null);
       setAcknowledgeShortfall(false);
+      if (res.cycleStarted) setInfoMsg(`Everyone's been paid — cycle ${res.cycleStarted} started automatically. Run the draw to set the new order.`);
     });
 
   const coverShortfall = () =>
@@ -169,20 +192,47 @@ export default function MgrPotDetail() {
     setQueueDraft(q);
   };
 
-  const proposeExit = (memberId: string) =>
-    run(`propose-${memberId}`, () => mgrProposeExit({ chamaId: cid, potId: pid, memberId }), (r) =>
-      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet, grossNet: r.grossNet })
+  // Client-side projection of what a member has contributed/received this
+  // cycle — same read-only "trusted preview" pattern as lateScore/
+  // recentReliability above; mgrExitMember re-derives the real numbers
+  // server-side rather than trusting this. Lets the confirm dialog show
+  // real figures without a round trip, mirroring the demo's
+  // openMgrRemoveMember.
+  function memberExitPreview(memberId: string) {
+    const contributed = records.filter((r) => r.memberId === memberId && r.status === 'paid').reduce((s, r) => s + r.amount, 0);
+    const received = payouts.filter((p) => p.memberId === memberId).reduce((s, p) => s + p.amount, 0);
+    return { contributed: Math.round(contributed * 100) / 100, received: Math.round(received * 100) / 100 };
+  }
+
+  const openExitConfirm = (memberId: string) => {
+    setExitCutInput(pot.exitCutPercent ?? 0);
+    setExitConfirmFor({ memberId, ...memberExitPreview(memberId) });
+  };
+
+  const confirmExit = () =>
+    exitConfirmFor &&
+    run(
+      `exit-${exitConfirmFor.memberId}`,
+      () => mgrExitMember({ chamaId: cid, potId: pid, memberId: exitConfirmFor.memberId, cutPercent: exitCutInput }),
+      () => setExitConfirmFor(null)
     );
 
-  const settleExit = () =>
-    exitFor &&
-    run('settleExit', () => mgrSettleExit({ chamaId: cid, potId: pid, exitId: exitFor.exitId }), () => setExitFor(null));
+  const settleRefund = (exitId: string, amount: number) =>
+    run(`settleRefund-${exitId}`, () => mgrSettleExitRefund({ chamaId: cid, potId: pid, exitId, amount }), () => setSettleRefundId(null));
+
+  const settleClawback = (exitId: string, amount: number) =>
+    run(`settleClawback-${exitId}`, () => mgrSettleExitClawback({ chamaId: cid, potId: pid, exitId, amount }), () => setSettleClawbackId(null));
 
   const settleArrear = (arrearId: string, amount?: number) =>
     run(`settleArrear-${arrearId}`, () => mgrSettleArrear({ chamaId: cid, potId: pid, arrearId, amount }), () => setSettleArrearId(null));
 
   const writeOffArrear = (arrearId: string, reason: string) =>
     run(`writeOff-${arrearId}`, () => mgrWriteOffArrear({ chamaId: cid, potId: pid, arrearId, reason }), () => setWriteOffArrearId(null));
+
+  const startNewCycle = () => {
+    if (!confirm(`Start cycle ${(pot.cycleNumber ?? 1) + 1} of "${pot.name}"? Everyone goes back into the queue for a fresh draw.`)) return;
+    run('newCycle', () => mgrStartNewCycle({ chamaId: cid, potId: pid }), (r) => setInfoMsg(`Cycle ${r.cycleNumber} started — run the draw to set the new order.`));
+  };
 
   const toggleReminders = async () => {
     setBusyKey('reminders');
@@ -320,35 +370,25 @@ export default function MgrPotDetail() {
           <p className="text-sm text-forest-900/70 mt-1">
             {payoutInfo.recipients.map((m) => memberName(members, m)).join(', ')} — {kes(payoutInfo.shareEach)} each
           </p>
-          {short && pot.finalRoundPolicy === 'close_early' ? (
-            <div className="mt-3 flex flex-col gap-2">
-              <p className="text-xs text-forest-900/60">This pot is set to close instead of paying out a short final round.</p>
-              <button onClick={closeForever} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start flex items-center gap-2">
-                {busyKey === 'closeForever' && <Spinner />} Close this pot instead
-              </button>
-            </div>
-          ) : (
-            <>
-              {short && pot.finalRoundPolicy === 'carry_over' && (
-                <p className="text-xs text-forest-900/60 mt-2">
-                  This pot is set to carry a short round over rather than force a partial payout — pay out now, or leave this and come back once more contributions land.
-                </p>
-              )}
-              {payoutInfo.poolShortfall > 0 && (
-                <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
-                  <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
-                  <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
-                </label>
-              )}
-              <button
-                onClick={payout}
-                disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
-                className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
-              >
-                {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
-              </button>
-            </>
+          {short && (
+            <p className="text-xs text-forest-900/60 mt-2">
+              {FINAL_POLICY_COPY[pot.finalRoundPolicy ?? 'split']}
+              {pot.finalRoundPolicy && pot.finalRoundPolicy !== 'split' ? ' Paid in full — never a reduced split.' : ''}
+            </p>
           )}
+          {payoutInfo.poolShortfall > 0 && (
+            <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
+              <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
+              <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
+            </label>
+          )}
+          <button
+            onClick={payout}
+            disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
+            className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
+          >
+            {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
+          </button>
         </div>
       )}
 
@@ -401,7 +441,7 @@ export default function MgrPotDetail() {
                             <button onClick={() => removeMember(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
                               Remove
                             </button>
-                            <button onClick={() => proposeExit(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
+                            <button onClick={() => openExitConfirm(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
                               Exit
                             </button>
                           </div>
@@ -475,6 +515,16 @@ export default function MgrPotDetail() {
         </>
       )}
 
+      {pot.status === 'completed' && isFinanceAdmin && (
+        <div className="card p-4 border-forest-300 ring-1 ring-forest-200">
+          <h3 className="font-display font-semibold">Cycle {pot.cycleNumber} complete</h3>
+          <p className="text-sm text-forest-900/70 mt-1">Everyone's had their turn. Start a new cycle to keep this merry-go-round running — records, arrears and reliability history all carry over — or close it for good below.</p>
+          <button onClick={startNewCycle} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2">
+            {busyKey === 'newCycle' && <Spinner />} Start cycle {(pot.cycleNumber ?? 1) + 1}
+          </button>
+        </div>
+      )}
+
       {openArrears.length > 0 && isFinanceAdmin && (
         <div className="card p-4">
           <h3 className="font-display font-semibold text-sm">Open arrears</h3>
@@ -496,6 +546,43 @@ export default function MgrPotDetail() {
                 </span>
               </li>
             ))}
+          </ul>
+        </div>
+      )}
+
+      {openExits.length > 0 && isFinanceAdmin && (
+        <div className="card p-4">
+          <h3 className="font-display font-semibold text-sm">Open exits</h3>
+          <ul className="mt-2 divide-y divide-forest-50">
+            {openExits.map((x) => {
+              const refundOutstanding = Math.round((x.refundDue - x.refundPaid) * 100) / 100;
+              const clawbackOutstanding = Math.round((x.clawbackDue - x.clawbackRecovered) * 100) / 100;
+              return (
+                <li key={x.id} className="py-2.5 flex flex-col gap-1.5 text-sm">
+                  <span className="font-medium">{memberName(members, x.memberId)}</span>
+                  {refundOutstanding > 0.01 && (
+                    <span className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-forest-900/60">Refund owed to them — {kes(refundOutstanding)} left{x.cutAmount > 0 ? ` (${x.exitCutPercent}% cut already withheld)` : ''}</span>
+                      {settleRefundId === x.id ? (
+                        <SettleArrearForm amount={refundOutstanding} busy={busyKey === `settleRefund-${x.id}`} onCancel={() => setSettleRefundId(null)} onSubmit={(amt) => settleRefund(x.id, amt)} />
+                      ) : (
+                        <button onClick={() => setSettleRefundId(x.id)} className="text-xs font-semibold text-forest-700">Pay refund</button>
+                      )}
+                    </span>
+                  )}
+                  {clawbackOutstanding > 0.01 && (
+                    <span className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-forest-900/60">Owed back to the pot — {kes(clawbackOutstanding)} left</span>
+                      {settleClawbackId === x.id ? (
+                        <SettleArrearForm amount={clawbackOutstanding} busy={busyKey === `settleClawback-${x.id}`} onCancel={() => setSettleClawbackId(null)} onSubmit={(amt) => settleClawback(x.id, amt)} />
+                      ) : (
+                        <button onClick={() => setSettleClawbackId(x.id)} className="text-xs font-semibold text-forest-700">Record recovery</button>
+                      )}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
@@ -546,6 +633,7 @@ export default function MgrPotDetail() {
 
       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
       {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
+      {infoMsg && <p className="text-sm text-forest-700 font-medium">{infoMsg}</p>}
 
       {addPicker !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setAddPicker(null)}>
@@ -574,24 +662,33 @@ export default function MgrPotDetail() {
         </div>
       )}
 
-      {exitFor && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setExitFor(null)}>
+      {exitConfirmFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setExitConfirmFor(null)}>
           <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5 flex flex-col gap-3" onClick={(e) => e.stopPropagation()}>
-            <h3 className="font-semibold text-forest-900">Exit {memberName(members, exitFor.memberId)}</h3>
+            <h3 className="font-semibold text-forest-900">Remove {memberName(members, exitConfirmFor.memberId)}?</h3>
             <p className="text-sm text-forest-900/70">
-              {exitFor.proposedNet >= 0
-                ? <>The pot owes them <strong>{kes(exitFor.proposedNet)}</strong> (paid in more than they've received).</>
-                : <>They owe the pot <strong>{kes(Math.abs(exitFor.proposedNet))}</strong> (received a payout already).</>}
+              They leave the pot right away — the pool, share and queue recalculate around whoever's left. Their refund and any recovery are settled afterward, at your own pace, from the Open exits card.
             </p>
-            {exitFor.grossNet !== exitFor.proposedNet && (
-              <p className="text-xs text-forest-900/50">
-                Before this pot's {pot.exitCutPercent}% exit cut, the refund would have been {kes(exitFor.grossNet)}.
-              </p>
-            )}
+            <div className="bg-forest-50/70 rounded-lg p-3 text-xs flex flex-col gap-1">
+              <div className="flex justify-between"><span>Contributed so far</span><span className="font-medium num">{kes(exitConfirmFor.contributed)}</span></div>
+              <div className="flex justify-between"><span>Payouts already received</span><span className="font-medium num">{kes(exitConfirmFor.received)}</span></div>
+            </div>
+            <label className="flex items-center gap-2 text-xs font-semibold text-forest-800">
+              Cut on refund
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={exitCutInput}
+                onChange={(e) => setExitCutInput(Number(e.target.value))}
+                className="w-20 border border-forest-200 rounded-lg px-2 py-1.5 text-sm font-normal"
+              />
+              <span className="font-normal text-forest-900/45">% — refund is chased down from the Open exits card</span>
+            </label>
             <div className="flex gap-2 justify-end pt-1">
-              <button onClick={() => setExitFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
-              <button onClick={settleExit} disabled={busyKey === 'settleExit'} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
-                {busyKey === 'settleExit' && <Spinner />} Confirm & remove
+              <button onClick={() => setExitConfirmFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
+              <button onClick={confirmExit} disabled={busyKey === `exit-${exitConfirmFor.memberId}`} className="bg-brick-500 hover:bg-brick-600 text-white text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
+                {busyKey === `exit-${exitConfirmFor.memberId}` && <Spinner />} Remove
               </button>
             </div>
           </div>

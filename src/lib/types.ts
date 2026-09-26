@@ -24,6 +24,10 @@ export interface Chama {
   autoRenew?: boolean;
   contributionAmount: number;
   contributionCycle: 'daily' | 'weekly' | 'monthly';
+  /** What the chama already had banked before joining the app. Set at creation
+   *  (defaults to 0); afterwards only the treasurer may change it — see
+   *  firestore.rules and AdminDashboard's Group balance calculation. */
+  openingBalance?: number;
   smsCredits?: number;
   settlementAccount?: string;
   settlementSplitCode?: string;
@@ -149,7 +153,7 @@ export interface MgrPot {
   autoDemoteLate: boolean;
   /** % withheld from a departing member's refund on exit (0 = none). Never applied to what a member owes the pot. */
   exitCutPercent?: number;
-  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. */
+  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. 'carry_over' pays everyone their full standard share then starts a new cycle automatically; 'close_early' pays the same full share then rests as 'completed'; 'split' (default) divides whatever's collected evenly among who's left. */
   finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
   status: 'draft' | 'active' | 'completed' | 'closed';
   cycleNumber: number;
@@ -179,12 +183,16 @@ export interface MgrArrear {
 export interface MgrExit {
   id: string;
   memberId: string;
-  proposedNet: number;
-  grossNet?: number;
-  exitCutPercent?: number;
-  status: 'proposed' | 'settled';
-  settledAmount?: number;
-  settledDirection?: 'pot_to_member' | 'member_to_pot';
+  reason: string;
+  contributed: number;
+  received: number;
+  exitCutPercent: number;
+  cutAmount: number;
+  refundDue: number;
+  refundPaid: number;
+  clawbackDue: number;
+  clawbackRecovered: number;
+  status: 'open' | 'settled';
   createdAt: number;
   updatedAt: number;
 }
@@ -199,11 +207,15 @@ export type MgrLedgerKind =
   | 'shortfall_covered'
   | 'member_added'
   | 'member_removed'
+  | 'member_exited'
+  | 'exit_refund_paid'
+  | 'exit_recovered'
   | 'exit_settled'
   | 'queue_reordered'
   | 'period_closed'
   | 'pot_closed'
-  | 'repaired';
+  | 'repaired'
+  | 'cycle_started';
 
 export interface MgrLedgerEntry {
   id: string;

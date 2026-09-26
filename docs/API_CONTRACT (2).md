@@ -33,10 +33,16 @@ Creates the `chamas` doc, a `members` doc for the caller with
 ```ts
 Request:  { name: string; motto?: string; contributionAmount: number;
             contributionCycle: 'daily'|'weekly'|'monthly';
+            openingBalance?: number;  // what the chama already had banked; defaults to 0
             adminName: string; adminPhone: string; adminIdNumber: string }
 Response: { chamaId: string; memberId: string }
 Errors:   failed-precondition (email not verified), invalid-argument
 ```
+
+`openingBalance`, once set, may only be changed afterward by the chama's
+`treasurer` — via a direct client update gated in `firestore.rules`, not a
+callable. It seeds the dashboard's Group balance figure alongside the
+transactions ledger (see `AdminDashboard.tsx`).
 
 ### `addAdmin` / `addMember`
 Caller: `chair` or `treasurer` of `chamaId` (finance admin).

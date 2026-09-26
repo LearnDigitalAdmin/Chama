@@ -93,6 +93,12 @@ def createChama(req: https_fn.CallableRequest) -> dict:
     admin_name = (data.get("adminName") or "").strip()
     admin_phone = data.get("adminPhone") or ""
     admin_id_number = data.get("adminIdNumber") or ""
+    # Opening balance: what the chama already had banked before joining the
+    # app. Optional (defaults to 0) so the dashboard's Group balance isn't
+    # misleadingly zero for a group that's been running for years. Only
+    # settable here because there's no treasurer yet to gate it — every
+    # later change goes through the treasurer-only path in firestore.rules.
+    opening_balance = data.get("openingBalance", 0)
 
     if not name:
         raise bad_request("Chama name is required.")
@@ -100,6 +106,8 @@ def createChama(req: https_fn.CallableRequest) -> dict:
         raise bad_request("contributionCycle must be daily, weekly, or monthly.")
     if not isinstance(contribution_amount, (int, float)) or contribution_amount <= 0:
         raise bad_request("contributionAmount must be a positive number.")
+    if not isinstance(opening_balance, (int, float)) or opening_balance < 0:
+        raise bad_request("openingBalance must be zero or a positive number.")
 
     db = _db()
     chama_ref = db.collection(paths.MC.CHAMAS).document()
@@ -125,6 +133,7 @@ def createChama(req: https_fn.CallableRequest) -> dict:
             "plan": "free",
             "contributionAmount": float(contribution_amount),
             "contributionCycle": contribution_cycle,
+            "openingBalance": float(opening_balance),
             "smsCredits": 0,
             "settlementAccount": None,
             "settlementSplitCode": None,

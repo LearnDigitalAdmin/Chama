@@ -53,6 +53,11 @@ class Chama(TypedDict):
     autoRenew: NotRequired[bool]
     contributionAmount: float
     contributionCycle: Frequency
+    # What the chama already had banked before joining the app. Set once at
+    # createChama (defaults to 0); afterwards only the treasurer may change
+    # it (see firestore.rules) — everything else the Group balance figure
+    # reflects comes from the transactions ledger, not from client writes.
+    openingBalance: NotRequired[float]
     smsCredits: NotRequired[float]
     settlementAccount: NotRequired[str]
     settlementSplitCode: NotRequired[str]
@@ -201,16 +206,27 @@ class MgrArrear(TypedDict):
 
 
 class MgrExit(TypedDict):
-    """chamas/{c}/mgrPots/{p}/exits/{id} — a member leaving the pot
-    mid-cycle. 'proposed' shows the computed net settlement (what they've
-    paid in this cycle minus what they've already received); 'settled'
-    records how the cash actually moved."""
+    """chamas/{c}/mgrPots/{p}/exits/{id} — a member removed from the pot
+    mid-cycle. Unlike a plain mgrRemoveMember, this member had money on
+    the table (paid in, or already received a payout, or both), so they
+    leave the pot IMMEDIATELY (mgrExitMember) while what's owed is tracked
+    as two independent running balances, each settled over one or more
+    partial payments — refundDue/refundPaid (the pot owes them, net of
+    the exit cut %) and clawbackDue/clawbackRecovered (they owe the pot,
+    from payouts already received). 'open' until BOTH balances reach
+    zero."""
     id: NotRequired[str]
     memberId: str
-    proposedNet: float           # positive = pot owes the member; negative = member owes the pot
-    status: Literal["proposed", "settled"]
-    settledAmount: NotRequired[float]
-    settledDirection: NotRequired[Literal["pot_to_member", "member_to_pot"]]
+    reason: str
+    contributed: float           # paid in this cycle, before the cut
+    received: float               # payouts already received this cycle
+    exitCutPercent: float
+    cutAmount: float
+    refundDue: float
+    refundPaid: float
+    clawbackDue: float
+    clawbackRecovered: float
+    status: Literal["open", "settled"]
     createdAt: int
     updatedAt: int
 
@@ -224,8 +240,10 @@ class MgrLedgerEntry(TypedDict):
     kind: Literal[
         "contribution", "payout", "arrear_opened", "arrear_settled",
         "arrear_written_off", "shortfall_recorded", "shortfall_covered",
-        "member_added", "member_removed", "exit_settled",
+        "member_added", "member_removed", "member_exited",
+        "exit_refund_paid", "exit_recovered", "exit_settled",
         "queue_reordered", "period_closed", "pot_closed", "repaired",
+        "cycle_started",
     ]
     memberId: NotRequired[Optional[str]]
     amount: NotRequired[float]

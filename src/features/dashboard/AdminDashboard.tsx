@@ -165,7 +165,11 @@ export default function AdminDashboard() {
   const activePots = pots.filter((p) => p.status === 'active');
   const draftPots = pots.filter((p) => p.status === 'draft');
   const plan = PLANS[chama.plan];
-  const groupBalance = allTxns.reduce((s, t) => s + (t.direction === 'in' ? t.amount : -t.amount), 0);
+  // Seeded from the chama's opening balance (what it had banked before
+  // joining the app — set at creation, correctable only by the treasurer in
+  // Settings) plus everything the ledger has recorded since.
+  const groupBalance =
+    (chama.openingBalance ?? 0) + allTxns.reduce((s, t) => s + (t.direction === 'in' ? t.amount : -t.amount), 0);
   const goalPercent = members.length ? (paidThisPeriod / members.length) * 100 : 0;
 
   const attentionItems: { key: string; text: string; to: string }[] = [
@@ -183,7 +187,7 @@ export default function AdminDashboard() {
     shortfallTotal > 0
       ? { tone: 'brick', text: `${kes(shortfallTotal)} MGR shortfall needs covering${shortfallPot ? ` in ${shortfallPot.name}` : ''}.`, to: shortfallPot ? `/app/mgr/${shortfallPot.id}` : '/app/mgr' }
       : completedPot
-        ? { tone: 'gold', text: `Payout due in ${completedPot.name}.`, to: `/app/mgr/${completedPot.id}` }
+        ? { tone: 'gold', text: `Cycle complete in ${completedPot.name} — start a new one, or close it.`, to: `/app/mgr/${completedPot.id}` }
         : openArrearsCount > 0
           ? { tone: 'gold', text: `${openArrearsCount} MGR arrear${openArrearsCount === 1 ? '' : 's'} to recover.`, to: '/app/mgr' }
           : soleActivePot

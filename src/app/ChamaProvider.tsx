@@ -24,6 +24,7 @@ interface ChamaContextValue {
   setChamaId: (id: string) => void;
   isFinanceAdmin: boolean;
   isOfficial: boolean;
+  isTreasurer: boolean;
 }
 
 const ChamaContext = createContext<ChamaContextValue>({
@@ -35,6 +36,7 @@ const ChamaContext = createContext<ChamaContextValue>({
   setChamaId: () => {},
   isFinanceAdmin: false,
   isOfficial: false,
+  isTreasurer: false,
 });
 
 export function ChamaProvider({ children }: { children: ReactNode }) {
@@ -79,6 +81,7 @@ export function ChamaProvider({ children }: { children: ReactNode }) {
       setChamaId: setSelected,
       isFinanceAdmin: membership?.role === 'chair' || membership?.role === 'treasurer',
       isOfficial: membership?.role === 'chair' || membership?.role === 'treasurer' || membership?.role === 'secretary',
+      isTreasurer: membership?.role === 'treasurer',
     }),
     [selected, membership, chama, chamaReady, memberships]
   );

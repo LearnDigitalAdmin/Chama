@@ -17,6 +17,7 @@ export default function CreateChama() {
   const [motto, setMotto] = useState('');
   const [contributionAmount, setContributionAmount] = useState('');
   const [contributionCycle, setContributionCycle] = useState<'daily' | 'weekly' | 'monthly'>('monthly');
+  const [openingBalance, setOpeningBalance] = useState('');
   const [adminName, setAdminName] = useState(user?.displayName ?? '');
   const [adminPhone, setAdminPhone] = useState('');
   const [adminIdNumber, setAdminIdNumber] = useState('');
@@ -25,9 +26,11 @@ export default function CreateChama() {
   const navigate = useNavigate();
 
   const amount = Number(contributionAmount);
+  const openingBalanceAmount = openingBalance.trim() === '' ? 0 : Number(openingBalance);
   const canSubmit =
     name.trim().length > 1 &&
     amount > 0 &&
+    openingBalanceAmount >= 0 &&
     adminName.trim().length > 1 &&
     isValidKenyanPhone(adminPhone) &&
     adminIdNumber.trim().length >= 4;
@@ -42,6 +45,7 @@ export default function CreateChama() {
         motto: motto.trim() || undefined,
         contributionAmount: amount,
         contributionCycle,
+        openingBalance: openingBalanceAmount,
         adminName: adminName.trim(),
         adminPhone,
         adminIdNumber,
@@ -77,6 +81,12 @@ export default function CreateChama() {
           <option value="monthly">Monthly</option>
         </select>
       </FormField>
+      <FormField label="Opening balance (KES, optional)">
+        <input type="number" min={0} placeholder="0" value={openingBalance} onChange={(e) => setOpeningBalance(e.target.value)} disabled={busy} className={inputClass} />
+      </FormField>
+      <p className="text-xs text-forest-900/50 -mt-2">
+        Already have money set aside for this chama? Enter it here so your balance is accurate from day one. You can only update this later as treasurer.
+      </p>
 
       <hr className="border-forest-100" />
       <p className="text-sm font-semibold text-ink">Your details, as chair</p>

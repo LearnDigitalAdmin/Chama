@@ -1,0 +1,1147 @@
+diff --git a/functions/main.py b/functions/main.py
+index 3b3fafe..d7b4778 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -52,10 +52,12 @@ from mychama.mgr import (  # noqa: E402,F401
+     mgrSettleArrear,
+     mgrWriteOffArrear,
+     mgrCoverShortfall,
+-    mgrProposeExit,
+-    mgrSettleExit,
++    mgrExitMember,
++    mgrSettleExitRefund,
++    mgrSettleExitClawback,
+     mgrRepairPot,
+     mgrCloseForever,
++    mgrStartNewCycle,
+ )
+ 
+ # --- Phase 3: Payments, SMS & Settlement -----------------------------------
+diff --git a/functions/mychama/mgr.py b/functions/mychama/mgr.py
+index 8e52451..15ff64c 100644
+--- a/functions/mychama/mgr.py
++++ b/functions/mychama/mgr.py
+@@ -29,10 +29,14 @@ split as the four callables above:
+     CURRENT queue (can't inject a member who isn't in it) and logs the
+     change to the ledger, so a bad client-side drag never corrupts payout
+     order silently.
+-  - mgrProposeExit / mgrSettleExit — a member leaving mid-cycle. Propose
+-    computes (server-side, from records+payouts) what the pot owes them or
+-    they owe the pot; settle records how the cash actually moved and
+-    removes them from the pot.
++  - mgrExitMember / mgrSettleExitRefund / mgrSettleExitClawback — a
++    member leaving mid-cycle. mgrExitMember removes them from the pot
++    IMMEDIATELY (their slot frees up right away, same as the demo) and
++    opens an exits doc tracking two independent running balances — a
++    refund the pot owes them (paid-in, less the exit cut %) and a
++    clawback they owe the pot (any payout already received) — each paid
++    down over one or more partial payments by its own callable, exactly
++    like an arrear.
+   - mgrSettleArrear / mgrWriteOffArrear — arrears are opened automatically
+     by closeMgrPeriod (one running-balance doc per member per pot); these
+     close them out.
+@@ -45,14 +49,37 @@ split as the four callables above:
+     The health check itself is pure and mirrored client-side
+     (src/lib/mgrEngine.ts::healthCheck) for an instant-feeling Health card
+     — reading it needs no round trip, acting on it always does.
+-  - mgrCloseForever — retires a pot. Refuses while arrears are open or a
+-    shortfall is outstanding, to stop a pot being closed with unresolved
+-    money still on the table.
++  - mgrCloseForever — retires a pot for good. Refuses while arrears are
++    open or a shortfall is outstanding, to stop a pot being closed with
++    unresolved money still on the table.
++  - mgrStartNewCycle — the OTHER way a 'completed' pot's story continues:
++    instead of retiring it, run it again. Resets the queue for a fresh
++    draw and bumps cycleNumber, but keeps every record/arrear/exit/ledger
++    entry so history and late-score reliability carry over. Unlike
++    mgrCloseForever, doesn't require arrears/exits to be clear first.
+ 
+ Every mutation below writes an entry to the pot's own `ledger`
+ subcollection (functions/shared/types.py::MgrLedgerEntry) — independent of
+ the chama-wide `transactions` collection — so a single pot's full history
+ can be audited or exported without cross-referencing anything else.
++
++MGR audit re-check (focused pass over just the merry-go-round module,
++cross-checked against the original demo HTML and the earlier feature
++audit): three gaps found beyond what that audit already listed —
++  1. finalRoundPolicy ('split' / 'carry_over' / 'close_early') was
++     collected at pot creation and shown in the UI, but recordMgrPayoutCash
++     never actually read it — every policy paid out identically. Fixed in
++     mgr_engine.build_final_plan; see its docstring.
++  2. A 'completed' pot (cycle finished, queue empty) had no way to run
++     again short of mgrCloseForever + creating a brand new pot from
++     scratch. Fixed by mgrStartNewCycle (and recordMgrPayoutCash now
++     starts the next cycle automatically for a 'carry_over' pot's final
++     short round).
++  3. The exit flow required settling the WHOLE net amount in one sitting
++     before the member was even removed from the pot, and — unlike
++     arrears — an unsettled exit had no persistent card to come back to.
++     Replaced with mgrExitMember (immediate removal) + two independently
++     payable balances, matching how arrears already work.
+ """
+ 
+ from __future__ import annotations
+@@ -418,16 +445,25 @@ def recordMgrPayoutCash(req: https_fn.CallableRequest) -> dict:
+     if dedup is not None:
+         return dedup
+ 
+-    if pot.get("pendingShortfall", 0) > 0 and not data.get("acknowledgeShortfall"):
++    records = _all_records(db, chama_id, pot_id)
++    short_round = mgr_engine.is_short_round(pot)
++    policy = pot.get("finalRoundPolicy", "split")
++    plan = mgr_engine.build_final_plan(pot, records, policy) if short_round else None
++    info = mgr_engine.pool_for_round(pot, records)
++
++    # A short round's real shortfall (plan["poolShortfall"]) is generally
++    # SMALLER than the pot's stored pendingShortfall, which was computed
++    # by closeMgrPeriod against the full periodsPerRound expected amount
++    # for every recipient slot — not just the fewer recipients actually
++    # left. Gating on the plan's own number (when there is a plan) keeps
++    # the "pay out anyway" checkbox honest about what's actually missing.
++    effective_shortfall = plan["poolShortfall"] if plan else pot.get("pendingShortfall", 0)
++    if effective_shortfall > 0 and not data.get("acknowledgeShortfall"):
+         raise precondition(
+-            f"This round is short by KES {pot['pendingShortfall']:,.2f} — record how it's being covered "
++            f"This round is short by KES {effective_shortfall:,.2f} — record how it's being covered "
+             "(mgrCoverShortfall) first, or pay out anyway with acknowledgeShortfall."
+         )
+ 
+-    records = _all_records(db, chama_id, pot_id)
+-    short_round = mgr_engine.is_short_round(pot)
+-    plan = mgr_engine.build_final_plan(pot, records) if short_round else None
+-    info = mgr_engine.pool_for_round(pot, records)
+     recipients = plan["recipients"] if plan else pot["queue"][: pot["recipientsPerRound"]]
+     if not recipients:
+         raise precondition("No recipients left in the queue for this pot.")
+@@ -465,19 +501,45 @@ def recordMgrPayoutCash(req: https_fn.CallableRequest) -> dict:
+         })
+ 
+     new_queue = [m for m in pot["queue"] if m not in recipients]
+-    new_status = "completed" if short_round or len(new_queue) < pot["recipientsPerRound"] else pot["status"]
+-    batch.update(pot_ref, {
+-        "queue": new_queue,
+-        "period": pot["period"] + 1,
+-        "status": new_status,
+-        "pendingShortfall": 0,
+-        "updatedAt": ts,
+-    })
++    cycle_started: int | None = None
++
++    if short_round and policy == "carry_over":
++        # "Carry over" means the merry-go-round itself carries over, not
++        # just a cash surplus — once the shrunk-membership final round has
++        # paid everyone their full share (above), immediately roll the pot
++        # into its next cycle rather than parking it in 'completed' with
++        # nothing left to do (that dead-end is exactly what
++        # mgrStartNewCycle exists to fix for every OTHER policy — this
++        # just means carry_over pots never need the admin to click it).
++        cycle_started = pot.get("cycleNumber", 1) + 1
++        batch.update(pot_ref, {
++            "queue": [],
++            "drawDone": False,
++            "drawMethod": None,
++            "status": "draft",
++            "cycleNumber": cycle_started,
++            "period": pot["period"] + 1,
++            "pendingShortfall": 0,
++            "updatedAt": ts,
++        })
++    else:
++        new_status = "completed" if short_round or len(new_queue) < pot["recipientsPerRound"] else pot["status"]
++        batch.update(pot_ref, {
++            "queue": new_queue,
++            "period": pot["period"] + 1,
++            "status": new_status,
++            "pendingShortfall": 0,
++            "updatedAt": ts,
++        })
+     batch.commit()
+     for member_id in recipients:
+         _log(db, chama_id, pot_id, "payout", member_id=member_id, amount=share, note=f"round {round_no}")
++    if cycle_started is not None:
++        _log(db, chama_id, pot_id, "cycle_started", note=f"cycle {cycle_started} (auto, carry_over final round)")
+ 
+-    result = {"ok": True, "paidTo": recipients, "amountEach": share}
++    result: dict = {"ok": True, "paidTo": recipients, "amountEach": share}
++    if cycle_started is not None:
++        result["cycleStarted"] = cycle_started
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+     return result
+ 
+@@ -534,8 +596,8 @@ def mgrRemoveMember(req: https_fn.CallableRequest) -> dict:
+     """Removes a member who has NOT yet received a payout this cycle and
+     has no open arrear — a plain "never got their turn, take them out"
+     removal. Someone who HAS received a payout, or is owed/owes money,
+-    must go through mgrProposeExit/mgrSettleExit instead so that money
+-    is accounted for."""
++    must go through mgrExitMember instead so that money is accounted
++    for."""
+     uid = require_auth(req)
+     data = req.data or {}
+     chama_id = data.get("chamaId")
+@@ -557,7 +619,7 @@ def mgrRemoveMember(req: https_fn.CallableRequest) -> dict:
+ 
+     payouts = _all_payouts(db, chama_id, pot_id)
+     if any(p["memberId"] == member_id for p in payouts):
+-        raise precondition("This member has already received a payout — use mgrProposeExit instead.")
++        raise precondition("This member has already received a payout — use mgrExitMember instead.")
+     if _open_arrear_for(db, chama_id, pot_id, member_id):
+         raise precondition("This member has an open arrear — settle or write it off first.")
+ 
+@@ -785,68 +847,141 @@ def mgrCoverShortfall(req: https_fn.CallableRequest) -> dict:
+ # --------------------------------------------------------------------- #
+ # Exits
+ # --------------------------------------------------------------------- #
++#
++# MGR audit re-check: the previous mgrProposeExit/mgrSettleExit pair
++# didn't actually remove the member from the pot until the ENTIRE net
++# amount was settled in one shot in the same session — close the
++# confirmation dialog without paying and the proposed exit just sat
++# there, invisible (no card listed it, unlike open arrears), with the
++# member still occupying a queue slot. The demo's real workflow (see
++# mgrExitMember/openMgrExitSettle) is the opposite: the member leaves
++# IMMEDIATELY on confirmation — their queue slot is freed and the round
++# recalculates around who's left right away — and what the pot owes them
++# (a refund, net of the exit cut %) or what they owe the pot (a clawback
++# on payouts already received) become two INDEPENDENT running balances
++# that can each be paid down over one or more partial payments, exactly
++# like an arrear. mgrExitMember replaces mgrProposeExit; two callables
++# (mirroring the demo's separate "refund" vs "clawback" settlement
++# actions) replace the old single mgrSettleExit.
++
+ 
+ @https_fn.on_call(region=REGION)
+-def mgrProposeExit(req: https_fn.CallableRequest) -> dict:
+-    """Computes what a member leaving mid-cycle is owed, or owes: their
+-    paid-in total this cycle (records with status 'paid', current
+-    cycleNumber) minus what they've already received in payouts. Writes a
+-    'proposed' exits doc for the admin to review before mgrSettleExit
+-    actually moves them out."""
++def mgrExitMember(req: https_fn.CallableRequest) -> dict:
++    """Removes a member from an active pot mid-cycle, right now — for
++    anyone mgrRemoveMember refuses (already paid out, or owed money for
++    what they've paid in). Computes, from records + payouts, a refund due
++    (what they've paid in this cycle, less the pot's exit cut %) and a
++    clawback due (any payout already received); opens an `exits` doc
++    tracking both as independent balances for mgrSettleExitRefund /
++    mgrSettleExitClawback to pay down over time. A member with nothing
++    owed either way is recorded 'settled' immediately, purely for the
++    audit trail."""
+     uid = require_auth(req)
+     data = req.data or {}
+     chama_id = data.get("chamaId")
+     pot_id = data.get("potId")
+     member_id = data.get("memberId")
++    reason = (data.get("reason") or "removed by admin").strip()
++    cut_override = data.get("cutPercent")
+     if not chama_id or not pot_id or not member_id:
+         raise bad_request("chamaId, potId, and memberId are required.")
+ 
+     db = _db()
+     require_finance_admin(db, uid, chama_id)
+-    _, pot = _get_pot(db, chama_id, pot_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
+     if member_id not in pot["memberIds"]:
+         raise bad_request("That member isn't in this pot.")
++    if len(pot["memberIds"]) <= 2:
++        raise precondition("A merry-go-round needs at least 2 members — close the pot instead of removing everyone.")
++
++    if isinstance(cut_override, (int, float)) and 0 <= cut_override <= 100:
++        cut_percent = float(cut_override)
++    else:
++        cut_percent = pot.get("exitCutPercent", 0) or 0
+ 
+     records = _all_records(db, chama_id, pot_id)
+     payouts = _all_payouts(db, chama_id, pot_id)
+-    paid_in = sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid")
+-    received = sum(p["amount"] for p in payouts if p["memberId"] == member_id)
+-    gross_net = round((paid_in - received) * 100) / 100  # positive: pot owes them; negative: they owe the pot
+-
+-    # Exit cut % (Members/MGR audit: "what's withheld from a removed
+-    # member's refund") only ever applies to a refund owed TO the exiting
+-    # member — it never increases what a member owes the pot.
+-    cut_percent = pot.get("exitCutPercent", 0) or 0
+-    net = round(gross_net * (1 - cut_percent / 100) * 100) / 100 if gross_net > 0 else gross_net
++    contributed = round(sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid") * 100) / 100
++    received = round(sum(p["amount"] for p in payouts if p["memberId"] == member_id) * 100) / 100
++    cut_amount = round(contributed * (cut_percent / 100) * 100) / 100
++    refund_due = max(0.0, round((contributed - cut_amount) * 100) / 100)
++    clawback_due = received
+ 
+     ts = now_ms()
+-    ref = db.collection(paths.mgr_exits(chama_id, pot_id)).document()
+-    ref.set({
++    new_member_ids = [m for m in pot["memberIds"] if m != member_id]
++    new_recipients_per_round = pot["recipientsPerRound"]
++    if new_recipients_per_round > len(new_member_ids):
++        new_recipients_per_round = max(1, len(new_member_ids))
++
++    pot_ref.update({
++        "memberIds": new_member_ids,
++        "queue": [m for m in pot["queue"] if m != member_id],
++        "recipientsPerRound": new_recipients_per_round,
++        "updatedAt": ts,
++    })
++
++    already_settled = refund_due <= 0.01 and clawback_due <= 0.01
++    exit_ref = db.collection(paths.mgr_exits(chama_id, pot_id)).document()
++    exit_ref.set({
+         "memberId": member_id,
+-        "proposedNet": net,
+-        "grossNet": gross_net,
++        "reason": reason,
++        "contributed": contributed,
++        "received": received,
+         "exitCutPercent": cut_percent,
+-        "status": "proposed",
++        "cutAmount": cut_amount,
++        "refundDue": refund_due,
++        "refundPaid": 0.0,
++        "clawbackDue": clawback_due,
++        "clawbackRecovered": 0.0,
++        "status": "settled" if already_settled else "open",
+         "createdAt": ts,
+         "updatedAt": ts,
+     })
+-    return {"exitId": ref.id, "proposedNet": net, "grossNet": gross_net}
++    # An open arrear for someone who's just left the pot is still owed —
++    # exactly like the demo, it stays open and recoverable on its own
++    # (mgrSettleArrear/mgrWriteOffArrear), independent of this exit.
++    open_arrear = _open_arrear_for(db, chama_id, pot_id, member_id)
++    if open_arrear:
++        open_arrear.reference.update({"note": "member exited the pot — recover directly", "updatedAt": ts})
++
++    _log(db, chama_id, pot_id, "member_exited", member_id=member_id, note=reason)
++
++    result = {
++        "ok": True,
++        "exitId": exit_ref.id,
++        "refundDue": refund_due,
++        "clawbackDue": clawback_due,
++        "cutAmount": cut_amount,
++    }
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
+ 
+ 
+-@https_fn.on_call(region=REGION)
+-def mgrSettleExit(req: https_fn.CallableRequest) -> dict:
++def _settle_exit_balance(req: https_fn.CallableRequest, *, kind: str) -> dict:
++    """Shared body for mgrSettleExitRefund / mgrSettleExitClawback — the
++    two independent partial-payment actions on one exit doc. `kind` is
++    'refund' (pot owes the ex-member, paid on the 'out' side of the
++    ledger) or 'clawback' (ex-member owes the pot, paid on the 'in'
++    side)."""
+     uid = require_auth(req)
+     data = req.data or {}
+     chama_id = data.get("chamaId")
+     pot_id = data.get("potId")
+     exit_id = data.get("exitId")
+-    settled_amount = data.get("settledAmount")
++    amount = data.get("amount")
+     if not chama_id or not pot_id or not exit_id:
+         raise bad_request("chamaId, potId, and exitId are required.")
++    if not isinstance(amount, (int, float)) or amount <= 0:
++        raise bad_request("amount must be a positive number.")
+ 
+     db = _db()
+     require_finance_admin(db, uid, chama_id)
+-    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++    _, pot = _get_pot(db, chama_id, pot_id)
+ 
+     dedup = already_applied(db, chama_id, data.get("clientRequestId"))
+     if dedup is not None:
+@@ -855,48 +990,65 @@ def mgrSettleExit(req: https_fn.CallableRequest) -> dict:
+     exit_ref = db.document(paths.mgr_exit(chama_id, pot_id, exit_id))
+     exit_snap = exit_ref.get()
+     if not exit_snap.exists:
+-        raise not_found("Exit proposal not found.")
++        raise not_found("Exit record not found.")
+     exit_doc = exit_snap.to_dict()
+-    if exit_doc.get("status") != "proposed":
+-        raise precondition("This exit has already been settled.")
+-    if _open_arrear_for(db, chama_id, pot_id, exit_doc["memberId"]):
+-        raise precondition("This member has an open arrear — settle or write it off before exiting them.")
+ 
+-    amount = float(settled_amount) if isinstance(settled_amount, (int, float)) else abs(exit_doc["proposedNet"])
+-    direction = "pot_to_member" if exit_doc["proposedNet"] >= 0 else "member_to_pot"
++    due_field = "refundDue" if kind == "refund" else "clawbackDue"
++    paid_field = "refundPaid" if kind == "refund" else "clawbackRecovered"
++    due = exit_doc.get(due_field, 0)
++    paid_so_far = exit_doc.get(paid_field, 0)
++    outstanding = round((due - paid_so_far) * 100) / 100
++    if outstanding <= 0.01:
++        raise precondition(f"There's no outstanding {kind} on this exit.")
++
++    pay_amount = min(float(amount), outstanding)
++    new_paid = round((paid_so_far + pay_amount) * 100) / 100
+     ts = now_ms()
+     today = today_iso()
+     member_id = exit_doc["memberId"]
+ 
+-    if amount > 0:
+-        db.collection(paths.transactions(chama_id)).document().set({
+-            "type": "mgr_payout" if direction == "pot_to_member" else "mgr_contribution",
+-            "memberId": member_id,
+-            "amount": amount,
+-            "method": "manual",
+-            "ref": "CASH" + str(ts)[-8:],
+-            "date": today,
+-            "settled": True,
+-            "direction": "out" if direction == "pot_to_member" else "in",
+-            "channel": "app",
+-            "note": pot["name"] + " exit settlement",
+-            "potId": pot_id,
+-            "createdAt": ts,
+-        })
++    db.collection(paths.transactions(chama_id)).document().set({
++        "type": "mgr_payout" if kind == "refund" else "mgr_contribution",
++        "memberId": member_id,
++        "amount": pay_amount,
++        "method": "manual",
++        "ref": "CASH" + str(ts)[-8:],
++        "date": today,
++        "settled": True,
++        "direction": "out" if kind == "refund" else "in",
++        "channel": "app",
++        "note": pot["name"] + (" exit refund" if kind == "refund" else " payout recovered on exit"),
++        "potId": pot_id,
++        "createdAt": ts,
++    })
+ 
+-    exit_ref.update({"status": "settled", "settledAmount": amount, "settledDirection": direction, "updatedAt": ts})
+-    pot_ref.update({
+-        "memberIds": [m for m in pot["memberIds"] if m != member_id],
+-        "queue": [m for m in pot["queue"] if m != member_id],
++    other_due_field = "clawbackDue" if kind == "refund" else "refundDue"
++    other_paid_field = "clawbackRecovered" if kind == "refund" else "refundPaid"
++    other_settled = exit_doc.get(other_due_field, 0) - exit_doc.get(other_paid_field, 0) <= 0.01
++    fully_settled = (due - new_paid <= 0.01) and other_settled
++
++    exit_ref.update({
++        paid_field: new_paid,
++        "status": "settled" if fully_settled else "open",
+         "updatedAt": ts,
+     })
+-    _log(db, chama_id, pot_id, "exit_settled", member_id=member_id, amount=amount, note=direction)
++    _log(db, chama_id, pot_id, "exit_refund_paid" if kind == "refund" else "exit_recovered", member_id=member_id, amount=pay_amount)
+ 
+-    result = {"ok": True, "settledAmount": amount, "settledDirection": direction}
++    result = {"ok": True, "remaining": round((due - new_paid) * 100) / 100, "status": "settled" if fully_settled else "open"}
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+     return result
+ 
+ 
++@https_fn.on_call(region=REGION)
++def mgrSettleExitRefund(req: https_fn.CallableRequest) -> dict:
++    return _settle_exit_balance(req, kind="refund")
++
++
++@https_fn.on_call(region=REGION)
++def mgrSettleExitClawback(req: https_fn.CallableRequest) -> dict:
++    return _settle_exit_balance(req, kind="clawback")
++
++
+ # --------------------------------------------------------------------- #
+ # Health, repair & closing
+ # --------------------------------------------------------------------- #
+@@ -967,3 +1119,63 @@ def mgrCloseForever(req: https_fn.CallableRequest) -> dict:
+     pot_ref.update({"status": "closed", "closedAt": ts, "updatedAt": ts})
+     _log(db, chama_id, pot_id, "pot_closed")
+     return {"ok": True}
++
++
++# --------------------------------------------------------------------- #
++# Cycles
++# --------------------------------------------------------------------- #
++
++@https_fn.on_call(region=REGION)
++def mgrStartNewCycle(req: https_fn.CallableRequest) -> dict:
++    """MGR audit re-check: the demo lets a merry-go-round run cycle after
++    cycle in the same pot (mgrStartNewCycle/doMgrStartNewCycle) — everyone
++    goes back into the queue for a fresh draw, while records, arrears,
++    exits and the ledger all carry straight over. That path didn't exist
++    at all here: once a pot's queue ran out, 'completed' was a dead end —
++    the only thing an admin could do with it was mgrCloseForever, which
++    means starting over meant creating a brand new pot and losing every
++    member's late-score history, reliability window and open
++    arrears/exits along with it.
++
++    Unlike mgrCloseForever, this deliberately does NOT require open
++    arrears/exits/shortfall to be clear first — same as the demo, they're
++    left open and keep showing on the Health/Arrears/Exits cards, because
++    forcing them settled before the group can even keep running the
++    rotation would hold the whole pot hostage to one late payer."""
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    pot_id = data.get("potId")
++    if not chama_id or not pot_id:
++        raise bad_request("chamaId and potId are required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++    pot_ref, pot = _get_pot(db, chama_id, pot_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    if pot["status"] != "completed":
++        raise precondition("Only a pot that has finished its cycle can start a new one.")
++    if len(pot["memberIds"]) < 2:
++        raise precondition("A merry-go-round needs at least 2 members to run another cycle.")
++
++    ts = now_ms()
++    new_cycle = pot.get("cycleNumber", 1) + 1
++    pot_ref.update({
++        "queue": [],
++        "drawDone": False,
++        "drawMethod": None,
++        "status": "draft",
++        "cycleNumber": new_cycle,
++        "period": pot["period"] + 1,
++        "pendingShortfall": 0,
++        "updatedAt": ts,
++    })
++    _log(db, chama_id, pot_id, "cycle_started", note=f"cycle {new_cycle}")
++
++    result = {"ok": True, "cycleNumber": new_cycle}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
+diff --git a/functions/shared/mgr_engine.py b/functions/shared/mgr_engine.py
+index 62000eb..78f4dc1 100644
+--- a/functions/shared/mgr_engine.py
++++ b/functions/shared/mgr_engine.py
+@@ -25,6 +25,13 @@ choices that aren't obvious from the code alone):
+     actually paid — because a merry-go-round promises a fixed payout to
+     whoever's turn it is. A shortfall is surfaced to admins to chase, not
+     quietly passed on to the recipient.
++
++MGR audit re-check (focused pass over just this module): build_final_plan
++now actually branches on the pot's finalRoundPolicy — previously every
++policy paid identically (a reduced, evenly-split share of whatever was
++left), which meant choosing "carry over" or "close out" at pot creation
++changed the UI's copy but nothing about the money. See build_final_plan's
++own docstring for what each policy does now.
+ """
+ 
+ from __future__ import annotations
+@@ -119,25 +126,67 @@ def is_short_round(pot: dict) -> bool:
+     return 0 < len(pot["queue"]) < pot["recipientsPerRound"]
+ 
+ 
+-def build_final_plan(pot: dict, records: list[dict]) -> dict:
++def build_final_plan(pot: dict, records: list[dict], policy: str = "split") -> dict:
+     """
+     For a round that can't fill its normal recipient count (membership
+-    shrank via exits/removals mid-cycle): splits whatever pool actually
+-    exists across whoever is left in the queue instead of leaving a
+-    fractional recipient slot unfilled. Read-only projection — the actual
+-    payout still goes through recordMgrPayoutCash, which re-derives the
+-    same numbers itself rather than trusting a client-cached plan.
++    shrank via exits/removals mid-cycle): decides what the remaining
++    queue actually gets paid. `policy` is the pot's `finalRoundPolicy`,
++    chosen at creation (MGR audit re-check: this used to be stored and
++    shown in the UI but never actually consulted here — every policy
++    behaved like "split". Fixed below.):
++
++      "split"      — divide whatever pool actually exists evenly across
++                     whoever is left, same as before. A member who ends up
++                     the sole survivor of a shrunk pot gets the whole
++                     remaining pool, not a "full share" they didn't
++                     collectively fund.
++
++      "carry_over" / "close_early" — pay the SAME full standard share
++                     every earlier recipient in this pot got (mirrors the
++                     demo's mgrRoundShare comment: "the last member in the
++                     queue is never short-changed"), funded first by
++                     whatever's actually been collected. Any gap between
++                     that full share and what's been collected still
++                     surfaces as a normal poolShortfall — chased via
++                     mgrCoverShortfall exactly like any other round,
++                     never invented or silently absorbed by the
++                     recipient. recordMgrPayoutCash tells "carry_over"
++                     and "close_early" apart only in what happens to the
++                     pot AFTER this payout (a fresh cycle starts
++                     automatically for carry_over; the pot rests
++                     'completed' for close_early, same as "split") — the
++                     payout math itself is identical for both, which is
++                     why they share this branch.
++
++    Read-only projection — the actual payout still goes through
++    recordMgrPayoutCash, which re-derives the same numbers itself rather
++    than trusting a client-cached plan.
+     """
+     info = pool_for_round(pot, records)
+     remaining = pot["queue"]
+     if not remaining:
+-        return {"recipients": [], "shareEach": 0.0, "poolExpected": info["expected"], "poolShortfall": info["shortfall"]}
++        return {"recipients": [], "shareEach": 0.0, "poolExpected": info["expected"], "poolShortfall": info["shortfall"], "policy": policy}
++
++    if policy in ("carry_over", "close_early"):
++        standard_share = round((pool_estimate(pot) / max(1, pot["recipientsPerRound"])) * 100) / 100
++        required = round((standard_share * len(remaining)) * 100) / 100
++        shortfall = max(0.0, round((required - info["actual"]) * 100) / 100)
++        return {
++            "recipients": remaining,
++            "shareEach": standard_share,
++            "poolExpected": required,
++            "poolShortfall": shortfall,
++            "policy": policy,
++            "short": True,
++        }
++
+     share = round((info["expected"] / len(remaining)) * 100) / 100
+     return {
+         "recipients": remaining,
+         "shareEach": share,
+         "poolExpected": info["expected"],
+         "poolShortfall": info["shortfall"],
++        "policy": "split",
+         "short": True,
+     }
+ 
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 4e0bf34..2007662 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -201,16 +201,27 @@ class MgrArrear(TypedDict):
+ 
+ 
+ class MgrExit(TypedDict):
+-    """chamas/{c}/mgrPots/{p}/exits/{id} — a member leaving the pot
+-    mid-cycle. 'proposed' shows the computed net settlement (what they've
+-    paid in this cycle minus what they've already received); 'settled'
+-    records how the cash actually moved."""
++    """chamas/{c}/mgrPots/{p}/exits/{id} — a member removed from the pot
++    mid-cycle. Unlike a plain mgrRemoveMember, this member had money on
++    the table (paid in, or already received a payout, or both), so they
++    leave the pot IMMEDIATELY (mgrExitMember) while what's owed is tracked
++    as two independent running balances, each settled over one or more
++    partial payments — refundDue/refundPaid (the pot owes them, net of
++    the exit cut %) and clawbackDue/clawbackRecovered (they owe the pot,
++    from payouts already received). 'open' until BOTH balances reach
++    zero."""
+     id: NotRequired[str]
+     memberId: str
+-    proposedNet: float           # positive = pot owes the member; negative = member owes the pot
+-    status: Literal["proposed", "settled"]
+-    settledAmount: NotRequired[float]
+-    settledDirection: NotRequired[Literal["pot_to_member", "member_to_pot"]]
++    reason: str
++    contributed: float           # paid in this cycle, before the cut
++    received: float               # payouts already received this cycle
++    exitCutPercent: float
++    cutAmount: float
++    refundDue: float
++    refundPaid: float
++    clawbackDue: float
++    clawbackRecovered: float
++    status: Literal["open", "settled"]
+     createdAt: int
+     updatedAt: int
+ 
+@@ -224,8 +235,10 @@ class MgrLedgerEntry(TypedDict):
+     kind: Literal[
+         "contribution", "payout", "arrear_opened", "arrear_settled",
+         "arrear_written_off", "shortfall_recorded", "shortfall_covered",
+-        "member_added", "member_removed", "exit_settled",
++        "member_added", "member_removed", "member_exited",
++        "exit_refund_paid", "exit_recovered", "exit_settled",
+         "queue_reordered", "period_closed", "pot_closed", "repaired",
++        "cycle_started",
+     ]
+     memberId: NotRequired[Optional[str]]
+     amount: NotRequired[float]
+diff --git a/src/features/dashboard/AdminDashboard.tsx b/src/features/dashboard/AdminDashboard.tsx
+index d30d0a9..17c1df1 100644
+--- a/src/features/dashboard/AdminDashboard.tsx
++++ b/src/features/dashboard/AdminDashboard.tsx
+@@ -183,7 +183,7 @@ export default function AdminDashboard() {
+     shortfallTotal > 0
+       ? { tone: 'brick', text: `${kes(shortfallTotal)} MGR shortfall needs covering${shortfallPot ? ` in ${shortfallPot.name}` : ''}.`, to: shortfallPot ? `/app/mgr/${shortfallPot.id}` : '/app/mgr' }
+       : completedPot
+-        ? { tone: 'gold', text: `Payout due in ${completedPot.name}.`, to: `/app/mgr/${completedPot.id}` }
++        ? { tone: 'gold', text: `Cycle complete in ${completedPot.name} — start a new one, or close it.`, to: `/app/mgr/${completedPot.id}` }
+         : openArrearsCount > 0
+           ? { tone: 'gold', text: `${openArrearsCount} MGR arrear${openArrearsCount === 1 ? '' : 's'} to recover.`, to: '/app/mgr' }
+           : soleActivePot
+diff --git a/src/features/mgr/MgrPotDetail.tsx b/src/features/mgr/MgrPotDetail.tsx
+index 37047a4..27139dd 100644
+--- a/src/features/mgr/MgrPotDetail.tsx
++++ b/src/features/mgr/MgrPotDetail.tsx
+@@ -17,10 +17,12 @@ import {
+   mgrSettleArrear,
+   mgrWriteOffArrear,
+   mgrCoverShortfall,
+-  mgrProposeExit,
+-  mgrSettleExit,
++  mgrExitMember,
++  mgrSettleExitRefund,
++  mgrSettleExitClawback,
+   mgrRepairPot,
+   mgrCloseForever,
++  mgrStartNewCycle,
+   generateStatement,
+ } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+@@ -28,15 +30,21 @@ import { kes } from '../../lib/money';
+ import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
+ import { Spinner } from '../../components/Spinner';
+ import { AdminChargeButton } from '../payments/AdminChargeButton';
+-import type { MgrArrear, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
++import type { MgrArrear, MgrExit, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
+ 
+ const STATUS_COPY: Record<MgrPot['status'], string> = {
+   draft: 'Draft — draw not run yet',
+   active: 'Active',
+-  completed: 'Round complete',
++  completed: 'Cycle complete',
+   closed: 'Closed',
+ };
+ 
++const FINAL_POLICY_COPY: Record<'split' | 'carry_over' | 'close_early', string> = {
++  split: "This pot splits whatever's collected evenly across who's left.",
++  carry_over: 'This pot pays everyone their full share, then starts a new cycle automatically.',
++  close_early: 'This pot pays everyone their full share, then rests once this cycle is done.',
++};
++
+ export default function MgrPotDetail() {
+   const { potId } = useParams<{ potId: string }>();
+   const { chamaId, isFinanceAdmin } = useChama();
+@@ -45,15 +53,24 @@ export default function MgrPotDetail() {
+   const [records, setRecords] = useState<MgrRecord[]>([]);
+   const [arrears, setArrears] = useState<MgrArrear[]>([]);
+   const [payouts, setPayouts] = useState<MgrPayout[]>([]);
++  const [exits, setExits] = useState<MgrExit[]>([]);
+   const [busyKey, setBusyKey] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
++  const [infoMsg, setInfoMsg] = useState<string | null>(null);
+   const [payoutInfo, setPayoutInfo] = useState<{ recipients: string[]; shareEach: number; poolShortfall: number } | null>(null);
+ 
+   // Queue reorder editor — only committed to the server on "Save order".
+   const [queueDraft, setQueueDraft] = useState<string[] | null>(null);
+   const [addPicker, setAddPicker] = useState<string[] | null>(null); // non-null while "Add members" modal is open
+-  const [exitFor, setExitFor] = useState<{ memberId: string; exitId: string; proposedNet: number; grossNet: number } | null>(null);
++  // Confirm-before-removing modal — mirrors the demo's openMgrRemoveMember:
++  // shows what this member has contributed/received (computed client-side
++  // from records/payouts we already have) and lets the cut % be overridden
++  // for this one removal, before mgrExitMember actually takes them out.
++  const [exitConfirmFor, setExitConfirmFor] = useState<{ memberId: string; contributed: number; received: number } | null>(null);
++  const [exitCutInput, setExitCutInput] = useState<number>(0);
++  const [settleRefundId, setSettleRefundId] = useState<string | null>(null);
++  const [settleClawbackId, setSettleClawbackId] = useState<string | null>(null);
+   const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
+   const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
+   const [shortfallAmount, setShortfallAmount] = useState<number>(0);
+@@ -77,16 +94,21 @@ export default function MgrPotDetail() {
+     const unsub4 = onSnapshot(collection(db, paths.mgrPayouts(chamaId, potId)), (snap) => {
+       setPayouts(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrPayout));
+     });
++    const unsub5 = onSnapshot(collection(db, paths.mgrExits(chamaId, potId)), (snap) => {
++      setExits(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as MgrExit));
++    });
+     return () => {
+       unsub1();
+       unsub2();
+       unsub3();
+       unsub4();
++      unsub5();
+     };
+   }, [chamaId, potId]);
+ 
+   const findings = useMemo(() => (pot ? healthCheck(pot, arrears) : []), [pot, arrears]);
+   const openArrears = arrears.filter((a) => a.status === 'open');
++  const openExits = exits.filter((x) => x.status === 'open');
+ 
+   if (!pot || !chamaId || !potId) return <p className="text-forest-900/60">Loading…</p>;
+ 
+@@ -125,9 +147,10 @@ export default function MgrPotDetail() {
+     });
+ 
+   const payout = () =>
+-    run('payout', () => recordMgrPayoutCash({ chamaId: cid, potId: pid, acknowledgeShortfall }), () => {
++    run('payout', () => recordMgrPayoutCash({ chamaId: cid, potId: pid, acknowledgeShortfall }), (res) => {
+       setPayoutInfo(null);
+       setAcknowledgeShortfall(false);
++      if (res.cycleStarted) setInfoMsg(`Everyone's been paid — cycle ${res.cycleStarted} started automatically. Run the draw to set the new order.`);
+     });
+ 
+   const coverShortfall = () =>
+@@ -169,14 +192,36 @@ export default function MgrPotDetail() {
+     setQueueDraft(q);
+   };
+ 
+-  const proposeExit = (memberId: string) =>
+-    run(`propose-${memberId}`, () => mgrProposeExit({ chamaId: cid, potId: pid, memberId }), (r) =>
+-      setExitFor({ memberId, exitId: r.exitId, proposedNet: r.proposedNet, grossNet: r.grossNet })
++  // Client-side projection of what a member has contributed/received this
++  // cycle — same read-only "trusted preview" pattern as lateScore/
++  // recentReliability above; mgrExitMember re-derives the real numbers
++  // server-side rather than trusting this. Lets the confirm dialog show
++  // real figures without a round trip, mirroring the demo's
++  // openMgrRemoveMember.
++  function memberExitPreview(memberId: string) {
++    const contributed = records.filter((r) => r.memberId === memberId && r.status === 'paid').reduce((s, r) => s + r.amount, 0);
++    const received = payouts.filter((p) => p.memberId === memberId).reduce((s, p) => s + p.amount, 0);
++    return { contributed: Math.round(contributed * 100) / 100, received: Math.round(received * 100) / 100 };
++  }
++
++  const openExitConfirm = (memberId: string) => {
++    setExitCutInput(pot.exitCutPercent ?? 0);
++    setExitConfirmFor({ memberId, ...memberExitPreview(memberId) });
++  };
++
++  const confirmExit = () =>
++    exitConfirmFor &&
++    run(
++      `exit-${exitConfirmFor.memberId}`,
++      () => mgrExitMember({ chamaId: cid, potId: pid, memberId: exitConfirmFor.memberId, cutPercent: exitCutInput }),
++      () => setExitConfirmFor(null)
+     );
+ 
+-  const settleExit = () =>
+-    exitFor &&
+-    run('settleExit', () => mgrSettleExit({ chamaId: cid, potId: pid, exitId: exitFor.exitId }), () => setExitFor(null));
++  const settleRefund = (exitId: string, amount: number) =>
++    run(`settleRefund-${exitId}`, () => mgrSettleExitRefund({ chamaId: cid, potId: pid, exitId, amount }), () => setSettleRefundId(null));
++
++  const settleClawback = (exitId: string, amount: number) =>
++    run(`settleClawback-${exitId}`, () => mgrSettleExitClawback({ chamaId: cid, potId: pid, exitId, amount }), () => setSettleClawbackId(null));
+ 
+   const settleArrear = (arrearId: string, amount?: number) =>
+     run(`settleArrear-${arrearId}`, () => mgrSettleArrear({ chamaId: cid, potId: pid, arrearId, amount }), () => setSettleArrearId(null));
+@@ -184,6 +229,11 @@ export default function MgrPotDetail() {
+   const writeOffArrear = (arrearId: string, reason: string) =>
+     run(`writeOff-${arrearId}`, () => mgrWriteOffArrear({ chamaId: cid, potId: pid, arrearId, reason }), () => setWriteOffArrearId(null));
+ 
++  const startNewCycle = () => {
++    if (!confirm(`Start cycle ${(pot.cycleNumber ?? 1) + 1} of "${pot.name}"? Everyone goes back into the queue for a fresh draw.`)) return;
++    run('newCycle', () => mgrStartNewCycle({ chamaId: cid, potId: pid }), (r) => setInfoMsg(`Cycle ${r.cycleNumber} started — run the draw to set the new order.`));
++  };
++
+   const toggleReminders = async () => {
+     setBusyKey('reminders');
+     setError(null);
+@@ -320,35 +370,25 @@ export default function MgrPotDetail() {
+           <p className="text-sm text-forest-900/70 mt-1">
+             {payoutInfo.recipients.map((m) => memberName(members, m)).join(', ')} — {kes(payoutInfo.shareEach)} each
+           </p>
+-          {short && pot.finalRoundPolicy === 'close_early' ? (
+-            <div className="mt-3 flex flex-col gap-2">
+-              <p className="text-xs text-forest-900/60">This pot is set to close instead of paying out a short final round.</p>
+-              <button onClick={closeForever} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start flex items-center gap-2">
+-                {busyKey === 'closeForever' && <Spinner />} Close this pot instead
+-              </button>
+-            </div>
+-          ) : (
+-            <>
+-              {short && pot.finalRoundPolicy === 'carry_over' && (
+-                <p className="text-xs text-forest-900/60 mt-2">
+-                  This pot is set to carry a short round over rather than force a partial payout — pay out now, or leave this and come back once more contributions land.
+-                </p>
+-              )}
+-              {payoutInfo.poolShortfall > 0 && (
+-                <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
+-                  <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
+-                  <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
+-                </label>
+-              )}
+-              <button
+-                onClick={payout}
+-                disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
+-                className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
+-              >
+-                {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
+-              </button>
+-            </>
++          {short && (
++            <p className="text-xs text-forest-900/60 mt-2">
++              {FINAL_POLICY_COPY[pot.finalRoundPolicy ?? 'split']}
++              {pot.finalRoundPolicy && pot.finalRoundPolicy !== 'split' ? ' Paid in full — never a reduced split.' : ''}
++            </p>
++          )}
++          {payoutInfo.poolShortfall > 0 && (
++            <label className="flex items-start gap-2 text-xs text-brick-500 bg-brick-50 rounded-lg p-2 mt-2">
++              <input type="checkbox" checked={acknowledgeShortfall} onChange={(e) => setAcknowledgeShortfall(e.target.checked)} className="mt-0.5" />
++              <span>This round is short by {kes(payoutInfo.poolShortfall)} and it hasn't been covered yet — pay out anyway.</span>
++            </label>
+           )}
++          <button
++            onClick={payout}
++            disabled={!!busyKey || (payoutInfo.poolShortfall > 0 && !acknowledgeShortfall)}
++            className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2"
++          >
++            {busyKey === 'payout' && <Spinner />} {busyKey === 'payout' ? 'Paying…' : 'Confirm cash payout'}
++          </button>
+         </div>
+       )}
+ 
+@@ -401,7 +441,7 @@ export default function MgrPotDetail() {
+                             <button onClick={() => removeMember(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
+                               Remove
+                             </button>
+-                            <button onClick={() => proposeExit(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
++                            <button onClick={() => openExitConfirm(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
+                               Exit
+                             </button>
+                           </div>
+@@ -475,6 +515,16 @@ export default function MgrPotDetail() {
+         </>
+       )}
+ 
++      {pot.status === 'completed' && isFinanceAdmin && (
++        <div className="card p-4 border-forest-300 ring-1 ring-forest-200">
++          <h3 className="font-display font-semibold">Cycle {pot.cycleNumber} complete</h3>
++          <p className="text-sm text-forest-900/70 mt-1">Everyone's had their turn. Start a new cycle to keep this merry-go-round running — records, arrears and reliability history all carry over — or close it for good below.</p>
++          <button onClick={startNewCycle} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-3 flex items-center gap-2">
++            {busyKey === 'newCycle' && <Spinner />} Start cycle {(pot.cycleNumber ?? 1) + 1}
++          </button>
++        </div>
++      )}
++
+       {openArrears.length > 0 && isFinanceAdmin && (
+         <div className="card p-4">
+           <h3 className="font-display font-semibold text-sm">Open arrears</h3>
+@@ -500,6 +550,43 @@ export default function MgrPotDetail() {
+         </div>
+       )}
+ 
++      {openExits.length > 0 && isFinanceAdmin && (
++        <div className="card p-4">
++          <h3 className="font-display font-semibold text-sm">Open exits</h3>
++          <ul className="mt-2 divide-y divide-forest-50">
++            {openExits.map((x) => {
++              const refundOutstanding = Math.round((x.refundDue - x.refundPaid) * 100) / 100;
++              const clawbackOutstanding = Math.round((x.clawbackDue - x.clawbackRecovered) * 100) / 100;
++              return (
++                <li key={x.id} className="py-2.5 flex flex-col gap-1.5 text-sm">
++                  <span className="font-medium">{memberName(members, x.memberId)}</span>
++                  {refundOutstanding > 0.01 && (
++                    <span className="flex flex-wrap items-center justify-between gap-2">
++                      <span className="text-forest-900/60">Refund owed to them — {kes(refundOutstanding)} left{x.cutAmount > 0 ? ` (${x.exitCutPercent}% cut already withheld)` : ''}</span>
++                      {settleRefundId === x.id ? (
++                        <SettleArrearForm amount={refundOutstanding} busy={busyKey === `settleRefund-${x.id}`} onCancel={() => setSettleRefundId(null)} onSubmit={(amt) => settleRefund(x.id, amt)} />
++                      ) : (
++                        <button onClick={() => setSettleRefundId(x.id)} className="text-xs font-semibold text-forest-700">Pay refund</button>
++                      )}
++                    </span>
++                  )}
++                  {clawbackOutstanding > 0.01 && (
++                    <span className="flex flex-wrap items-center justify-between gap-2">
++                      <span className="text-forest-900/60">Owed back to the pot — {kes(clawbackOutstanding)} left</span>
++                      {settleClawbackId === x.id ? (
++                        <SettleArrearForm amount={clawbackOutstanding} busy={busyKey === `settleClawback-${x.id}`} onCancel={() => setSettleClawbackId(null)} onSubmit={(amt) => settleClawback(x.id, amt)} />
++                      ) : (
++                        <button onClick={() => setSettleClawbackId(x.id)} className="text-xs font-semibold text-forest-700">Record recovery</button>
++                      )}
++                    </span>
++                  )}
++                </li>
++              );
++            })}
++          </ul>
++        </div>
++      )}
++
+       {isFinanceAdmin && (records.length > 0 || payouts.length > 0) && (
+         <div className="card p-4">
+           <h3 className="font-display font-semibold text-sm">Books</h3>
+@@ -546,6 +633,7 @@ export default function MgrPotDetail() {
+ 
+       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+       {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
++      {infoMsg && <p className="text-sm text-forest-700 font-medium">{infoMsg}</p>}
+ 
+       {addPicker !== null && (
+         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setAddPicker(null)}>
+@@ -574,24 +662,33 @@ export default function MgrPotDetail() {
+         </div>
+       )}
+ 
+-      {exitFor && (
+-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setExitFor(null)}>
++      {exitConfirmFor && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setExitConfirmFor(null)}>
+           <div className="bg-white rounded-2xl shadow-xl max-w-sm w-full p-5 flex flex-col gap-3" onClick={(e) => e.stopPropagation()}>
+-            <h3 className="font-semibold text-forest-900">Exit {memberName(members, exitFor.memberId)}</h3>
++            <h3 className="font-semibold text-forest-900">Remove {memberName(members, exitConfirmFor.memberId)}?</h3>
+             <p className="text-sm text-forest-900/70">
+-              {exitFor.proposedNet >= 0
+-                ? <>The pot owes them <strong>{kes(exitFor.proposedNet)}</strong> (paid in more than they've received).</>
+-                : <>They owe the pot <strong>{kes(Math.abs(exitFor.proposedNet))}</strong> (received a payout already).</>}
++              They leave the pot right away — the pool, share and queue recalculate around whoever's left. Their refund and any recovery are settled afterward, at your own pace, from the Open exits card.
+             </p>
+-            {exitFor.grossNet !== exitFor.proposedNet && (
+-              <p className="text-xs text-forest-900/50">
+-                Before this pot's {pot.exitCutPercent}% exit cut, the refund would have been {kes(exitFor.grossNet)}.
+-              </p>
+-            )}
++            <div className="bg-forest-50/70 rounded-lg p-3 text-xs flex flex-col gap-1">
++              <div className="flex justify-between"><span>Contributed so far</span><span className="font-medium num">{kes(exitConfirmFor.contributed)}</span></div>
++              <div className="flex justify-between"><span>Payouts already received</span><span className="font-medium num">{kes(exitConfirmFor.received)}</span></div>
++            </div>
++            <label className="flex items-center gap-2 text-xs font-semibold text-forest-800">
++              Cut on refund
++              <input
++                type="number"
++                min={0}
++                max={100}
++                value={exitCutInput}
++                onChange={(e) => setExitCutInput(Number(e.target.value))}
++                className="w-20 border border-forest-200 rounded-lg px-2 py-1.5 text-sm font-normal"
++              />
++              <span className="font-normal text-forest-900/45">% — refund is chased down from the Open exits card</span>
++            </label>
+             <div className="flex gap-2 justify-end pt-1">
+-              <button onClick={() => setExitFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
+-              <button onClick={settleExit} disabled={busyKey === 'settleExit'} className="btn-primary text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
+-                {busyKey === 'settleExit' && <Spinner />} Confirm & remove
++              <button onClick={() => setExitConfirmFor(null)} className="text-xs font-semibold px-3 py-1.5 rounded-full text-forest-900/60 hover:bg-forest-50">Cancel</button>
++              <button onClick={confirmExit} disabled={busyKey === `exit-${exitConfirmFor.memberId}`} className="bg-brick-500 hover:bg-brick-600 text-white text-xs font-semibold px-4 py-1.5 rounded-full flex items-center gap-2">
++                {busyKey === `exit-${exitConfirmFor.memberId}` && <Spinner />} Remove
+               </button>
+             </div>
+           </div>
+diff --git a/src/features/mgr/MgrPots.tsx b/src/features/mgr/MgrPots.tsx
+index eb261d6..d3dd24a 100644
+--- a/src/features/mgr/MgrPots.tsx
++++ b/src/features/mgr/MgrPots.tsx
+@@ -210,9 +210,9 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         If the last round doesn't fill
+         <select value={finalRoundPolicy} onChange={(e) => setFinalRoundPolicy(e.target.value as typeof finalRoundPolicy)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
+-          <option value="split">Split what's collected evenly</option>
+-          <option value="carry_over">Let it run an extra period instead of a partial payout</option>
+-          <option value="close_early">Close the pot instead of a partial payout</option>
++          <option value="split">Split what's collected evenly — fewer members just share a smaller pool</option>
++          <option value="carry_over">Pay everyone their full share, then start a new cycle automatically</option>
++          <option value="close_early">Pay everyone their full share, then rest once this cycle is done</option>
+         </select>
+       </label>
+       <label className="flex items-center gap-2 text-sm font-medium">
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index d1bc35b..0c51fc7 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -206,7 +206,7 @@ export const closeMgrPeriod = callable<
+ /** Added beyond the original Phase 2 contract — see mychama/mgr.py's docstring. */
+ export const recordMgrPayoutCash = callable<
+   { chamaId: string; potId: string; acknowledgeShortfall?: boolean },
+-  { ok: true; paidTo: string[]; amountEach: number }
++  { ok: true; paidTo: string[]; amountEach: number; cycleStarted?: number }
+ >('recordMgrPayoutCash', () => 'Record merry-go-round payout');
+ 
+ // -- MGR repair pass — membership, arrears, exits, shortfall, health -------
+@@ -246,16 +246,29 @@ export const mgrCoverShortfall = callable<
+   { ok: true; remaining: number }
+ >('mgrCoverShortfall', (r) => `Cover KES ${r.amount.toLocaleString()} merry-go-round shortfall`);
+ 
+-/** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
+-export const mgrProposeExit = liveCallable<
+-  { chamaId: string; potId: string; memberId: string },
+-  { exitId: string; proposedNet: number; grossNet: number }
+->('mgrProposeExit', 'Working out exit settlement');
++/**
++ * Removes a member from the pot IMMEDIATELY (their queue slot frees up
++ * right away) and opens two independent running balances — a refund the
++ * pot owes them and a clawback they owe the pot — settled afterward via
++ * mgrSettleExitRefund / mgrSettleExitClawback. Replaces the old
++ * propose-then-settle-in-full flow: an unsettled balance now shows
++ * persistently on the pot's "Open exits" card instead of disappearing
++ * the moment a confirmation dialog is closed.
++ */
++export const mgrExitMember = callable<
++  { chamaId: string; potId: string; memberId: string; reason?: string; cutPercent?: number },
++  { ok: true; exitId: string; refundDue: number; clawbackDue: number; cutAmount: number }
++>('mgrExitMember', () => 'Remove member from merry-go-round');
++
++export const mgrSettleExitRefund = callable<
++  { chamaId: string; potId: string; exitId: string; amount: number },
++  { ok: true; remaining: number; status: 'open' | 'settled' }
++>('mgrSettleExitRefund', (r) => `Pay KES ${r.amount.toLocaleString()} exit refund`);
+ 
+-export const mgrSettleExit = callable<
+-  { chamaId: string; potId: string; exitId: string; settledAmount?: number },
+-  { ok: true; settledAmount: number; settledDirection: 'pot_to_member' | 'member_to_pot' }
+->('mgrSettleExit', () => 'Settle merry-go-round exit');
++export const mgrSettleExitClawback = callable<
++  { chamaId: string; potId: string; exitId: string; amount: number },
++  { ok: true; remaining: number; status: 'open' | 'settled' }
++>('mgrSettleExitClawback', (r) => `Recover KES ${r.amount.toLocaleString()} on exit`);
+ 
+ export const mgrRepairPot = callable<{ chamaId: string; potId: string }, { ok: true; changed: boolean; queue: string[] }>(
+   'mgrRepairPot',
+@@ -267,6 +280,12 @@ export const mgrCloseForever = callable<{ chamaId: string; potId: string }, { ok
+   () => 'Close merry-go-round pot'
+ );
+ 
++/** Restarts a 'completed' pot for another cycle — fresh draw, same pot, records/arrears/exits/ledger all carry over. */
++export const mgrStartNewCycle = callable<{ chamaId: string; potId: string }, { ok: true; cycleNumber: number }>(
++  'mgrStartNewCycle',
++  () => 'Start a new merry-go-round cycle'
++);
++
+ // ---------------------------------------------------------------------------
+ // Phase 3 — Payments, SMS & Settlement
+ // ---------------------------------------------------------------------------
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 6c234b4..142c15d 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -149,7 +149,7 @@ export interface MgrPot {
+   autoDemoteLate: boolean;
+   /** % withheld from a departing member's refund on exit (0 = none). Never applied to what a member owes the pot. */
+   exitCutPercent?: number;
+-  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. */
++  /** How a round that can't split evenly across recipientsPerRound is handled — chosen at creation. 'carry_over' pays everyone their full standard share then starts a new cycle automatically; 'close_early' pays the same full share then rests as 'completed'; 'split' (default) divides whatever's collected evenly among who's left. */
+   finalRoundPolicy?: 'split' | 'carry_over' | 'close_early';
+   status: 'draft' | 'active' | 'completed' | 'closed';
+   cycleNumber: number;
+@@ -179,12 +179,16 @@ export interface MgrArrear {
+ export interface MgrExit {
+   id: string;
+   memberId: string;
+-  proposedNet: number;
+-  grossNet?: number;
+-  exitCutPercent?: number;
+-  status: 'proposed' | 'settled';
+-  settledAmount?: number;
+-  settledDirection?: 'pot_to_member' | 'member_to_pot';
++  reason: string;
++  contributed: number;
++  received: number;
++  exitCutPercent: number;
++  cutAmount: number;
++  refundDue: number;
++  refundPaid: number;
++  clawbackDue: number;
++  clawbackRecovered: number;
++  status: 'open' | 'settled';
+   createdAt: number;
+   updatedAt: number;
+ }
+@@ -199,11 +203,15 @@ export type MgrLedgerKind =
+   | 'shortfall_covered'
+   | 'member_added'
+   | 'member_removed'
++  | 'member_exited'
++  | 'exit_refund_paid'
++  | 'exit_recovered'
+   | 'exit_settled'
+   | 'queue_reordered'
+   | 'period_closed'
+   | 'pot_closed'
+-  | 'repaired';
++  | 'repaired'
++  | 'cycle_started';
+ 
+ export interface MgrLedgerEntry {
+   id: string;

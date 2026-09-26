@@ -52,10 +52,12 @@ from mychama.mgr import (  # noqa: E402,F401
     mgrSettleArrear,
     mgrWriteOffArrear,
     mgrCoverShortfall,
-    mgrProposeExit,
-    mgrSettleExit,
+    mgrExitMember,
+    mgrSettleExitRefund,
+    mgrSettleExitClawback,
     mgrRepairPot,
     mgrCloseForever,
+    mgrStartNewCycle,
 )
 
 # --- Phase 3: Payments, SMS & Settlement -----------------------------------

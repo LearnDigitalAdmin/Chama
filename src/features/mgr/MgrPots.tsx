@@ -210,9 +210,9 @@ function CreatePotForm({ chamaId, memberIds, onDone }: { chamaId: string; member
       <label className="flex flex-col gap-1 text-sm font-medium">
         If the last round doesn't fill
         <select value={finalRoundPolicy} onChange={(e) => setFinalRoundPolicy(e.target.value as typeof finalRoundPolicy)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
-          <option value="split">Split what's collected evenly</option>
-          <option value="carry_over">Let it run an extra period instead of a partial payout</option>
-          <option value="close_early">Close the pot instead of a partial payout</option>
+          <option value="split">Split what's collected evenly — fewer members just share a smaller pool</option>
+          <option value="carry_over">Pay everyone their full share, then start a new cycle automatically</option>
+          <option value="close_early">Pay everyone their full share, then rest once this cycle is done</option>
         </select>
       </label>
       <label className="flex items-center gap-2 text-sm font-medium">

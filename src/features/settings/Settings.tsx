@@ -14,12 +14,13 @@ export default function Settings() {
 }
 
 function AdminSettings() {
-  const { chama, chamaId, chamaReady, isFinanceAdmin } = useChama();
+  const { chama, chamaId, chamaReady, isFinanceAdmin, isTreasurer } = useChama();
   const { members } = useMembers(chamaId, true);
   const admins = members.filter((m) => m.isAdmin);
   const [name, setName] = useState('');
   const [motto, setMotto] = useState('');
   const [contributionAmount, setContributionAmount] = useState('');
+  const [openingBalance, setOpeningBalance] = useState('');
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,6 +31,7 @@ function AdminSettings() {
     setName(chama!.name);
     setMotto(chama!.motto ?? '');
     setContributionAmount(String(chama!.contributionAmount));
+    setOpeningBalance(String(chama!.openingBalance ?? 0));
     setEditing(true);
   }
 
@@ -37,12 +39,25 @@ function AdminSettings() {
     setBusy(true);
     setError(null);
     try {
+      // Two writes, not one: firestore.rules gates the balance separately
+      // from the rest of the chama profile (treasurer-only vs. any finance
+      // admin), so a single combined update would be rejected whenever a
+      // non-treasurer chair edits the profile alongside it.
       await updateDoc(doc(db, paths.chama(chamaId!)), {
         name: name.trim(),
         motto: motto.trim() || null,
         contributionAmount: Number(contributionAmount),
         updatedAt: Date.now(),
       });
+      if (isTreasurer) {
+        const newBalance = Number(openingBalance);
+        if (newBalance !== (chama!.openingBalance ?? 0)) {
+          await updateDoc(doc(db, paths.chama(chamaId!)), {
+            openingBalance: newBalance,
+            updatedAt: Date.now(),
+          });
+        }
+      }
       setEditing(false);
     } catch {
       setError("Couldn't save — please try again.");
@@ -82,6 +97,15 @@ function AdminSettings() {
               Contribution amount (KES / {chama.contributionCycle})
               <input type="number" value={contributionAmount} onChange={(e) => setContributionAmount(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
             </label>
+            {isTreasurer ? (
+              <label className="flex flex-col gap-1 text-sm font-medium">
+                Opening balance (KES)
+                <input type="number" min={0} value={openingBalance} onChange={(e) => setOpeningBalance(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+                <span className="text-xs font-normal text-forest-900/50">Only the treasurer can update this. Feeds directly into the Group balance on the dashboard.</span>
+              </label>
+            ) : (
+              <p className="text-xs text-forest-900/50">Opening balance (KES {chama.openingBalance?.toLocaleString('en-KE') ?? 0}) can only be updated by the treasurer.</p>
+            )}
             <div className="flex gap-2">
               <button onClick={save} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
                 {busy ? 'Saving…' : 'Save'}
@@ -104,6 +128,9 @@ function AdminSettings() {
             )}
             <p>
               <span className="text-forest-900/50">Contribution:</span> KES {chama.contributionAmount.toLocaleString('en-KE')} / {chama.contributionCycle}
+            </p>
+            <p>
+              <span className="text-forest-900/50">Opening balance:</span> KES {(chama.openingBalance ?? 0).toLocaleString('en-KE')}
             </p>
             <p>
               <span className="text-forest-900/50">Plan:</span> {PLANS[chama.plan].name}

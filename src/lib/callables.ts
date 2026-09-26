@@ -80,6 +80,8 @@ export const createChama = liveCallable<
     motto?: string;
     contributionAmount: number;
     contributionCycle: 'daily' | 'weekly' | 'monthly';
+    /** What the chama already had banked before joining the app. Defaults to 0 server-side. */
+    openingBalance?: number;
     adminName: string;
     adminPhone: string;
     adminIdNumber: string;
@@ -206,7 +208,7 @@ export const closeMgrPeriod = callable<
 /** Added beyond the original Phase 2 contract — see mychama/mgr.py's docstring. */
 export const recordMgrPayoutCash = callable<
   { chamaId: string; potId: string; acknowledgeShortfall?: boolean },
-  { ok: true; paidTo: string[]; amountEach: number }
+  { ok: true; paidTo: string[]; amountEach: number; cycleStarted?: number }
 >('recordMgrPayoutCash', () => 'Record merry-go-round payout');
 
 // -- MGR repair pass — membership, arrears, exits, shortfall, health -------
@@ -246,16 +248,29 @@ export const mgrCoverShortfall = callable<
   { ok: true; remaining: number }
 >('mgrCoverShortfall', (r) => `Cover KES ${r.amount.toLocaleString()} merry-go-round shortfall`);
 
-/** Not queueable: the admin is waiting on the computed net figure to decide how to settle. */
-export const mgrProposeExit = liveCallable<
-  { chamaId: string; potId: string; memberId: string },
-  { exitId: string; proposedNet: number; grossNet: number }
->('mgrProposeExit', 'Working out exit settlement');
+/**
+ * Removes a member from the pot IMMEDIATELY (their queue slot frees up
+ * right away) and opens two independent running balances — a refund the
+ * pot owes them and a clawback they owe the pot — settled afterward via
+ * mgrSettleExitRefund / mgrSettleExitClawback. Replaces the old
+ * propose-then-settle-in-full flow: an unsettled balance now shows
+ * persistently on the pot's "Open exits" card instead of disappearing
+ * the moment a confirmation dialog is closed.
+ */
+export const mgrExitMember = callable<
+  { chamaId: string; potId: string; memberId: string; reason?: string; cutPercent?: number },
+  { ok: true; exitId: string; refundDue: number; clawbackDue: number; cutAmount: number }
+>('mgrExitMember', () => 'Remove member from merry-go-round');
 
-export const mgrSettleExit = callable<
-  { chamaId: string; potId: string; exitId: string; settledAmount?: number },
-  { ok: true; settledAmount: number; settledDirection: 'pot_to_member' | 'member_to_pot' }
->('mgrSettleExit', () => 'Settle merry-go-round exit');
+export const mgrSettleExitRefund = callable<
+  { chamaId: string; potId: string; exitId: string; amount: number },
+  { ok: true; remaining: number; status: 'open' | 'settled' }
+>('mgrSettleExitRefund', (r) => `Pay KES ${r.amount.toLocaleString()} exit refund`);
+
+export const mgrSettleExitClawback = callable<
+  { chamaId: string; potId: string; exitId: string; amount: number },
+  { ok: true; remaining: number; status: 'open' | 'settled' }
+>('mgrSettleExitClawback', (r) => `Recover KES ${r.amount.toLocaleString()} on exit`);
 
 export const mgrRepairPot = callable<{ chamaId: string; potId: string }, { ok: true; changed: boolean; queue: string[] }>(
   'mgrRepairPot',
@@ -265,6 +280,12 @@ export const mgrRepairPot = callable<{ chamaId: string; potId: string }, { ok: t
 export const mgrCloseForever = callable<{ chamaId: string; potId: string }, { ok: true }>(
   'mgrCloseForever',
   () => 'Close merry-go-round pot'
+);
+
+/** Restarts a 'completed' pot for another cycle — fresh draw, same pot, records/arrears/exits/ledger all carry over. */
+export const mgrStartNewCycle = callable<{ chamaId: string; potId: string }, { ok: true; cycleNumber: number }>(
+  'mgrStartNewCycle',
+  () => 'Start a new merry-go-round cycle'
 );
 
 // ---------------------------------------------------------------------------

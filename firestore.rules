@@ -113,15 +113,30 @@ service cloud.firestore {
       // Plan, billing, settlement routing and SMS credits stay server-owned:
       // letting a client move settlementSplitCode would redirect the
       // chama's money, and letting it set `plan` directly would grant paid
-      // features without a completed payment.
-      allow update: if isFinanceAdmin(chamaId)
-                    && untouched([
-                         'plan', 'planExpiry',
-                         'settlementAccount', 'settlementSplitCode',
-                         'autoSettle', 'settlementFreq', 'lastSettlement',
-                         'smsCredits', 'minutesExportsUsedThisMonth',
-                         'status', 'createdAt'
-                       ]);
+      // features without a completed payment. openingBalance is carved out
+      // of this branch entirely — it's money, so like every other
+      // financial figure in this schema it's off limits to a chair acting
+      // alone; see the treasurer-only branch below.
+      allow update: if (
+                        isFinanceAdmin(chamaId)
+                        && untouched([
+                             'plan', 'planExpiry',
+                             'settlementAccount', 'settlementSplitCode',
+                             'autoSettle', 'settlementFreq', 'lastSettlement',
+                             'smsCredits', 'minutesExportsUsedThisMonth',
+                             'status', 'createdAt', 'openingBalance'
+                           ])
+                      ) || (
+                        // The treasurer alone corrects the chama's opening
+                        // balance — the one non-ledger figure the
+                        // dashboard's Group balance is seeded from (see
+                        // AdminDashboard.tsx). Nothing else may ride along
+                        // on this write.
+                        isTreasurer(chamaId)
+                        && onlyChanged(['openingBalance', 'updatedAt'])
+                        && isNumber(request.resource.data.openingBalance)
+                        && request.resource.data.openingBalance >= 0
+                      );
 
       allow delete: if false;
 
