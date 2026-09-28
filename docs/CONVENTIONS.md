@@ -72,10 +72,12 @@ invent a new prefix inline in a handler.
 | `MCA-` | App payment | `paymentIntents` | `mychama1` Python (`initiatePayment`) |
 | `MCS-` | SMS credit top-up | `smsTopUps` | `mychama1` Python (`purchaseSmsCredits`) |
 | `MCP-` | Plan billing | `planBilling` | `mychama1` Python (`upgradePlan`) |
+| `MCX-` | Reports-engine wallet top-up | `reportCreditTopUps` | `mychama1` Python (`purchaseReportCredits`) |
+| `MCR-` | Starter/Basic one-off premium report | `reportAlacartePurchases` | `mychama1` Python (`purchasePremiumReportAlaCarte`) |
 
 Format: `{PREFIX}-{chamaId}-{purposeCode}-{epochMs}-{rand6}` for
 `MCW-`/`MCA-` (purpose code is `CNT`/`LNR`/`MGR`); `{PREFIX}-{chamaId}-{epochMs}-{rand6}`
-(no purpose code) for `MCS-`/`MCP-`. Cash transactions use
+(no purpose code) for `MCS-`/`MCP-`/`MCX-`/`MCR-`. Cash transactions use
 `CASH{rand6}` (no chama/purpose encoded — cash never touches the webhook).
 
 ## 6. Firestore security rules are not optional in Python

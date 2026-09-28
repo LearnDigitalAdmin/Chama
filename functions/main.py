@@ -80,3 +80,12 @@ from mychama.billing import (  # noqa: E402,F401
     sweep_plan_expiry,
     reset_monthly_export_quota,
 )
+
+# --- Reports engine (this patch): Contribution Ledger, Arrears &
+#     Penalties, P&L, Balance Sheet + the wallet/à-la-carte purchase flows.
+#     See functions/shared/reports_engine.py and functions/mychama/reports.py. ---
+from mychama.reports import (  # noqa: E402,F401
+    generateReport,
+    purchaseReportCredits,
+    purchasePremiumReportAlaCarte,
+)

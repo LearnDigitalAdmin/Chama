@@ -9,6 +9,7 @@ import { kes } from '../../lib/money';
 import { contributionFees } from '../../lib/money';
 import { PLANS } from '../../lib/constants';
 import type { Contribution } from '../../lib/types';
+import MyStatementCard from '../reports/MyStatementCard';
 
 const STATUS_LABEL: Record<string, string> = { paid: 'Paid', partial: 'Partial', pending: 'Due', overdue: 'Overdue' };
 const STATUS_CLASS: Record<string, string> = {
@@ -50,6 +51,8 @@ export default function MyContributions() {
           </p>
         )}
       </div>
+
+      <MyStatementCard />
 
       <div className="card overflow-hidden">
         <div className="overflow-x-auto">

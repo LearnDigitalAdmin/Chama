@@ -40,6 +40,14 @@ def build_plan_billing_reference(chama_id: str) -> str:
     return f"{RefPrefix.PLAN_BILLING}-{chama_id}-{now_ms()}-{_rand6()}"
 
 
+def build_report_credit_topup_reference(chama_id: str) -> str:
+    return f"{RefPrefix.REPORT_CREDIT_TOPUP}-{chama_id}-{now_ms()}-{_rand6()}"
+
+
+def build_report_alacarte_reference(chama_id: str) -> str:
+    return f"{RefPrefix.REPORT_ALACARTE}-{chama_id}-{now_ms()}-{_rand6()}"
+
+
 def build_cash_reference() -> str:
     """For manual/cash transactions — mirrors the demo's 'CASH...' convention."""
     return "CASH" + _rand6()

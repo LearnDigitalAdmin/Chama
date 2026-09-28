@@ -64,7 +64,22 @@ class Chama(TypedDict):
     autoSettle: NotRequired[bool]
     settlementFreq: NotRequired[Frequency]
     lastSettlement: NotRequired[str]
-    minutesExportsUsedThisMonth: NotRequired[float]
+    # --- Reports engine (retires minutesExportsUsedThisMonth/minutesQuota —
+    #     see functions/shared/constants.py's PLANS docstring). A chama
+    #     provisioned before this patch has the OLD field instead; every
+    #     reader falls back to it — see reports_engine.standard_used(). ---
+    minutesExportsUsedThisMonth: NotRequired[float]  # LEGACY — pre-reports-engine name, read as a fallback only
+    standardReportsUsedThisMonth: NotRequired[float]
+    premiumReportsUsedThisMonth: NotRequired[float]
+    premiumAlacarteUsedThisMonth: NotRequired[int]
+    # Prepaid top-up wallet — spent as STANDARD credits on Starter/Basic,
+    # or PREMIUM credits on Growth/Max (see constants.py). Credited by the
+    # PAY repo's webhook on an MCX- reference succeeding.
+    reportCreditsBalance: NotRequired[float]
+    # 1-12; which month a chama's financial year starts (for the P&L /
+    # Balance Sheet "This/Last Financial Year" period presets). Defaults to
+    # 1 (January) when absent.
+    fiscalYearStartMonth: NotRequired[int]
     status: Literal["active", "suspended"]
     whatsappEnabled: NotRequired[bool]
     createdAt: NotRequired[int]
@@ -380,3 +395,47 @@ class Invite(TypedDict):
     claimedAt: NotRequired[int]
     claimedByUid: NotRequired[str]
     expiresAt: int
+
+
+class ReportCreditTopUp(TypedDict):
+    """
+    chamas/{chamaId}/reportCreditTopUps/{reference} — reports-engine wallet
+    top-up. Same shape/trust model as SmsTopUp (doc ID IS the payment
+    reference, prefix MCX-), settled by the PAY repo's webhook — see
+    functions/mychama/reports.py::purchaseReportCredits and TOUCH_BASE.md
+    "Reports engine — PAY-repo follow-up".
+    """
+    chamaId: str
+    credits: int              # how many wallet credits this purchase adds on success
+    amountKes: float
+    phone: str
+    status: Literal["pending", "success", "failed"]
+    createdAt: int
+    expiresAt: int
+    updatedAt: NotRequired[int]
+
+
+class ReportAlacartePurchase(TypedDict):
+    """
+    chamas/{chamaId}/reportAlacartePurchases/{reference} — Starter/Basic
+    one-off premium-report purchase (prefix MCR-). The report's parameters
+    are captured at purchase time so `generateReport` can find and consume
+    this doc once payment succeeds, without the caller having to resend
+    them. Counts against `chamas.premiumAlacarteUsedThisMonth` from the
+    moment it's CREATED (not from success) so a chama can't get around its
+    monthly cap by leaving several payments pending at once.
+    """
+    chamaId: str
+    reportType: str            # one of REPORT_TYPES' premium keys (cashflow / profit_loss / balance_sheet)
+    memberId: NotRequired[str]
+    dateFrom: NotRequired[str]
+    dateTo: NotRequired[str]
+    asOf: NotRequired[str]
+    format: Literal["pdf", "csv"]
+    encrypt: bool
+    amountKes: float
+    phone: str
+    status: Literal["pending", "success", "failed", "consumed"]
+    createdAt: int
+    expiresAt: int
+    updatedAt: NotRequired[int]

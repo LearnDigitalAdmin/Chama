@@ -34,7 +34,15 @@ export interface Chama {
   autoSettle?: boolean;
   settlementFreq?: 'daily' | 'weekly' | 'monthly';
   lastSettlement?: string;
+  /** LEGACY — pre-reports-engine field name, read as a fallback only. See PLANS docstring in src/lib/constants.ts. */
   minutesExportsUsedThisMonth?: number;
+  standardReportsUsedThisMonth?: number;
+  premiumReportsUsedThisMonth?: number;
+  premiumAlacarteUsedThisMonth?: number;
+  /** Prepaid report-credit wallet — spent as STANDARD credits on Starter/Basic, PREMIUM credits on Growth/Max. */
+  reportCreditsBalance?: number;
+  /** 1-12; defaults to 1 (January) when absent. */
+  fiscalYearStartMonth?: number;
   status: 'active' | 'suspended';
   whatsappEnabled?: boolean;
   createdAt?: number;
@@ -360,6 +368,36 @@ export interface Invite {
   claimedAt?: number;
   claimedByUid?: string;
   expiresAt: number;
+}
+
+/** chamas/{chamaId}/reportCreditTopUps/{reference} — prefix MCX-. See functions/shared/types.py. */
+export interface ReportCreditTopUp {
+  chamaId: string;
+  credits: number;
+  amountKes: number;
+  phone: string;
+  status: 'pending' | 'success' | 'failed';
+  createdAt: number;
+  expiresAt: number;
+  updatedAt?: number;
+}
+
+/** chamas/{chamaId}/reportAlacartePurchases/{reference} — prefix MCR-. See functions/shared/types.py. */
+export interface ReportAlacartePurchase {
+  chamaId: string;
+  reportType: string;
+  memberId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  asOf?: string;
+  format: 'pdf' | 'csv';
+  encrypt: boolean;
+  amountKes: number;
+  phone: string;
+  status: 'pending' | 'success' | 'failed' | 'consumed';
+  createdAt: number;
+  expiresAt: number;
+  updatedAt?: number;
 }
 
 export interface Minute {

@@ -364,11 +364,57 @@ export const upgradePlan = liveCallable<
 /**
  * Not queueable: generates and returns a document URL live.
  * Either a date-ranged statement (from/to/format, memberId optional for a
- * whole-chama statement) OR — a small, documented addition beyond the
- * original contract, see TOUCH_BASE.md "Billing & statements" — a single
- * minutes entry's PDF via minutesId, which ignores from/to/memberId.
+ * whole-chama statement — PREMIUM as of the reports engine, see
+ * REPORT_TYPES['cashflow'] in constants.ts) OR — a small, documented
+ * addition beyond the original contract, see TOUCH_BASE.md "Billing &
+ * statements" — a single minutes entry's PDF via minutesId, which ignores
+ * from/to/memberId. `alacarteReference` is only needed on Starter/Basic,
+ * to consume a purchase made with purchasePremiumReportAlaCarte first.
  */
 export const generateStatement = liveCallable<
-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string },
-  { url: string }
+  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string; period?: string; encrypt?: boolean; alacarteReference?: string },
+  { url: string; encrypted: boolean; pinSentTo: number; charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
 >('generateStatement', 'Generating statement');
+
+// ---------------------------------------------------------------------------
+// Reports engine (this patch) — Contribution Ledger, Arrears & Penalties,
+// P&L, Balance Sheet + the wallet/à la carte purchase flows. See
+// functions/shared/reports_engine.py and functions/mychama/reports.py.
+// ---------------------------------------------------------------------------
+
+/** Not queueable — same reasoning as generateStatement above. */
+export const generateReport = liveCallable<
+  {
+    chamaId: string;
+    reportType: 'contribution_ledger' | 'arrears_penalties' | 'profit_loss' | 'balance_sheet';
+    format: 'pdf' | 'csv';
+    period?: string; // preset key, e.g. 'this_month' | 'last_quarter' | 'this_fy' | 'custom' — see reports_engine.resolve_range
+    from?: string;
+    to?: string;
+    asOf?: string;
+    encrypt?: boolean;
+    alacarteReference?: string; // Starter/Basic consuming a paid purchase — see purchasePremiumReportAlaCarte
+  },
+  { url: string; encrypted: boolean; pinSentTo: number; charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
+>('generateReport', 'Generating report');
+
+/** Not queueable: live payment, mirrors purchaseSmsCredits exactly. Pass 1, 10 or 30 for a bundle rate — see REPORT_WALLET_BUNDLES. */
+export const purchaseReportCredits = liveCallable<
+  { chamaId: string; credits: number; phone: string },
+  { reference: string; amountKes: number }
+>('purchaseReportCredits', 'Starting report-credit top-up payment');
+
+/** Not queueable: live payment. Starter/Basic only — Growth/Max already have premiumReportCredits + the wallet. */
+export const purchasePremiumReportAlaCarte = liveCallable<
+  {
+    chamaId: string;
+    reportType: 'cashflow' | 'profit_loss' | 'balance_sheet';
+    format?: 'pdf' | 'csv';
+    phone: string;
+    memberId?: string;
+    from?: string;
+    to?: string;
+    asOf?: string;
+  },
+  { reference: string; amountKes: number }
+>('purchasePremiumReportAlaCarte', 'Starting one-off report payment');

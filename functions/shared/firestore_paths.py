@@ -143,3 +143,19 @@ def user_chama_membership(uid: str, chama_id: str) -> str:
 
 def user_chama_memberships(uid: str) -> str:
     return f"{MC.USER_CHAMAS}/{uid}/{MC.MEMBERSHIPS}"
+
+
+def report_credit_topups(chama_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_CREDIT_TOPUPS}"
+
+
+def report_credit_topup(chama_id: str, reference: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_CREDIT_TOPUPS}/{reference}"
+
+
+def report_alacarte_purchases(chama_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_ALACARTE_PURCHASES}"
+
+
+def report_alacarte_purchase(chama_id: str, reference: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_ALACARTE_PURCHASES}/{reference}"

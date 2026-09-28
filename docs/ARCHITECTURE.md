@@ -134,6 +134,46 @@ webhook — reference prefix `MCS-`, collection `smsTopUps`, credited to
 `chamas.smsCredits` on webhook success. Plan upgrades follow the identical
 pattern with prefix `MCP-` and collection `planBilling`.
 
+### Reports engine (exports & financial statements)
+
+One shared module, `functions/shared/reports_engine.py`, owns everything
+common to every report: period-preset resolution, the credit/wallet/
+à-la-carte charging gate (`spend_credits`, `consume_alacarte_purchase`),
+PDF encryption + the admin PIN SMS, and the data builders/renderers for the
+Contribution Ledger, Arrears & Penalties, P&L and Balance Sheet.
+`generateStatement` (member statement, whole-chama cashflow, minutes) and
+`generateReport` (the four builders above) both call into it — the client
+only ever picks a report and a period.
+
+- **Tiers.** *Standard* reports (member statement, contribution ledger,
+  arrears & penalties, minutes) are included from Starter up; *premium*
+  reports (cashflow, P&L, balance sheet) are Growth/Max only, with a
+  monthly premium allowance. Starter/Basic can still buy a premium report
+  one-off (capped per month) via `purchasePremiumReportAlaCarte`.
+  Source of truth: `PLANS` / `REPORT_TYPES` in `functions/shared/constants.py`
+  (mirrored in `src/lib/constants.ts` and `firestoreData.json`).
+- **Wallet.** `chamas.reportCreditsBalance` is credit-denominated (not KES,
+  unlike `smsCredits`). On Starter/Basic it covers standard reports beyond
+  the monthly allowance; on Growth/Max it covers premium reports.
+- **Prefixes.** `MCX-` (`reportCreditTopUps`) credits the wallet on webhook
+  success; `MCR-` (`reportAlacartePurchases`) only flips to `success` — the
+  callable then *consumes* it (`success` → `consumed`) when the report is
+  generated, so a paid purchase can't be redirected to other parameters.
+- **Encryption policy.** Member statements, P&L and balance sheets are
+  always PDF-only and PIN-protected. Contribution ledger, arrears and
+  cashflow are optionally protected (they're routinely shared to a group).
+  A 6-digit PIN (`secrets`, never logged, never returned by the API) is SMSed
+  to the chair and treasurer — or, for a member's own statement, to that
+  member — straight through `send_sms`, deliberately bypassing the
+  `smsCredits` debit (a security notice isn't a billable campaign).
+  Encryption is reportlab's built-in `StandardEncryption`; CSV can't carry
+  it, so CSV exports are unencrypted.
+- **Member self-service.** A member generating their *own* statement is free
+  on every plan (including Free) and costs the chama no credit.
+- **Offline.** Only the raw CSV dumps work offline (local Firestore cache).
+  Every computed report is a `liveCallable` — credit deduction needs a single
+  source of truth and PDF/PIN generation needs the server.
+
 ## 7. What's genuinely new vs. what already exists
 
 Already fully specified and must be reused as-is, not redesigned:
@@ -147,6 +187,7 @@ Already fully specified and must be reused as-is, not redesigned:
 Genuinely new for the live build (not in the original demo or the bot),
 introduced by this global package:
 - `invites` collection + claim flow (§3)
-- `MCA-`, `MCS-`, `MCP-` reference prefixes and their `smsTopUps` /
-  `planBilling` collections
+- `MCA-`, `MCS-`, `MCP-`, `MCX-`, `MCR-` reference prefixes and their
+  `smsTopUps` / `planBilling` / `reportCreditTopUps` /
+  `reportAlacartePurchases` collections
 - `userChamas/{uid}/memberships/{chamaId}` sync trigger

@@ -39,12 +39,29 @@
 
   "plans": {
     "order": ["free", "starter", "basic", "growth", "max"],
-    "free":    { "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": false, "onlineCollection": false },
-    "starter": { "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": true,  "onlineCollection": true },
-    "basic":   { "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "minutesQuota": 3,    "exportsAllowed": true,  "onlineCollection": true },
-    "growth":  { "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
-    "max":     { "price": 4990, "memberLimit": 999, "smsRate": 0.5, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
-    "minutesQuotaNull": "null means unlimited. Beyond quota, a minutes export costs KES 100."
+    "free":    { "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "exportsAllowed": false, "onlineCollection": false, "standardReportCredits": 0,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 0 },
+    "starter": { "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": 3,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 1 },
+    "basic":   { "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": 8,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 2 },
+    "growth":  { "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": null, "premiumReportCredits": 4,  "premiumAlacarteCapPerMonth": null },
+    "max":     { "price": 4990, "memberLimit": 999, "smsRate": 0.5, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": null, "premiumReportCredits": 10, "premiumAlacarteCapPerMonth": null },
+    "note": "minutesQuota/minutesExportsUsedThisMonth (pre-reports-engine) retired in favour of standardReportCredits/premiumReportCredits/premiumAlacarteCapPerMonth — see functions/shared/constants.py's PLANS docstring. null = unlimited."
+  },
+
+  "reportCatalog": {
+    "note": "See functions/shared/constants.py REPORT_TYPES for the authoritative version this must stay identical to. All KES prices include the standing 20% launch discount.",
+    "walletCreditPriceKes": 56,
+    "walletBundle10Kes": 504,
+    "walletBundle30Kes": 1400,
+    "premiumAlacarteCreditPriceKes": 144,
+    "reports": {
+      "member_statement":    { "label": "Individual Member Statement",           "tier": "standard", "credits": 1, "periodMode": "range", "encryptDefault": true,  "encryptOptional": false },
+      "contribution_ledger": { "label": "Contribution Summary & Tracking Ledger", "tier": "standard", "credits": 1, "periodMode": "range", "encryptDefault": false, "encryptOptional": true },
+      "arrears_penalties":   { "label": "Arrears & Penalties Report",            "tier": "standard", "credits": 2, "periodMode": "as_of", "encryptDefault": false, "encryptOptional": true },
+      "minutes":             { "label": "Meeting Minutes Export",                "tier": "standard", "credits": 1, "periodMode": "single", "encryptDefault": false, "encryptOptional": false },
+      "cashflow":            { "label": "Cashflow Statement",                    "tier": "premium",  "credits": 2, "periodMode": "range", "encryptDefault": false, "encryptOptional": true },
+      "profit_loss":         { "label": "Profit & Loss Statement",               "tier": "premium",  "credits": 3, "periodMode": "range", "encryptDefault": true,  "encryptOptional": false },
+      "balance_sheet":       { "label": "Balance Sheet",                         "tier": "premium",  "credits": 3, "periodMode": "as_of", "encryptDefault": true,  "encryptOptional": false }
+    }
   },
 
   "collections": {
@@ -67,7 +84,12 @@
         "autoSettle": { "type": "boolean" },
         "settlementFreq": { "type": "string", "enum": ["daily", "weekly", "monthly"] },
         "lastSettlement": { "type": "string", "format": "YYYY-MM-DD" },
-        "minutesExportsUsedThisMonth": { "type": "number" },
+        "minutesExportsUsedThisMonth": { "type": "number", "note": "LEGACY — pre-reports-engine name, kept as a read fallback only. See standardReportsUsedThisMonth." },
+        "standardReportsUsedThisMonth": { "type": "number" },
+        "premiumReportsUsedThisMonth": { "type": "number" },
+        "premiumAlacarteUsedThisMonth": { "type": "number", "note": "Starter/Basic only — counts toward premiumAlacarteCapPerMonth, reserved at purchase time." },
+        "reportCreditsBalance": { "type": "number", "note": "Prepaid wallet — spent as STANDARD credits on Starter/Basic, PREMIUM credits on Growth/Max. Credited by the PAY repo's webhook on an MCX- reference succeeding." },
+        "fiscalYearStartMonth": { "type": "number", "note": "1-12, defaults to 1 (January) when absent." },
         "status": { "type": "string", "enum": ["active", "suspended"], "required": true, "note": "The bot skips suspended chamas during membership lookup." },
         "whatsappEnabled": { "type": "boolean", "default": true },
         "createdAt": { "type": "number" },

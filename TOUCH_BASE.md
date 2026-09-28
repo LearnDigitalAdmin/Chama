@@ -304,6 +304,28 @@ Paystack/HostPinnacle sandbox access, no PAY-repo access):
    against the live project; it isn't expressible in any file in this
    repo, which is why it was never done.
 4. **Verify the PAY repo's `MCP-` webhook branch** — see §5.
+4a. **Reports engine — PAY-repo follow-up.** `MCX-` (wallet top-up) and
+   `MCR-` (Starter/Basic one-off) must be handled by the PAY repo's
+   `paystackCallback`. The companion patch `PAY_reports_engine_webhook.patch`
+   adds `handleMyChamaReportCreditTopup` / `handleMyChamaReportAlacarte`, the
+   `determineChargeType` entries and the `charge.failed` branch. Until it is
+   deployed, an MCX-/MCR- payment succeeds at Paystack but credits nothing.
+   Also mirror the new `PLANS` fields into CYBER's `mychama.config.ts`
+   (`standardReportCredits`, `premiumReportCredits`, `premiumAlacarteCapPerMonth`;
+   `minutesQuota` is retired).
+4b. **Reports engine — known limitations (deliberate, documented in code):**
+   (i) P&L loan-interest income is *apportioned* from blended repayments —
+   installments carry no per-payment timestamp; (ii) balance-sheet loan
+   receivables use current `paidAmount`, not a historical reconstruction, and
+   retained earnings is a labelled balancing figure; (iii) no penalty-fee
+   field exists in the schema, so the "Penalties" section of the arrears
+   report says so instead of inventing numbers; (iv) CSV exports can't be
+   encrypted; (v) `fiscalYearStartMonth` defaults to 1 and has no settings UI
+   yet. Existing chamas still carry `minutesExportsUsedThisMonth`; readers fall
+   back to it, and the monthly sweep resets both.
+4c. **Behaviour changes to confirm:** a whole-chama statement is now premium
+   (Growth/Max, or a one-off) instead of any paid plan; a member's own
+   statement is free on every plan, including Free.
 5. **Decide on Firebase App Check** for the callable functions — nothing
    in this repo enables it. Not a blocker, but worth a decision before a
    real launch, since callable functions are otherwise reachable by

@@ -298,12 +298,53 @@ Response: { reference: string } | { ok: true }
 
 ### `generateStatement`
 Caller: finance admin (any member scope) or the member themself
-(`memberId` must equal caller's own). Enforces
-`PLANS[plan].exportsAllowed` and `minutesQuota` /
-`minutesExportsUsedThisMonth`.
+(`memberId` must equal caller's own). Report type is inferred: `minutesId` →
+`minutes`; `memberId` → `member_statement`; neither → `cashflow` (whole chama,
+**premium**). A member's own statement is **free on every plan** and costs no
+credit. Otherwise charged through `reports_engine.spend_credits` (monthly
+allowance → wallet), or by consuming an `alacarteReference` on Starter/Basic.
+Give either a `period` preset (`this_month` | `last_month` | `this_quarter` |
+`last_quarter` | `this_fy` | `last_fy` | `custom`) or explicit `from`/`to`.
 
 ```ts
-Request:  { chamaId: string; memberId?: string; from: string; to: string; format: 'pdf'|'csv' }
-Response: { url: string }
-Errors:   failed-precondition (exports not allowed on this plan, or quota exhausted)
+Request:  { chamaId: string; memberId?: string; period?: string; from?: string; to?: string;
+            format: 'pdf'|'csv'; minutesId?: string; potId?: string;
+            encrypt?: boolean; alacarteReference?: string }
+Response: { url: string; encrypted: boolean; pinSentTo: number;
+            charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
+Errors:   failed-precondition (plan doesn't offer it / no à la carte purchase), resource-exhausted (credits used up)
+```
+The PIN is never in the response — it is SMSed only.
+
+### `generateReport`
+Caller: finance admin. `reportType`: `contribution_ledger` | `arrears_penalties`
+| `profit_loss` | `balance_sheet`. `arrears_penalties` and `balance_sheet` are
+point-in-time (`asOf` or `period`: `today`/`last_month`/`last_quarter`/`last_fy`/`custom`);
+the others are ranges. `profit_loss` and `balance_sheet` are PDF-only and always encrypted.
+
+```ts
+Request:  { chamaId: string; reportType: string; format: 'pdf'|'csv'; period?: string;
+            from?: string; to?: string; asOf?: string; encrypt?: boolean; alacarteReference?: string }
+Response: same as generateStatement
+```
+
+### `purchaseReportCredits`
+Caller: finance admin. Wallet top-up (prefix `MCX-`). `credits` of 1, 10 or 30
+use the bundle price (`REPORT_WALLET_BUNDLES`).
+```ts
+Request:  { chamaId: string; credits: number; phone: string }
+Response: { reference: string; amountKes: number }
+```
+
+### `purchasePremiumReportAlaCarte`
+Caller: finance admin, Starter/Basic only (capped per month —
+`PLANS[plan].premiumAlacarteCapPerMonth`, reserved at purchase time). Prefix
+`MCR-`. Periods are resolved and frozen at purchase time. After
+`reportAlacartePurchases/{reference}.status` becomes `success`, pass the
+reference as `alacarteReference` to `generateStatement` (cashflow) or
+`generateReport` (P&L, balance sheet).
+```ts
+Request:  { chamaId: string; reportType: 'cashflow'|'profit_loss'|'balance_sheet'; format?: 'pdf'|'csv';
+            phone: string; period?: string; from?: string; to?: string; asOf?: string }
+Response: { reference: string; amountKes: number }
 ```

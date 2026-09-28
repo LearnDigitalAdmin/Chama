@@ -124,6 +124,8 @@ service cloud.firestore {
                              'settlementAccount', 'settlementSplitCode',
                              'autoSettle', 'settlementFreq', 'lastSettlement',
                              'smsCredits', 'minutesExportsUsedThisMonth',
+                             'standardReportsUsedThisMonth', 'premiumReportsUsedThisMonth',
+                             'premiumAlacarteUsedThisMonth', 'reportCreditsBalance',
                              'status', 'createdAt', 'openingBalance'
                            ])
                       ) || (
@@ -468,6 +470,24 @@ service cloud.firestore {
       // -------------------------------------------------------------- //
 
       match /planBilling/{reference} {
+        allow read: if isFinanceAdmin(chamaId);
+        allow write: if false;
+      }
+
+      // -------------------------------------------------------------- //
+      // reportCreditTopUps / reportAlacartePurchases — reports engine
+      // (this patch). Same trust model as smsTopUps/planBilling exactly:
+      // server-written (purchaseReportCredits / purchasePremiumReportAlaCarte),
+      // settled by the PAY repo's webhook, finance-admin-only read since
+      // neither is tied to one member.
+      // -------------------------------------------------------------- //
+
+      match /reportCreditTopUps/{reference} {
+        allow read: if isFinanceAdmin(chamaId);
+        allow write: if false;
+      }
+
+      match /reportAlacartePurchases/{reference} {
         allow read: if isFinanceAdmin(chamaId);
         allow write: if false;
       }

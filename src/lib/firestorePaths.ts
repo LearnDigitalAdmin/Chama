@@ -55,4 +55,8 @@ export const paths = {
 
   userChamaMembership: (uid: string, chamaId: string) => `${MC.USER_CHAMAS}/${uid}/${MC.MEMBERSHIPS}/${chamaId}`,
   userChamaMemberships: (uid: string) => `${MC.USER_CHAMAS}/${uid}/${MC.MEMBERSHIPS}`,
+  reportCreditTopUps: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_CREDIT_TOPUPS}`,
+  reportCreditTopUp: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_CREDIT_TOPUPS}/${reference}`,
+  reportAlacartePurchases: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_ALACARTE_PURCHASES}`,
+  reportAlacartePurchase: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_ALACARTE_PURCHASES}/${reference}`,
 };
