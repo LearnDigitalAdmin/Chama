@@ -1,0 +1,694 @@
+diff --git a/docs/API_CONTRACT.md b/docs/API_CONTRACT.md
+index 45b005c..e001c11 100644
+--- a/docs/API_CONTRACT.md
++++ b/docs/API_CONTRACT.md
+@@ -267,14 +267,20 @@ Response: { reference: string }
+ ```
+ 
+ ### `sendSmsCampaign`
+-Caller: `chair`/`treasurer`/`secretary`. Debits `smsCredits` at
+-`PLANS[plan].smsRate` per message before calling HostPinnacle directly.
++Caller: `chair`/`treasurer`/`secretary`. Debits `smsCredits` at 1 credit
++per SMS segment per recipient (140/270/385-char breakpoints, 3-segment
++hard cap) before calling HostPinnacle directly — flat across every plan
++tier. `PLANS[plan].smsRate` is a *different* number (the KES price per
++credit at top-up time) and plays no part in this charge. Message content
++is restricted to GSM-7-safe characters and WhatsApp-only links.
+ 
+ ```ts
+ Request:  { chamaId: string; audience: 'all'|'overdue'|'custom';
+             memberIds?: string[]; message: string }
+ Response: { sent: number; creditsUsed: number }
+-Errors:   resource-exhausted (insufficient smsCredits — computed before sending, never partially sent)
++Errors:   invalid-argument (message empty, over 385 chars, contains
++          disallowed characters/links)
++          resource-exhausted (insufficient smsCredits — computed before sending, never partially sent)
+ ```
+ 
+ ---
+diff --git a/firestore.rules b/firestore.rules
+index 84bfb68..e2f6602 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -447,9 +447,14 @@ service cloud.firestore {
+ 
+       match /smsSchedules/{scheduleId} {
+         allow read: if isOfficial(chamaId);
++        // 385 = shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385
++        // segment cap) — was 480 here, out of sync with the app's own
++        // segment/credit rules, so a schedule written directly against
++        // these rules (see ScheduleForm) could carry a body the cron
++        // (run_sms_schedules) would never have priced correctly.
+         allow create, update: if isOfficial(chamaId)
+                               && request.resource.data.status in ['active', 'paused']
+-                              && request.resource.data.body.size() <= 480;
++                              && request.resource.data.body.size() <= 385;
+         allow delete: if isOfficial(chamaId);
+       }
+ 
+diff --git a/functions/mychama/sms.py b/functions/mychama/sms.py
+index 1372a85..a80b22f 100644
+--- a/functions/mychama/sms.py
++++ b/functions/mychama/sms.py
+@@ -18,7 +18,7 @@ from firebase_admin import firestore
+ from shared import firestore_paths as paths
+ from shared import ids
+ from shared import paystack
+-from shared.constants import MC, PLANS, SECURITY
++from shared.constants import MC, SECURITY
+ from shared.dates import now_ms
+ from shared.errors import bad_request, not_found, rate_limited, require_auth
+ from shared.hostpinnacle import send_sms
+@@ -26,6 +26,7 @@ from shared.idempotency import already_applied, record_result
+ from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone, normalize_sms_phone
+ from shared.roles import require_official
+ from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
++from shared.sms_validation import MAX_SMS_LENGTH, count_sms_segments, validate_sms_content
+ import logging
+ 
+ REGION = "africa-south1"
+@@ -90,6 +91,18 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+         )
+         raise bad_request("chamaId, audience, and message are required.")
+ 
++    content_error = validate_sms_content(message)
++    if content_error:
++        logging.warning("sendSmsCampaign: content validation failed chamaId=%s error=%s", chama_id, content_error)
++        raise bad_request(content_error)
++
++    segments = count_sms_segments(message)
++    if segments is None:
++        logging.warning("sendSmsCampaign: message too long chamaId=%s len=%d", chama_id, len(message))
++        raise bad_request(
++            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
++        )
++
+     db = _db()
+     require_official(db, uid, chama_id)
+     logging.info("sendSmsCampaign: uid=%s confirmed official for chamaId=%s", uid, chama_id)
+@@ -108,9 +121,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+         logging.warning("sendSmsCampaign: chama not found chamaId=%s", chama_id)
+         raise not_found("Chama not found.")
+     chama = chama_snap.to_dict()
+-    plan = chama.get("plan", "free")
+-    rate = PLANS.get(plan, PLANS["free"])["smsRate"]
+-    logging.info("sendSmsCampaign: chamaId=%s plan=%s rate=%s", chama_id, plan, rate)
++    logging.info("sendSmsCampaign: chamaId=%s segments=%d", chama_id, segments)
+ 
+     recipients = _recipients(db, chama_id, audience, data.get("memberIds"))
+     pre_filter_count = len(recipients)
+@@ -126,11 +137,15 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+         )
+         return {"sent": 0, "creditsUsed": 0}
+ 
+-    cost = round(len(recipients) * rate * 100) / 100
++    # 1 credit per SMS segment per recipient — flat across every plan tier.
++    # PLANS[plan].smsRate is the KES price paid per credit at top-up time;
++    # it must not be multiplied in here (that was the bug: it made a send
++    # cost 0.9/0.7/0.5 credits instead of a whole credit per segment).
++    cost = segments * len(recipients)
+     credits = chama.get("smsCredits", 0)
+     logging.info(
+-        "sendSmsCampaign: cost=%s available credits=%s recipients=%d",
+-        cost, credits, len(recipients),
++        "sendSmsCampaign: cost=%s available credits=%s recipients=%d segments=%d",
++        cost, credits, len(recipients), segments,
+     )
+     if credits < cost:
+         logging.warning(
+@@ -166,7 +181,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+ 
+     logging.info("sendSmsCampaign: send loop done sent=%d failed=%d", sent, failed)
+ 
+-    actual_cost = round(sent * rate * 100) / 100
++    actual_cost = segments * sent
+     chama_ref.update({"smsCredits": credits - actual_cost, "updatedAt": ts})
+     db.collection(paths.sms_log(chama_id)).document().set({
+         "audience": audience,
+@@ -278,8 +293,6 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+     for chama_doc in chamas:
+         chama_id = chama_doc.id
+         chama = chama_doc.to_dict()
+-        plan = chama.get("plan", "free")
+-        rate = PLANS.get(plan, PLANS["free"])["smsRate"]
+ 
+         due = (
+             db.collection(paths.sms_schedules(chama_id))
+@@ -292,14 +305,25 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+             body = sched.get("body") or sched.get("message") or ""  # tolerate pre-fix docs written under the old field name
+             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
+             recipients = [m for m in recipients if m.get("phoneNormalized")]
+-            cost = round(len(recipients) * rate * 100) / 100
++
++            segments = count_sms_segments(body) if body else 0
++            content_error = validate_sms_content(body) if body else None
++            # 1 credit per SMS segment per recipient — flat across every plan
++            # tier; see sendSmsCampaign above for why smsRate must not be
++            # multiplied in here.
++            cost = (segments or 0) * len(recipients)
+ 
+             credits = chama.get("smsCredits", 0)
+-            if credits < cost or not recipients or not body:
+-                # Not enough credit, nobody to send to, or an empty body —
+-                # push nextRun forward by one frequency step so it's retried
+-                # next cycle rather than spamming the same failure every 15
+-                # minutes.
++            if credits < cost or not recipients or not body or not segments or content_error:
++                # Not enough credit, nobody to send to, an empty/oversized
++                # body, or content that fails validation — push nextRun
++                # forward by one frequency step so it's retried next cycle
++                # rather than spamming the same failure every 15 minutes.
++                if content_error or not segments:
++                    logging.warning(
++                        "run_sms_schedules: skipping invalid schedule chamaId=%s scheduleId=%s error=%s len=%d",
++                        chama_id, sched_doc.id, content_error or "message too long", len(body),
++                    )
+                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
+                 continue
+ 
+@@ -318,7 +342,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+                 except Exception:  # noqa: BLE001
+                     continue
+ 
+-            actual_cost = round(sent * rate * 100) / 100
++            actual_cost = segments * sent
+             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
+             db.collection(paths.sms_log(chama_id)).document().set({
+                 "audience": sched.get("audience", "all"),
+diff --git a/functions/shared/constants.py b/functions/shared/constants.py
+index b7f94a5..31b7fac 100644
+--- a/functions/shared/constants.py
++++ b/functions/shared/constants.py
+@@ -83,6 +83,12 @@ MGR_PAYOUT_MARKUP_RATE = {
+ 
+ PLAN_ORDER = ["free", "starter", "basic", "growth", "max"]
+ 
++# NOTE: smsRate below is the KES price paid PER CREDIT when topping up
++# (cheaper tiers get a bulk discount), converted by the PAY repo's webhook
++# when it credits chamas.smsCredits on a successful top-up. It is NOT the
++# number of credits an SMS costs to send — sending always costs exactly 1
++# credit per segment (see functions/shared/sms_validation.py), regardless
++# of plan. Don't multiply smsRate into a send-time cost again.
+ PLANS = {
+     "free":    {"name": "Free",    "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": False, "onlineCollection": False},
+     "starter": {"name": "Starter", "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": True,  "onlineCollection": True},
+diff --git a/functions/shared/hostpinnacle.py b/functions/shared/hostpinnacle.py
+index d97cbfd..e831360 100644
+--- a/functions/shared/hostpinnacle.py
++++ b/functions/shared/hostpinnacle.py
+@@ -16,13 +16,23 @@ import re
+ import requests
+ 
+ SMS_API_URL = "https://smsportal.hostpinnacle.co.ke/SMSApi/send"
+-MAX_SMS_LENGTH = 400
++# Matches shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385 segment
++# cap) — sendSmsCampaign/run_sms_schedules already reject anything over
++# this before it gets here, so this trim is a last-resort safety net,
++# not the primary enforcement point.
++MAX_SMS_LENGTH = 385
+ 
+ _NON_GSM = re.compile(r"[^\x00-\x7F\u00A0-\u00FF]")
+ 
+ 
+ def clean_sms_text(text: str) -> str:
+-    """Strips non-GSM characters and trims to the HostPinnacle length cap — mirrors the PAY repo's equivalent helper."""
++    """
++    Strips non-GSM characters and trims to the HostPinnacle length cap —
++    mirrors the PAY repo's equivalent helper. Defense-in-depth only:
++    shared.sms_validation.validate_sms_content() is what actually blocks
++    emoji/non-GSM content and over-length messages before send, so this
++    should normally be a no-op.
++    """
+     cleaned = _NON_GSM.sub("", text or "")
+     return cleaned[:MAX_SMS_LENGTH]
+ 
+diff --git a/functions/shared/sms_validation.py b/functions/shared/sms_validation.py
+new file mode 100644
+index 0000000..bec8d1c
+--- /dev/null
++++ b/functions/shared/sms_validation.py
+@@ -0,0 +1,74 @@
++"""
++SMS segmentation & content rules — shared by sendSmsCampaign and
++run_sms_schedules (functions/mychama/sms.py).
++
++Segment breakpoints (140 / 270 / 385 chars) are MyChama's own product
++rule, not GSM-7 concatenation math: 1 credit is charged per SMS segment,
++the same regardless of plan tier. PLANS[plan]['smsRate'] in
++shared/constants.py is a *different* number — the KES price per credit
++at top-up time — and must never be multiplied into this charge again
++(that conflation was the sendSmsCampaign/run_sms_schedules bug this
++module fixes).
++
++Content is restricted to GSM-7-safe characters and WhatsApp links only,
++so a stray emoji or non-GSM character can't silently push HostPinnacle
++into UCS-2 encoding — which would roughly halve the real per-segment
++character count and desync what a campaign was charged from what it
++actually cost to send.
++"""
++
++from __future__ import annotations
++
++import re
++
++# Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
++# A message over the last breakpoint is rejected outright (no 4th segment).
++SEGMENT_BREAKPOINTS: tuple[int, ...] = (140, 270, 385)
++MAX_SMS_LENGTH = SEGMENT_BREAKPOINTS[-1]
++MAX_SMS_SEGMENTS = len(SEGMENT_BREAKPOINTS)
++
++# Letters, digits, whitespace, and standard punctuation only — deliberately
++# excludes emoji and other non-GSM-7 characters. Extend this set only with
++# other plain-punctuation characters, never with symbols that risk pushing
++# the message into UCS-2 encoding.
++_ALLOWED_PUNCTUATION = r""".,!?'"\-:;()/&@%+=_"""
++_ALLOWED_CHARS_RE = re.compile(rf"^[A-Za-z0-9\s{_ALLOWED_PUNCTUATION}]*$")
++
++# Catches http(s)/www links plus bare "word.tld" links people paste without
++# a scheme. Conservative on purpose: it will flag some non-link text that
++# merely looks like a domain, which is the safe direction to err in here.
++_URL_RE = re.compile(
++    r"(?:https?://|www\.)\S+|\b(?:[a-zA-Z0-9-]+\.)+(?:com|co\.ke|org|net|io|me|ke|info|biz|co)\b(?:/\S*)?",
++    re.IGNORECASE,
++)
++_WHATSAPP_HOSTS = ("wa.me", "chat.whatsapp.com", "api.whatsapp.com", "whatsapp.com")
++
++
++def count_sms_segments(message: str) -> int | None:
++    """
++    Returns 1, 2, or 3 per the 140/270/385 breakpoints, 0 for an empty
++    message, or None if the message is over the 385-char hard cap (the
++    caller should reject rather than send).
++    """
++    length = len(message)
++    if length == 0:
++        return 0
++    for i, cap in enumerate(SEGMENT_BREAKPOINTS):
++        if length <= cap:
++            return i + 1
++    return None
++
++
++def _is_whatsapp_link(url: str) -> bool:
++    lowered = url.lower()
++    return any(host in lowered for host in _WHATSAPP_HOSTS)
++
++
++def validate_sms_content(message: str) -> str | None:
++    """Returns a user-facing error string if the message breaks content rules, else None."""
++    if not _ALLOWED_CHARS_RE.match(message):
++        return "Remove emojis or special characters — SMS only allows letters, numbers, and standard punctuation."
++    for match in _URL_RE.finditer(message):
++        if not _is_whatsapp_link(match.group(0)):
++            return "Only WhatsApp links (wa.me or whatsapp.com) are allowed in SMS messages."
++    return None
+diff --git a/src/features/communication/Communication.tsx b/src/features/communication/Communication.tsx
+index 5b85fb8..ccea082 100644
+--- a/src/features/communication/Communication.tsx
++++ b/src/features/communication/Communication.tsx
+@@ -6,12 +6,31 @@ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers } from '../../app/useMembers';
+ import { sendSmsCampaign, purchaseSmsCredits } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+-import { AUDIENCE_LABEL, PLANS, SMS_SEGMENT_LEN } from '../../lib/constants';
++import { AUDIENCE_LABEL, PLANS } from '../../lib/constants';
++import { countSmsSegments, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
+ import { kes } from '../../lib/money';
+-import type { SmsLogEntry, SmsSchedule } from '../../lib/types';
++import type { Chama, ChamaMember, SmsLogEntry, SmsSchedule } from '../../lib/types';
+ 
+ type Audience = 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
+ 
++/** Mirrors functions/mychama/sms.py's _recipients() filtering for the live
++ *  cost preview below — used by both the compose form and the schedule
++ *  form, since a scheduled message needs the same precheck as an
++ *  immediate send. */
++function estimateRecipients(
++  audience: Audience,
++  customIds: string[],
++  activeMembers: ChamaMember[],
++  overdueMemberIds: Set<string>,
++  loanHolderMemberIds: Set<string>
++): number {
++  if (audience === 'all') return activeMembers.length;
++  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin).length;
++  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id)).length;
++  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id)).length;
++  return customIds.length;
++}
++
+ export default function Communication() {
+   const { chama, chamaId, chamaReady, isOfficial } = useChama();
+   const { members } = useMembers(chamaId, false);
+@@ -61,15 +80,18 @@ export default function Communication() {
+ 
+   const recipientEstimate = useMemo(() => {
+     const active = members.filter((m) => m.status === 'active');
+-    if (audience === 'all') return active.length;
+-    if (audience === 'admins') return active.filter((m) => m.isAdmin).length;
+-    if (audience === 'overdue') return active.filter((m) => overdueMemberIds.has(m.id)).length;
+-    if (audience === 'loan_holders') return active.filter((m) => loanHolderMemberIds.has(m.id)).length;
+-    return customIds.length;
++    return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
+   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
+ 
+-  const segments = Math.max(1, Math.ceil(message.length / SMS_SEGMENT_LEN));
+-  const costEstimate = chama ? segments * recipientEstimate * PLANS[chama.plan].smsRate : 0;
++  const trimmedMessage = message.trim();
++  const segments = countSmsSegments(trimmedMessage); // null once over the 385-char cap
++  const overLength = segments === null;
++  const contentError = trimmedMessage ? validateSmsContent(trimmedMessage) : null;
++  const creditsNeeded = segments ? segments * recipientEstimate : 0;
++  const kesEquivalent = chama ? creditsNeeded * PLANS[chama.plan].smsRate : 0;
++  const availableCredits = chama?.smsCredits ?? 0;
++  const insufficientCredits = creditsNeeded > availableCredits;
++  const canSend = !busy && !!trimmedMessage && !overLength && !contentError && !insufficientCredits;
+ 
+   if (!chamaReady || !chama) return <p className="text-forest-900/60">Loading…</p>;
+ 
+@@ -81,17 +103,29 @@ export default function Communication() {
+     if (!chamaId) return;
+     setError(null);
+     setResult(null);
+-    if (!message.trim()) {
++    if (!trimmedMessage) {
+       setError('Write a message first.');
+       return;
+     }
++    if (overLength) {
++      setError(`Message is too long — SMS campaigns are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
++      return;
++    }
++    if (contentError) {
++      setError(contentError);
++      return;
++    }
++    if (insufficientCredits) {
++      setError(`Not enough SMS credits — this campaign needs ${creditsNeeded}, you have ${availableCredits}. Top up to continue.`);
++      return;
++    }
+     setBusy(true);
+     try {
+       const res = await sendSmsCampaign({
+         chamaId,
+         audience,
+         memberIds: audience === 'custom' ? customIds : undefined,
+-        message: message.trim(),
++        message: trimmedMessage,
+       });
+       setResult(res);
+       setMessage('');
+@@ -163,20 +197,34 @@ export default function Communication() {
+             )}
+             <label className="flex flex-col gap-1 text-sm font-medium">
+               Message
+-              <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++              <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+             </label>
+             <p className="text-xs text-forest-900/50">
+-              {message.length}/400 characters · {segments} segment{segments === 1 ? '' : 's'} × {recipientEstimate} recipient
+-              {recipientEstimate === 1 ? '' : 's'} ≈ {kes(costEstimate)}
++              {message.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
++              {recipientEstimate === 1 ? '' : 's'} = {creditsNeeded} credit{creditsNeeded === 1 ? '' : 's'} (≈ {kes(kesEquivalent)})
+             </p>
+-            <button onClick={send} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
++            {overLength && (
++              <p className="text-sm text-brick-500 font-medium">
++                Too long — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments).
++              </p>
++            )}
++            {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
++            {!overLength && !contentError && insufficientCredits && trimmedMessage && (
++              <p className="text-sm text-brick-500 font-medium">
++                Not enough SMS credits — needs {creditsNeeded}, you have {availableCredits}.{' '}
++                <button onClick={() => setShowTopUp(true)} className="underline font-semibold">
++                  Top up now
++                </button>
++              </p>
++            )}
++            <button onClick={send} disabled={!canSend} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
+               {busy ? 'Sending…' : 'Send SMS'}
+             </button>
+             {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+             {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
+             {result && (
+               <p className="text-sm text-forest-700 font-medium">
+-                Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credits used.
++                Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credit{result.creditsUsed === 1 ? '' : 's'} used.
+               </p>
+             )}
+           </div>
+@@ -205,7 +253,16 @@ export default function Communication() {
+         </>
+       )}
+ 
+-      {tab === 'scheduled' && chamaId && isOfficial && <ScheduledTab chamaId={chamaId} members={members} />}
++      {tab === 'scheduled' && chamaId && isOfficial && (
++        <ScheduledTab
++          chamaId={chamaId}
++          chama={chama}
++          members={members}
++          overdueMemberIds={overdueMemberIds}
++          loanHolderMemberIds={loanHolderMemberIds}
++          onRequestTopUp={() => setShowTopUp(true)}
++        />
++      )}
+     </div>
+   );
+ }
+@@ -222,7 +279,21 @@ const FREQUENCY_LABEL: Record<string, string> = { daily: 'Daily', weekly: 'Weekl
+  * pattern src/features/mgr/MgrPotDetail.tsx's per-pot reminder toggle
+  * already uses — so this is a screen, not a new backend.
+  */
+-function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: string; name: string }[] }) {
++function ScheduledTab({
++  chamaId,
++  chama,
++  members,
++  overdueMemberIds,
++  loanHolderMemberIds,
++  onRequestTopUp,
++}: {
++  chamaId: string;
++  chama: Chama;
++  members: ChamaMember[];
++  overdueMemberIds: Set<string>;
++  loanHolderMemberIds: Set<string>;
++  onRequestTopUp: () => void;
++}) {
+   const [schedules, setSchedules] = useState<SmsSchedule[]>([]);
+   const [showForm, setShowForm] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -261,7 +332,11 @@ function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: st
+       {showForm && (
+         <ScheduleForm
+           chamaId={chamaId}
++          chama={chama}
+           members={members}
++          overdueMemberIds={overdueMemberIds}
++          loanHolderMemberIds={loanHolderMemberIds}
++          onRequestTopUp={onRequestTopUp}
+           onDone={() => setShowForm(false)}
+           onError={setError}
+         />
+@@ -301,12 +376,20 @@ function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: st
+ 
+ function ScheduleForm({
+   chamaId,
++  chama,
+   members,
++  overdueMemberIds,
++  loanHolderMemberIds,
++  onRequestTopUp,
+   onDone,
+   onError,
+ }: {
+   chamaId: string;
+-  members: { id: string; name: string }[];
++  chama: Chama;
++  members: ChamaMember[];
++  overdueMemberIds: Set<string>;
++  loanHolderMemberIds: Set<string>;
++  onRequestTopUp: () => void;
+   onDone: () => void;
+   onError: (msg: string | null) => void;
+ }) {
+@@ -320,17 +403,47 @@ function ScheduleForm({
+     setCustomIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+   }
+ 
++  const recipientEstimate = useMemo(() => {
++    const active = members.filter((m) => m.status === 'active');
++    return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
++  }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
++
++  const trimmedBody = body.trim();
++  const segments = countSmsSegments(trimmedBody);
++  const overLength = segments === null;
++  const contentError = trimmedBody ? validateSmsContent(trimmedBody) : null;
++  // Each occurrence of a recurring schedule costs this many credits — the
++  // same precheck as a one-off send, run against the audience's current
++  // size (a later run may differ if membership changes, but this is the
++  // best estimate available at creation time).
++  const creditsNeededPerRun = segments ? segments * recipientEstimate : 0;
++  const availableCredits = chama.smsCredits ?? 0;
++  const insufficientCredits = creditsNeededPerRun > availableCredits;
++  const canSubmit = !busy && !!trimmedBody && !overLength && !contentError && !insufficientCredits;
++
+   async function submit() {
+     onError(null);
+-    if (!body.trim()) {
++    if (!trimmedBody) {
+       onError('Write a message first.');
+       return;
+     }
++    if (overLength) {
++      onError(`Message is too long — SMS schedules are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
++      return;
++    }
++    if (contentError) {
++      onError(contentError);
++      return;
++    }
++    if (insufficientCredits) {
++      onError(`Not enough SMS credits — each run of this schedule needs ${creditsNeededPerRun}, you have ${availableCredits}. Top up to continue.`);
++      return;
++    }
+     setBusy(true);
+     try {
+       await setDoc(doc(collection(db, paths.smsSchedules(chamaId))), {
+         status: 'active',
+-        body: body.trim(),
++        body: trimmedBody,
+         audience,
+         memberIds: audience === 'custom' ? customIds : null,
+         frequency,
+@@ -350,7 +463,7 @@ function ScheduleForm({
+       <h3 className="font-display font-semibold">New schedule</h3>
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         Message
+-        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+       </label>
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         Audience
+@@ -380,9 +493,27 @@ function ScheduleForm({
+           <option value="monthly">Monthly</option>
+         </select>
+       </label>
++      <p className="text-xs text-forest-900/50">
++        {body.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
++        {recipientEstimate === 1 ? '' : 's'} = {creditsNeededPerRun} credit{creditsNeededPerRun === 1 ? '' : 's'} per run
++      </p>
+       <p className="text-xs text-forest-900/50">Starts within about 15 minutes, then repeats on this cadence until paused or deleted.</p>
++      {overLength && (
++        <p className="text-sm text-brick-500 font-medium">
++          Too long — SMS schedules are capped at {MAX_SMS_LENGTH} characters (3 segments).
++        </p>
++      )}
++      {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
++      {!overLength && !contentError && insufficientCredits && trimmedBody && (
++        <p className="text-sm text-brick-500 font-medium">
++          Not enough SMS credits for even one run — needs {creditsNeededPerRun}, you have {availableCredits}.{' '}
++          <button onClick={onRequestTopUp} className="underline font-semibold">
++            Top up now
++          </button>
++        </p>
++      )}
+       <div className="flex gap-2">
+-        <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
++        <button onClick={submit} disabled={!canSubmit} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+           {busy ? 'Saving…' : 'Create schedule'}
+         </button>
+         <button onClick={onDone} disabled={busy} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">
+diff --git a/src/lib/constants.ts b/src/lib/constants.ts
+index 93362b1..64d3565 100644
+--- a/src/lib/constants.ts
++++ b/src/lib/constants.ts
+@@ -57,6 +57,14 @@ export const FEES = {
+ 
+ export const PLAN_ORDER: ChamaPlan[] = ['free', 'starter', 'basic', 'growth', 'max'];
+ 
++/**
++ * NOTE: smsRate below is the KES price paid PER CREDIT when topping up
++ * (cheaper tiers get a bulk discount) — it is NOT the number of credits
++ * an SMS costs to send. Sending always costs exactly 1 credit per segment
++ * (see src/lib/smsValidation.ts), regardless of plan. Only use smsRate to
++ * show a KES-equivalent of a credits total, never to compute the credits
++ * a send itself deducts.
++ */
+ export const PLANS: Record<
+   ChamaPlan,
+   {
+@@ -170,8 +178,8 @@ export const SECURITY = {
+   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
+ } as const;
+ 
+-/** GSM-7 segment length used for the Communication page's live cost preview — matches HostPinnacle's own segmenting. */
+-export const SMS_SEGMENT_LEN = 160;
++// SMS segment breakpoints (140/270/385 chars) and content-validation rules
++// live in src/lib/smsValidation.ts, mirroring functions/shared/sms_validation.py.
+ 
+ export const AUDIENCE_LABEL: Record<string, string> = {
+   all: 'To everyone',
+diff --git a/src/lib/smsValidation.ts b/src/lib/smsValidation.ts
+new file mode 100644
+index 0000000..cb4e7d6
+--- /dev/null
++++ b/src/lib/smsValidation.ts
+@@ -0,0 +1,55 @@
++/**
++ * SMS segmentation & content rules — MUST stay value-identical to
++ * functions/shared/sms_validation.py. See that file's docstring for why
++ * these rules exist (esp. why PLANS[plan].smsRate must never be
++ * multiplied into the credits-per-send charge again).
++ *
++ * Used by src/features/communication/Communication.tsx for the compose
++ * and scheduled-message forms' live cost preview, send/schedule button
++ * gating, and content validation. Mirrored server-side (functions/mychama/sms.py)
++ * as the source of truth — this file is a UX layer, not the enforcement point.
++ */
++
++// Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
++export const SMS_SEGMENT_BREAKPOINTS = [140, 270, 385] as const;
++export const MAX_SMS_LENGTH = SMS_SEGMENT_BREAKPOINTS[SMS_SEGMENT_BREAKPOINTS.length - 1];
++export const MAX_SMS_SEGMENTS = SMS_SEGMENT_BREAKPOINTS.length;
++
++/** Returns 1/2/3 segments, 0 for an empty message, or null if over the 385-char cap. */
++export function countSmsSegments(message: string): number | null {
++  const length = message.length;
++  if (length === 0) return 0;
++  for (let i = 0; i < SMS_SEGMENT_BREAKPOINTS.length; i++) {
++    if (length <= SMS_SEGMENT_BREAKPOINTS[i]) return i + 1;
++  }
++  return null;
++}
++
++// Letters, digits, whitespace, and standard punctuation only — deliberately
++// excludes emoji and other non-GSM-7 characters.
++const ALLOWED_PUNCTUATION = `.,!?'"\\-:;()/&@%+=_`;
++const ALLOWED_CHARS_RE = new RegExp(`^[A-Za-z0-9\\s${ALLOWED_PUNCTUATION}]*$`);
++
++// Catches http(s)/www links plus bare "word.tld" links pasted without a
++// scheme. Conservative on purpose — see the .py mirror's comment.
++const URL_RE = /(?:https?:\/\/|www\.)\S+|\b(?:[a-zA-Z0-9-]+\.)+(?:com|co\.ke|org|net|io|me|ke|info|biz|co)\b(?:\/\S*)?/gi;
++const WHATSAPP_HOSTS = ['wa.me', 'chat.whatsapp.com', 'api.whatsapp.com', 'whatsapp.com'];
++
++function isWhatsAppLink(url: string): boolean {
++  const lowered = url.toLowerCase();
++  return WHATSAPP_HOSTS.some((host) => lowered.includes(host));
++}
++
++/** Returns a user-facing error string if the message breaks content rules, else null. */
++export function validateSmsContent(message: string): string | null {
++  if (!ALLOWED_CHARS_RE.test(message)) {
++    return 'Remove emojis or special characters — SMS only allows letters, numbers, and standard punctuation.';
++  }
++  const links = message.match(URL_RE) ?? [];
++  for (const link of links) {
++    if (!isWhatsAppLink(link)) {
++      return 'Only WhatsApp links (wa.me or whatsapp.com) are allowed in SMS messages.';
++    }
++  }
++  return null;
++}

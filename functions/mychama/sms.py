@@ -18,7 +18,7 @@ from firebase_admin import firestore
 from shared import firestore_paths as paths
 from shared import ids
 from shared import paystack
-from shared.constants import MC, PLANS, SECURITY
+from shared.constants import MC, SECURITY
 from shared.dates import now_ms
 from shared.errors import bad_request, not_found, rate_limited, require_auth
 from shared.hostpinnacle import send_sms
@@ -26,6 +26,7 @@ from shared.idempotency import already_applied, record_result
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone, normalize_sms_phone
 from shared.roles import require_official
 from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
+from shared.sms_validation import MAX_SMS_LENGTH, count_sms_segments, validate_sms_content
 import logging
 
 REGION = "africa-south1"
@@ -90,6 +91,18 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
         )
         raise bad_request("chamaId, audience, and message are required.")
 
+    content_error = validate_sms_content(message)
+    if content_error:
+        logging.warning("sendSmsCampaign: content validation failed chamaId=%s error=%s", chama_id, content_error)
+        raise bad_request(content_error)
+
+    segments = count_sms_segments(message)
+    if segments is None:
+        logging.warning("sendSmsCampaign: message too long chamaId=%s len=%d", chama_id, len(message))
+        raise bad_request(
+            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
+        )
+
     db = _db()
     require_official(db, uid, chama_id)
     logging.info("sendSmsCampaign: uid=%s confirmed official for chamaId=%s", uid, chama_id)
@@ -108,9 +121,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
         logging.warning("sendSmsCampaign: chama not found chamaId=%s", chama_id)
         raise not_found("Chama not found.")
     chama = chama_snap.to_dict()
-    plan = chama.get("plan", "free")
-    rate = PLANS.get(plan, PLANS["free"])["smsRate"]
-    logging.info("sendSmsCampaign: chamaId=%s plan=%s rate=%s", chama_id, plan, rate)
+    logging.info("sendSmsCampaign: chamaId=%s segments=%d", chama_id, segments)
 
     recipients = _recipients(db, chama_id, audience, data.get("memberIds"))
     pre_filter_count = len(recipients)
@@ -126,11 +137,15 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
         )
         return {"sent": 0, "creditsUsed": 0}
 
-    cost = round(len(recipients) * rate * 100) / 100
+    # 1 credit per SMS segment per recipient — flat across every plan tier.
+    # PLANS[plan].smsRate is the KES price paid per credit at top-up time;
+    # it must not be multiplied in here (that was the bug: it made a send
+    # cost 0.9/0.7/0.5 credits instead of a whole credit per segment).
+    cost = segments * len(recipients)
     credits = chama.get("smsCredits", 0)
     logging.info(
-        "sendSmsCampaign: cost=%s available credits=%s recipients=%d",
-        cost, credits, len(recipients),
+        "sendSmsCampaign: cost=%s available credits=%s recipients=%d segments=%d",
+        cost, credits, len(recipients), segments,
     )
     if credits < cost:
         logging.warning(
@@ -166,7 +181,7 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
 
     logging.info("sendSmsCampaign: send loop done sent=%d failed=%d", sent, failed)
 
-    actual_cost = round(sent * rate * 100) / 100
+    actual_cost = segments * sent
     chama_ref.update({"smsCredits": credits - actual_cost, "updatedAt": ts})
     db.collection(paths.sms_log(chama_id)).document().set({
         "audience": audience,
@@ -278,8 +293,6 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
     for chama_doc in chamas:
         chama_id = chama_doc.id
         chama = chama_doc.to_dict()
-        plan = chama.get("plan", "free")
-        rate = PLANS.get(plan, PLANS["free"])["smsRate"]
 
         due = (
             db.collection(paths.sms_schedules(chama_id))
@@ -292,14 +305,25 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
             body = sched.get("body") or sched.get("message") or ""  # tolerate pre-fix docs written under the old field name
             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
             recipients = [m for m in recipients if m.get("phoneNormalized")]
-            cost = round(len(recipients) * rate * 100) / 100
+
+            segments = count_sms_segments(body) if body else 0
+            content_error = validate_sms_content(body) if body else None
+            # 1 credit per SMS segment per recipient — flat across every plan
+            # tier; see sendSmsCampaign above for why smsRate must not be
+            # multiplied in here.
+            cost = (segments or 0) * len(recipients)
 
             credits = chama.get("smsCredits", 0)
-            if credits < cost or not recipients or not body:
-                # Not enough credit, nobody to send to, or an empty body —
-                # push nextRun forward by one frequency step so it's retried
-                # next cycle rather than spamming the same failure every 15
-                # minutes.
+            if credits < cost or not recipients or not body or not segments or content_error:
+                # Not enough credit, nobody to send to, an empty/oversized
+                # body, or content that fails validation — push nextRun
+                # forward by one frequency step so it's retried next cycle
+                # rather than spamming the same failure every 15 minutes.
+                if content_error or not segments:
+                    logging.warning(
+                        "run_sms_schedules: skipping invalid schedule chamaId=%s scheduleId=%s error=%s len=%d",
+                        chama_id, sched_doc.id, content_error or "message too long", len(body),
+                    )
                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
                 continue
 
@@ -318,7 +342,7 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
                 except Exception:  # noqa: BLE001
                     continue
 
-            actual_cost = round(sent * rate * 100) / 100
+            actual_cost = segments * sent
             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
             db.collection(paths.sms_log(chama_id)).document().set({
                 "audience": sched.get("audience", "all"),

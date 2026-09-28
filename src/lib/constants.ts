@@ -57,6 +57,14 @@ export const FEES = {
 
 export const PLAN_ORDER: ChamaPlan[] = ['free', 'starter', 'basic', 'growth', 'max'];
 
+/**
+ * NOTE: smsRate below is the KES price paid PER CREDIT when topping up
+ * (cheaper tiers get a bulk discount) — it is NOT the number of credits
+ * an SMS costs to send. Sending always costs exactly 1 credit per segment
+ * (see src/lib/smsValidation.ts), regardless of plan. Only use smsRate to
+ * show a KES-equivalent of a credits total, never to compute the credits
+ * a send itself deducts.
+ */
 export const PLANS: Record<
   ChamaPlan,
   {
@@ -170,8 +178,8 @@ export const SECURITY = {
   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
 } as const;
 
-/** GSM-7 segment length used for the Communication page's live cost preview — matches HostPinnacle's own segmenting. */
-export const SMS_SEGMENT_LEN = 160;
+// SMS segment breakpoints (140/270/385 chars) and content-validation rules
+// live in src/lib/smsValidation.ts, mirroring functions/shared/sms_validation.py.
 
 export const AUDIENCE_LABEL: Record<string, string> = {
   all: 'To everyone',

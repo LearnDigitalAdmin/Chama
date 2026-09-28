@@ -267,14 +267,20 @@ Response: { reference: string }
 ```
 
 ### `sendSmsCampaign`
-Caller: `chair`/`treasurer`/`secretary`. Debits `smsCredits` at
-`PLANS[plan].smsRate` per message before calling HostPinnacle directly.
+Caller: `chair`/`treasurer`/`secretary`. Debits `smsCredits` at 1 credit
+per SMS segment per recipient (140/270/385-char breakpoints, 3-segment
+hard cap) before calling HostPinnacle directly — flat across every plan
+tier. `PLANS[plan].smsRate` is a *different* number (the KES price per
+credit at top-up time) and plays no part in this charge. Message content
+is restricted to GSM-7-safe characters and WhatsApp-only links.
 
 ```ts
 Request:  { chamaId: string; audience: 'all'|'overdue'|'custom';
             memberIds?: string[]; message: string }
 Response: { sent: number; creditsUsed: number }
-Errors:   resource-exhausted (insufficient smsCredits — computed before sending, never partially sent)
+Errors:   invalid-argument (message empty, over 385 chars, contains
+          disallowed characters/links)
+          resource-exhausted (insufficient smsCredits — computed before sending, never partially sent)
 ```
 
 ---

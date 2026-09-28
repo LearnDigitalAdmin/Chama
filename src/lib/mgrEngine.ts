@@ -5,14 +5,16 @@
  * functions/mychama/mgr.py — nothing here mutates a queue or a record.
  */
 
-import type { MgrArrear, MgrPot, MgrRecord } from './types';
+import type { MgrArrear, MgrPayout, MgrPot, MgrRecord } from './types';
 
 const LATE_DECAY = 0.7;
 
 export function lateScore(records: MgrRecord[], memberId: string): number {
   const recs = records.filter((r) => r.memberId === memberId).sort((a, b) => a.period - b.period);
   let score = 0;
-  for (const r of recs) score = r.status === 'missed' ? score + 1 : score * LATE_DECAY;
+  // A 'partial' period counts the same as 'missed' — only a fully 'paid'
+  // period earns the decay (see functions/shared/mgr_engine.py::late_score).
+  for (const r of recs) score = r.status === 'missed' || r.status === 'partial' ? score + 1 : score * LATE_DECAY;
   return Math.round(score * 100) / 100;
 }
 
@@ -26,7 +28,10 @@ export function recentReliability(records: MgrRecord[], memberId: string, window
 }
 
 export function missedCount(records: MgrRecord[], memberId: string): number {
-  return records.filter((r) => r.memberId === memberId && r.status === 'missed').length;
+  // Counts both full misses and partial payments — anything short of the
+  // full amount still leaves a gap the member owes (mirrors
+  // functions/shared/mgr_engine.py::missed_count).
+  return records.filter((r) => r.memberId === memberId && (r.status === 'missed' || r.status === 'partial')).length;
 }
 
 export function poolEstimate(pot: Pick<MgrPot, 'amount' | 'memberIds' | 'periodsPerRound'>): number {
@@ -60,10 +65,19 @@ export interface MgrHealthFinding {
  * Pure diagnostics — mirrors functions/shared/mgr_engine.py::health_check
  * field for field. Safe to run client-side for an instant Health card;
  * only mgrRepairPot (server-only) may act on what this finds.
+ *
+ * `payouts` defaults to [] for callers that don't have the payouts
+ * subcollection loaded (e.g. the pot-list card, to avoid an extra
+ * listener per card) — in that case a member paid out this cycle can be
+ * mis-flagged as "missing" here, same as before this fix. The detail
+ * page (the only place "Repair queue" actually runs) always passes the
+ * real payouts, which is what matters: mgrRepairPot itself checks the
+ * server's own copy of `payouts` regardless of what this preview saw.
  */
 export function healthCheck(
-  pot: Pick<MgrPot, 'memberIds' | 'queue' | 'status' | 'pendingShortfall' | 'recipientsPerRound'>,
-  arrears: Pick<MgrArrear, 'memberId' | 'status'>[]
+  pot: Pick<MgrPot, 'memberIds' | 'queue' | 'status' | 'pendingShortfall' | 'recipientsPerRound' | 'cycleNumber'>,
+  arrears: Pick<MgrArrear, 'memberId' | 'status'>[],
+  payouts: Pick<MgrPayout, 'memberId' | 'cycleNumber'>[] = []
 ): MgrHealthFinding[] {
   const findings: MgrHealthFinding[] = [];
   const memberSet = new Set(pot.memberIds);
@@ -79,9 +93,19 @@ export function healthCheck(
     if (!memberSet.has(m)) findings.push({ code: 'orphaned_in_queue', memberId: m, message: 'In the payout queue but no longer a pot member.' });
   }
 
+  // A member absent from the queue isn't necessarily "missing" — the
+  // normal, correct outcome of a payout is removal from the queue. Only
+  // flag members who are neither in the queue NOR already paid out THIS
+  // cycle; cycleNumber-gated so someone paid in a PRIOR cycle, now
+  // legitimately back for a fresh mgrStartNewCycle draw, still gets
+  // flagged if they're genuinely absent from the new queue.
+  const currentCycle = pot.cycleNumber ?? 1;
+  const paidOutThisCycle = new Set(payouts.filter((p) => (p.cycleNumber ?? 1) === currentCycle).map((p) => p.memberId));
   if (pot.status === 'active') {
     for (const m of memberSet) {
-      if (!queueSet.has(m)) findings.push({ code: 'missing_from_queue', memberId: m, message: 'A pot member with no place in the payout queue.' });
+      if (!queueSet.has(m) && !paidOutThisCycle.has(m)) {
+        findings.push({ code: 'missing_from_queue', memberId: m, message: 'A pot member with no place in the payout queue.' });
+      }
     }
   }
 

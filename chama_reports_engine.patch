@@ -1,0 +1,3089 @@
+diff --git a/TOUCH_BASE.md b/TOUCH_BASE.md
+index ed9ba34..b3094b9 100644
+--- a/TOUCH_BASE.md
++++ b/TOUCH_BASE.md
+@@ -304,6 +304,28 @@ Paystack/HostPinnacle sandbox access, no PAY-repo access):
+    against the live project; it isn't expressible in any file in this
+    repo, which is why it was never done.
+ 4. **Verify the PAY repo's `MCP-` webhook branch** — see §5.
++4a. **Reports engine — PAY-repo follow-up.** `MCX-` (wallet top-up) and
++   `MCR-` (Starter/Basic one-off) must be handled by the PAY repo's
++   `paystackCallback`. The companion patch `PAY_reports_engine_webhook.patch`
++   adds `handleMyChamaReportCreditTopup` / `handleMyChamaReportAlacarte`, the
++   `determineChargeType` entries and the `charge.failed` branch. Until it is
++   deployed, an MCX-/MCR- payment succeeds at Paystack but credits nothing.
++   Also mirror the new `PLANS` fields into CYBER's `mychama.config.ts`
++   (`standardReportCredits`, `premiumReportCredits`, `premiumAlacarteCapPerMonth`;
++   `minutesQuota` is retired).
++4b. **Reports engine — known limitations (deliberate, documented in code):**
++   (i) P&L loan-interest income is *apportioned* from blended repayments —
++   installments carry no per-payment timestamp; (ii) balance-sheet loan
++   receivables use current `paidAmount`, not a historical reconstruction, and
++   retained earnings is a labelled balancing figure; (iii) no penalty-fee
++   field exists in the schema, so the "Penalties" section of the arrears
++   report says so instead of inventing numbers; (iv) CSV exports can't be
++   encrypted; (v) `fiscalYearStartMonth` defaults to 1 and has no settings UI
++   yet. Existing chamas still carry `minutesExportsUsedThisMonth`; readers fall
++   back to it, and the monthly sweep resets both.
++4c. **Behaviour changes to confirm:** a whole-chama statement is now premium
++   (Growth/Max, or a one-off) instead of any paid plan; a member's own
++   statement is free on every plan, including Free.
+ 5. **Decide on Firebase App Check** for the callable functions — nothing
+    in this repo enables it. Not a blocker, but worth a decision before a
+    real launch, since callable functions are otherwise reachable by
+diff --git a/docs/API_CONTRACT.md b/docs/API_CONTRACT.md
+index 45b005c..1121259 100644
+--- a/docs/API_CONTRACT.md
++++ b/docs/API_CONTRACT.md
+@@ -292,12 +292,53 @@ Response: { reference: string } | { ok: true }
+ 
+ ### `generateStatement`
+ Caller: finance admin (any member scope) or the member themself
+-(`memberId` must equal caller's own). Enforces
+-`PLANS[plan].exportsAllowed` and `minutesQuota` /
+-`minutesExportsUsedThisMonth`.
++(`memberId` must equal caller's own). Report type is inferred: `minutesId` →
++`minutes`; `memberId` → `member_statement`; neither → `cashflow` (whole chama,
++**premium**). A member's own statement is **free on every plan** and costs no
++credit. Otherwise charged through `reports_engine.spend_credits` (monthly
++allowance → wallet), or by consuming an `alacarteReference` on Starter/Basic.
++Give either a `period` preset (`this_month` | `last_month` | `this_quarter` |
++`last_quarter` | `this_fy` | `last_fy` | `custom`) or explicit `from`/`to`.
+ 
+ ```ts
+-Request:  { chamaId: string; memberId?: string; from: string; to: string; format: 'pdf'|'csv' }
+-Response: { url: string }
+-Errors:   failed-precondition (exports not allowed on this plan, or quota exhausted)
++Request:  { chamaId: string; memberId?: string; period?: string; from?: string; to?: string;
++            format: 'pdf'|'csv'; minutesId?: string; potId?: string;
++            encrypt?: boolean; alacarteReference?: string }
++Response: { url: string; encrypted: boolean; pinSentTo: number;
++            charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
++Errors:   failed-precondition (plan doesn't offer it / no à la carte purchase), resource-exhausted (credits used up)
++```
++The PIN is never in the response — it is SMSed only.
++
++### `generateReport`
++Caller: finance admin. `reportType`: `contribution_ledger` | `arrears_penalties`
++| `profit_loss` | `balance_sheet`. `arrears_penalties` and `balance_sheet` are
++point-in-time (`asOf` or `period`: `today`/`last_month`/`last_quarter`/`last_fy`/`custom`);
++the others are ranges. `profit_loss` and `balance_sheet` are PDF-only and always encrypted.
++
++```ts
++Request:  { chamaId: string; reportType: string; format: 'pdf'|'csv'; period?: string;
++            from?: string; to?: string; asOf?: string; encrypt?: boolean; alacarteReference?: string }
++Response: same as generateStatement
++```
++
++### `purchaseReportCredits`
++Caller: finance admin. Wallet top-up (prefix `MCX-`). `credits` of 1, 10 or 30
++use the bundle price (`REPORT_WALLET_BUNDLES`).
++```ts
++Request:  { chamaId: string; credits: number; phone: string }
++Response: { reference: string; amountKes: number }
++```
++
++### `purchasePremiumReportAlaCarte`
++Caller: finance admin, Starter/Basic only (capped per month —
++`PLANS[plan].premiumAlacarteCapPerMonth`, reserved at purchase time). Prefix
++`MCR-`. Periods are resolved and frozen at purchase time. After
++`reportAlacartePurchases/{reference}.status` becomes `success`, pass the
++reference as `alacarteReference` to `generateStatement` (cashflow) or
++`generateReport` (P&L, balance sheet).
++```ts
++Request:  { chamaId: string; reportType: 'cashflow'|'profit_loss'|'balance_sheet'; format?: 'pdf'|'csv';
++            phone: string; period?: string; from?: string; to?: string; asOf?: string }
++Response: { reference: string; amountKes: number }
+ ```
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 26f8dfd..b773539 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -134,6 +134,46 @@ webhook — reference prefix `MCS-`, collection `smsTopUps`, credited to
+ `chamas.smsCredits` on webhook success. Plan upgrades follow the identical
+ pattern with prefix `MCP-` and collection `planBilling`.
+ 
++### Reports engine (exports & financial statements)
++
++One shared module, `functions/shared/reports_engine.py`, owns everything
++common to every report: period-preset resolution, the credit/wallet/
++à-la-carte charging gate (`spend_credits`, `consume_alacarte_purchase`),
++PDF encryption + the admin PIN SMS, and the data builders/renderers for the
++Contribution Ledger, Arrears & Penalties, P&L and Balance Sheet.
++`generateStatement` (member statement, whole-chama cashflow, minutes) and
++`generateReport` (the four builders above) both call into it — the client
++only ever picks a report and a period.
++
++- **Tiers.** *Standard* reports (member statement, contribution ledger,
++  arrears & penalties, minutes) are included from Starter up; *premium*
++  reports (cashflow, P&L, balance sheet) are Growth/Max only, with a
++  monthly premium allowance. Starter/Basic can still buy a premium report
++  one-off (capped per month) via `purchasePremiumReportAlaCarte`.
++  Source of truth: `PLANS` / `REPORT_TYPES` in `functions/shared/constants.py`
++  (mirrored in `src/lib/constants.ts` and `firestoreData.json`).
++- **Wallet.** `chamas.reportCreditsBalance` is credit-denominated (not KES,
++  unlike `smsCredits`). On Starter/Basic it covers standard reports beyond
++  the monthly allowance; on Growth/Max it covers premium reports.
++- **Prefixes.** `MCX-` (`reportCreditTopUps`) credits the wallet on webhook
++  success; `MCR-` (`reportAlacartePurchases`) only flips to `success` — the
++  callable then *consumes* it (`success` → `consumed`) when the report is
++  generated, so a paid purchase can't be redirected to other parameters.
++- **Encryption policy.** Member statements, P&L and balance sheets are
++  always PDF-only and PIN-protected. Contribution ledger, arrears and
++  cashflow are optionally protected (they're routinely shared to a group).
++  A 6-digit PIN (`secrets`, never logged, never returned by the API) is SMSed
++  to the chair and treasurer — or, for a member's own statement, to that
++  member — straight through `send_sms`, deliberately bypassing the
++  `smsCredits` debit (a security notice isn't a billable campaign).
++  Encryption is reportlab's built-in `StandardEncryption`; CSV can't carry
++  it, so CSV exports are unencrypted.
++- **Member self-service.** A member generating their *own* statement is free
++  on every plan (including Free) and costs the chama no credit.
++- **Offline.** Only the raw CSV dumps work offline (local Firestore cache).
++  Every computed report is a `liveCallable` — credit deduction needs a single
++  source of truth and PDF/PIN generation needs the server.
++
+ ## 7. What's genuinely new vs. what already exists
+ 
+ Already fully specified and must be reused as-is, not redesigned:
+@@ -147,6 +187,7 @@ Already fully specified and must be reused as-is, not redesigned:
+ Genuinely new for the live build (not in the original demo or the bot),
+ introduced by this global package:
+ - `invites` collection + claim flow (§3)
+-- `MCA-`, `MCS-`, `MCP-` reference prefixes and their `smsTopUps` /
+-  `planBilling` collections
++- `MCA-`, `MCS-`, `MCP-`, `MCX-`, `MCR-` reference prefixes and their
++  `smsTopUps` / `planBilling` / `reportCreditTopUps` /
++  `reportAlacartePurchases` collections
+ - `userChamas/{uid}/memberships/{chamaId}` sync trigger
+diff --git a/docs/CONVENTIONS.md b/docs/CONVENTIONS.md
+index 406945d..4068a95 100644
+--- a/docs/CONVENTIONS.md
++++ b/docs/CONVENTIONS.md
+@@ -72,10 +72,12 @@ invent a new prefix inline in a handler.
+ | `MCA-` | App payment | `paymentIntents` | `mychama1` Python (`initiatePayment`) |
+ | `MCS-` | SMS credit top-up | `smsTopUps` | `mychama1` Python (`purchaseSmsCredits`) |
+ | `MCP-` | Plan billing | `planBilling` | `mychama1` Python (`upgradePlan`) |
++| `MCX-` | Reports-engine wallet top-up | `reportCreditTopUps` | `mychama1` Python (`purchaseReportCredits`) |
++| `MCR-` | Starter/Basic one-off premium report | `reportAlacartePurchases` | `mychama1` Python (`purchasePremiumReportAlaCarte`) |
+ 
+ Format: `{PREFIX}-{chamaId}-{purposeCode}-{epochMs}-{rand6}` for
+ `MCW-`/`MCA-` (purpose code is `CNT`/`LNR`/`MGR`); `{PREFIX}-{chamaId}-{epochMs}-{rand6}`
+-(no purpose code) for `MCS-`/`MCP-`. Cash transactions use
++(no purpose code) for `MCS-`/`MCP-`/`MCX-`/`MCR-`. Cash transactions use
+ `CASH{rand6}` (no chama/purpose encoded — cash never touches the webhook).
+ 
+ ## 6. Firestore security rules are not optional in Python
+diff --git a/firestore.rules b/firestore.rules
+index 84bfb68..0ce10b6 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -124,6 +124,8 @@ service cloud.firestore {
+                              'settlementAccount', 'settlementSplitCode',
+                              'autoSettle', 'settlementFreq', 'lastSettlement',
+                              'smsCredits', 'minutesExportsUsedThisMonth',
++                             'standardReportsUsedThisMonth', 'premiumReportsUsedThisMonth',
++                             'premiumAlacarteUsedThisMonth', 'reportCreditsBalance',
+                              'status', 'createdAt', 'openingBalance'
+                            ])
+                       ) || (
+@@ -467,6 +469,24 @@ service cloud.firestore {
+         allow write: if false;
+       }
+ 
++      // -------------------------------------------------------------- //
++      // reportCreditTopUps / reportAlacartePurchases — reports engine
++      // (this patch). Same trust model as smsTopUps/planBilling exactly:
++      // server-written (purchaseReportCredits / purchasePremiumReportAlaCarte),
++      // settled by the PAY repo's webhook, finance-admin-only read since
++      // neither is tied to one member.
++      // -------------------------------------------------------------- //
++
++      match /reportCreditTopUps/{reference} {
++        allow read: if isFinanceAdmin(chamaId);
++        allow write: if false;
++      }
++
++      match /reportAlacartePurchases/{reference} {
++        allow read: if isFinanceAdmin(chamaId);
++        allow write: if false;
++      }
++
+       // -------------------------------------------------------------- //
+       // invites — server-only (addMember/addAdmin create, claimInvite
+       // reads/settles). Made explicit here rather than left to the
+diff --git a/firestoreData.json b/firestoreData.json
+index 990d04a..06420aa 100644
+--- a/firestoreData.json
++++ b/firestoreData.json
+@@ -39,12 +39,29 @@
+ 
+   "plans": {
+     "order": ["free", "starter", "basic", "growth", "max"],
+-    "free":    { "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": false, "onlineCollection": false },
+-    "starter": { "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": true,  "onlineCollection": true },
+-    "basic":   { "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "minutesQuota": 3,    "exportsAllowed": true,  "onlineCollection": true },
+-    "growth":  { "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
+-    "max":     { "price": 4990, "memberLimit": 999, "smsRate": 0.5, "minutesQuota": null, "exportsAllowed": true,  "onlineCollection": true },
+-    "minutesQuotaNull": "null means unlimited. Beyond quota, a minutes export costs KES 100."
++    "free":    { "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "exportsAllowed": false, "onlineCollection": false, "standardReportCredits": 0,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 0 },
++    "starter": { "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": 3,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 1 },
++    "basic":   { "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": 8,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 2 },
++    "growth":  { "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": null, "premiumReportCredits": 4,  "premiumAlacarteCapPerMonth": null },
++    "max":     { "price": 4990, "memberLimit": 999, "smsRate": 0.5, "exportsAllowed": true,  "onlineCollection": true,  "standardReportCredits": null, "premiumReportCredits": 10, "premiumAlacarteCapPerMonth": null },
++    "note": "minutesQuota/minutesExportsUsedThisMonth (pre-reports-engine) retired in favour of standardReportCredits/premiumReportCredits/premiumAlacarteCapPerMonth — see functions/shared/constants.py's PLANS docstring. null = unlimited."
++  },
++
++  "reportCatalog": {
++    "note": "See functions/shared/constants.py REPORT_TYPES for the authoritative version this must stay identical to. All KES prices include the standing 20% launch discount.",
++    "walletCreditPriceKes": 56,
++    "walletBundle10Kes": 504,
++    "walletBundle30Kes": 1400,
++    "premiumAlacarteCreditPriceKes": 144,
++    "reports": {
++      "member_statement":    { "label": "Individual Member Statement",           "tier": "standard", "credits": 1, "periodMode": "range", "encryptDefault": true,  "encryptOptional": false },
++      "contribution_ledger": { "label": "Contribution Summary & Tracking Ledger", "tier": "standard", "credits": 1, "periodMode": "range", "encryptDefault": false, "encryptOptional": true },
++      "arrears_penalties":   { "label": "Arrears & Penalties Report",            "tier": "standard", "credits": 2, "periodMode": "as_of", "encryptDefault": false, "encryptOptional": true },
++      "minutes":             { "label": "Meeting Minutes Export",                "tier": "standard", "credits": 1, "periodMode": "single", "encryptDefault": false, "encryptOptional": false },
++      "cashflow":            { "label": "Cashflow Statement",                    "tier": "premium",  "credits": 2, "periodMode": "range", "encryptDefault": false, "encryptOptional": true },
++      "profit_loss":         { "label": "Profit & Loss Statement",               "tier": "premium",  "credits": 3, "periodMode": "range", "encryptDefault": true,  "encryptOptional": false },
++      "balance_sheet":       { "label": "Balance Sheet",                         "tier": "premium",  "credits": 3, "periodMode": "as_of", "encryptDefault": true,  "encryptOptional": false }
++    }
+   },
+ 
+   "collections": {
+@@ -67,7 +84,12 @@
+         "autoSettle": { "type": "boolean" },
+         "settlementFreq": { "type": "string", "enum": ["daily", "weekly", "monthly"] },
+         "lastSettlement": { "type": "string", "format": "YYYY-MM-DD" },
+-        "minutesExportsUsedThisMonth": { "type": "number" },
++        "minutesExportsUsedThisMonth": { "type": "number", "note": "LEGACY — pre-reports-engine name, kept as a read fallback only. See standardReportsUsedThisMonth." },
++        "standardReportsUsedThisMonth": { "type": "number" },
++        "premiumReportsUsedThisMonth": { "type": "number" },
++        "premiumAlacarteUsedThisMonth": { "type": "number", "note": "Starter/Basic only — counts toward premiumAlacarteCapPerMonth, reserved at purchase time." },
++        "reportCreditsBalance": { "type": "number", "note": "Prepaid wallet — spent as STANDARD credits on Starter/Basic, PREMIUM credits on Growth/Max. Credited by the PAY repo's webhook on an MCX- reference succeeding." },
++        "fiscalYearStartMonth": { "type": "number", "note": "1-12, defaults to 1 (January) when absent." },
+         "status": { "type": "string", "enum": ["active", "suspended"], "required": true, "note": "The bot skips suspended chamas during membership lookup." },
+         "whatsappEnabled": { "type": "boolean", "default": true },
+         "createdAt": { "type": "number" },
+diff --git a/functions/main.py b/functions/main.py
+index d7b4778..5909d3f 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -80,3 +80,12 @@ from mychama.billing import (  # noqa: E402,F401
+     sweep_plan_expiry,
+     reset_monthly_export_quota,
+ )
++
++# --- Reports engine (this patch): Contribution Ledger, Arrears &
++#     Penalties, P&L, Balance Sheet + the wallet/à-la-carte purchase flows.
++#     See functions/shared/reports_engine.py and functions/mychama/reports.py. ---
++from mychama.reports import (  # noqa: E402,F401
++    generateReport,
++    purchaseReportCredits,
++    purchasePremiumReportAlaCarte,
++)
+diff --git a/functions/mychama/billing.py b/functions/mychama/billing.py
+index c637165..5cc0ecc 100644
+--- a/functions/mychama/billing.py
++++ b/functions/mychama/billing.py
+@@ -48,13 +48,14 @@ import io
+ import secrets as pysecrets
+ from datetime import timedelta
+ 
+-from firebase_admin import firestore, storage
++from firebase_admin import firestore
+ from firebase_functions import https_fn, scheduler_fn
+ 
+ from shared import firestore_paths as paths
+ from shared import ids
+ from shared import paystack
+-from shared.constants import MC, PLAN_ORDER, PLANS
++from shared import reports_engine
++from shared.constants import MC, PLAN_ORDER, PLANS, REPORT_TYPES
+ from shared.dates import now_ms, today_iso, add_days_iso
+ from shared.errors import bad_request, not_found, precondition, rate_limited, require_auth, upstream_failure
+ from shared.idempotency import already_applied, record_result
+@@ -246,7 +247,7 @@ def _render_csv(chama_name: str, rows: list[dict], names: dict, scope_label: str
+     return buf.getvalue().encode("utf-8")
+ 
+ 
+-def _render_pdf(chama_name: str, rows: list[dict], names: dict, scope_label: str, date_from: str, date_to: str) -> bytes:
++def _render_pdf(chama_name: str, rows: list[dict], names: dict, scope_label: str, date_from: str, date_to: str, encrypt_enc=None) -> bytes:
+     from reportlab.lib import colors
+     from reportlab.lib.pagesizes import A4
+     from reportlab.lib.styles import getSampleStyleSheet
+@@ -255,10 +256,13 @@ def _render_pdf(chama_name: str, rows: list[dict], names: dict, scope_label: str
+ 
+     styles = getSampleStyleSheet()
+     buf = io.BytesIO()
+-    doc = SimpleDocTemplate(
+-        buf, pagesize=A4,
++    doc_kwargs = dict(
++        pagesize=A4,
+         topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm,
+     )
++    if encrypt_enc is not None:
++        doc_kwargs["encrypt"] = encrypt_enc
++    doc = SimpleDocTemplate(buf, **doc_kwargs)
+     story = [
+         Paragraph(chama_name, styles["Title"]),
+         Paragraph(f"Statement — {scope_label}", styles["Heading3"]),
+@@ -342,22 +346,33 @@ def _render_minutes_pdf(chama_name: str, minute: dict) -> bytes:
+     return buf.getvalue()
+ 
+ 
+-STORAGE_BUCKET = "mychama1.firebasestorage.app"  # must match src/lib/firebase.ts storageBucket
+-
+-
+ def _upload_and_sign(chama_id: str, filename: str, content: bytes, content_type: str) -> str:
+-    bucket = storage.bucket(STORAGE_BUCKET)
+-    blob = bucket.blob(f"statements/{chama_id}/{filename}")
+-    blob.upload_from_string(content, content_type=content_type)
+     # See TOUCH_BASE.md "Go-live checklist" — the Cloud Functions runtime
+     # service account needs roles/iam.serviceAccountTokenCreator on itself
+     # for generate_signed_url to work; without it this raises and the
+     # error surfaces to the caller as an 'internal' failure.
+-    return blob.generate_signed_url(version="v4", expiration=STATEMENT_URL_TTL, method="GET")
++    # Delegates to shared/reports_engine.py so there's exactly one storage
++    # bucket constant and one signed-URL TTL policy for every report type.
++    return reports_engine.upload_and_sign(chama_id, filename, content, content_type, STATEMENT_URL_TTL)
+ 
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID])
+ def generateStatement(req: https_fn.CallableRequest) -> dict:
++    """
++    Member-scoped statement ('member_statement' — standard tier, and FREE
++    with no credit charge at all when a member pulls their OWN, on any
++    plan including Free — see reports_engine's spend_credits docstring
++    and TOUCH_BASE.md "Reports engine — member self-serve carve-out"),
++    minutes export ('minutes' — standard tier), or a whole-chama/pot
++    statement ('cashflow' — PREMIUM tier as of this patch: Growth/Max
++    monthly allowance, or Starter/Basic via a paid alacarteReference from
++    purchasePremiumReportAlaCarte — see functions/mychama/reports.py).
++
++    Encryption: member_statement is always encrypted (PII); cashflow is
++    optional (`data.get('encrypt')`, default off — chamas routinely share
++    an unencrypted whole-chama cashflow to the group); minutes is never
++    encrypted. See functions/shared/constants.py REPORT_TYPES.
++    """
+     uid = require_auth(req)
+     data = req.data or {}
+     chama_id = data.get("chamaId")
+@@ -367,11 +382,14 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     fmt = data.get("format")
+     minutes_id = data.get("minutesId")  # minimal, documented addition — see TOUCH_BASE.md
+     pot_id = data.get("potId")  # optional — scopes the statement to one MGR pot, see mychama/mgr.py
++    encrypt_requested = data.get("encrypt")
++    alacarte_reference = data.get("alacarteReference")  # Starter/Basic consuming a paid whole-chama purchase
++    period_preset = data.get("period")  # optional preset key — resolved server-side, see reports_engine.resolve_range
+ 
+     if not chama_id or fmt not in ("pdf", "csv"):
+         raise bad_request("chamaId and a valid format ('pdf' or 'csv') are required.")
+-    if not minutes_id and (not date_from or not date_to):
+-        raise bad_request("from and to dates are required.")
++    if not minutes_id and not period_preset and (not date_from or not date_to):
++        raise bad_request("A period (or from and to dates) is required.")
+ 
+     db = _db()
+     membership = require_membership(db, uid, chama_id)
+@@ -381,57 +399,96 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     if not member_id and not membership.is_finance_admin:
+         raise https_fn.HttpsError("permission-denied", "A whole-chama statement needs the chair or treasurer role.")
+ 
+-    chama_snap = db.document(paths.chama(chama_id)).get()
++    chama_ref = db.document(paths.chama(chama_id))
++    chama_snap = chama_ref.get()
+     if not chama_snap.exists:
+         raise not_found("Chama not found.")
+     chama = chama_snap.to_dict()
+-    plan = chama.get("plan", "free")
+-    plan_cfg = PLANS.get(plan, PLANS["free"])
+-
+-    if not plan_cfg["exportsAllowed"]:
+-        raise precondition(f"Exports aren't available on the {plan_cfg['name']} plan — upgrade to generate statements or export minutes.")
+-
+-    quota = plan_cfg["minutesQuota"]
+-    used = chama.get("minutesExportsUsedThisMonth", 0)
+-    if quota is not None and used >= quota:
+-        raise precondition(
+-            f"This chama has used its {quota} free export{'s' if quota != 1 else ''} for this month. "
+-            "More free exports are available next month, or upgrade the plan for a higher (or unlimited) allowance."
+-        )
+-
+-    chama_ref = db.document(paths.chama(chama_id))
+     chama_name = chama.get("name", "MyChama")
+ 
++    if not minutes_id and period_preset:
++        date_from, date_to = reports_engine.resolve_range(
++            period_preset, date_from, date_to, chama.get("fiscalYearStartMonth", 1)
++        )
++
+     if minutes_id:
+-        minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
+-        if not minute_snap.exists:
+-            raise not_found("Minutes not found.")
+-        content = _render_minutes_pdf(chama_name, minute_snap.to_dict())
+-        filename = f"minutes-{minutes_id}-{now_ms()}.pdf"
+-        content_type = "application/pdf"
++        report_key = "minutes"
++    elif member_id:
++        report_key = "member_statement"
+     else:
+-        names = _member_name_map(db, chama_id)
+-        pot_label = None
+-        if pot_id:
+-            pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
+-            if not pot_snap.exists:
+-                raise not_found("Merry-go-round pot not found.")
+-            pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
+-        base_label = names.get(member_id, "Member") if member_id else "Whole chama"
+-        scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
+-        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
++        report_key = "cashflow"
++
++    is_self_service = bool(member_id) and member_id == membership.member_id
++
++    charge_info = None
++    if is_self_service:
++        pass  # free, no plan/credit check at all — see docstring
++    elif report_key == "cashflow" and PLANS.get(chama.get("plan", "free"), PLANS["free"])["premiumReportCredits"] == 0:
++        if not alacarte_reference:
++            plan_cfg = PLANS.get(chama.get("plan", "free"), PLANS["free"])
++            raise precondition(
++                f"A whole-chama statement isn't included on the {plan_cfg['name']} plan. "
++                "Buy it as a one-off first with purchasePremiumReportAlaCarte, then pass the reference here."
++            )
++        purchase = reports_engine.consume_alacarte_purchase(db, chama_id, "cashflow", alacarte_reference)
++        date_from = purchase.get("dateFrom", date_from)
++        date_to = purchase.get("dateTo", date_to)
++        fmt = purchase.get("format", fmt)
++        encrypt_requested = purchase.get("encrypt", encrypt_requested)
++        charge_info = {"source": "alacarte", "reference": alacarte_reference}
++    else:
++        charge_info = reports_engine.spend_credits(db, chama_ref, chama, report_key)
++
++    try:
++        spec = REPORT_TYPES[report_key]
++        encrypt = spec["encryptDefault"] if not spec["encryptOptional"] else bool(encrypt_requested if encrypt_requested is not None else spec["encryptDefault"])
+         if fmt == "csv":
+-            content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
+-            content_type = "text/csv"
+-        else:
+-            content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to)
++            encrypt = False  # see reports_engine module docstring — CSV encryption isn't implemented yet
++        pin = reports_engine.generate_pin() if encrypt else None
++        encrypt_enc = reports_engine.build_encryption(pin) if pin else None
++
++        if minutes_id:
++            minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
++            if not minute_snap.exists:
++                raise not_found("Minutes not found.")
++            content = _render_minutes_pdf(chama_name, minute_snap.to_dict())
++            filename = f"minutes-{minutes_id}-{now_ms()}.pdf"
+             content_type = "application/pdf"
+-        filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
+-
+-    url = _upload_and_sign(chama_id, filename, content, content_type)
+-
+-    chama_ref.update({"minutesExportsUsedThisMonth": used + 1, "updatedAt": now_ms()})
+-    return {"url": url}
++        else:
++            names = _member_name_map(db, chama_id)
++            pot_label = None
++            if pot_id:
++                pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
++                if not pot_snap.exists:
++                    raise not_found("Merry-go-round pot not found.")
++                pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
++            base_label = names.get(member_id, "Member") if member_id else "Whole chama"
++            scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
++            rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
++            if fmt == "csv":
++                content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
++                content_type = "text/csv"
++            else:
++                content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to, encrypt_enc)
++                content_type = "application/pdf"
++            filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
++
++        url = _upload_and_sign(chama_id, filename, content, content_type)
++    except Exception:
++        reports_engine.refund_charge(db, chama_id, chama_ref, report_key, charge_info)
++        raise
++
++    pin_sent_to: list[str] = []
++    if pin:
++        recipients = [membership_phone(db, chama_id, membership.member_id)] if is_self_service else reports_engine.admin_pin_recipients(db, chama_id)
++        pin_sent_to = reports_engine.notify_pin(db, chama, pin, spec["label"], [p for p in recipients if p])
++
++    return {"url": url, "encrypted": bool(pin), "pinSentTo": len(pin_sent_to), "charge": charge_info}
++
++
++def membership_phone(db, chama_id: str, member_id: str) -> str | None:
++    snap = db.document(paths.member(chama_id, member_id)).get()
++    return (snap.to_dict() or {}).get("phoneNormalized") if snap.exists else None
+ 
+ 
+ # --------------------------------------------------------------------- #
+@@ -508,13 +565,26 @@ def sweep_plan_expiry(event: scheduler_fn.ScheduledEvent) -> None:
+ 
+ @scheduler_fn.on_schedule(schedule="1 of month 00:30", region="us-central1", timezone=scheduler_fn.Timezone("Africa/Nairobi"))
+ def reset_monthly_export_quota(event: scheduler_fn.ScheduledEvent) -> None:
+-    """Nothing reset this before Phase 4 — a chama that used its one free
+-    export in its first month would otherwise stay locked out forever."""
++    """
++    Nothing reset this before Phase 4 — a chama that used its one free
++    export in its first month would otherwise stay locked out forever.
++
++    Extended by the reports engine (this patch) to also reset the two new
++    monthly credit counters and the Starter/Basic à la carte cap counter.
++    `minutesExportsUsedThisMonth` is kept reset in lockstep purely as a
++    legacy fallback for any reader that hasn't been updated yet — see the
++    LEGACY note on that field in functions/shared/types.py.
++    """
+     db = _db()
+     batch = db.batch()
+     n = 0
+     for doc in db.collection(MC.CHAMAS).where("status", "==", "active").stream():
+-        batch.update(doc.reference, {"minutesExportsUsedThisMonth": 0})
++        batch.update(doc.reference, {
++            "minutesExportsUsedThisMonth": 0,
++            "standardReportsUsedThisMonth": 0,
++            "premiumReportsUsedThisMonth": 0,
++            "premiumAlacarteUsedThisMonth": 0,
++        })
+         n += 1
+         if n % 400 == 0:  # batched writes cap at 500
+             batch.commit()
+diff --git a/functions/mychama/identity.py b/functions/mychama/identity.py
+index 51d2040..c210068 100644
+--- a/functions/mychama/identity.py
++++ b/functions/mychama/identity.py
+@@ -139,6 +139,11 @@ def createChama(req: https_fn.CallableRequest) -> dict:
+             "settlementSplitCode": None,
+             "autoSettle": False,
+             "minutesExportsUsedThisMonth": 0,
++            "standardReportsUsedThisMonth": 0,
++            "premiumReportsUsedThisMonth": 0,
++            "premiumAlacarteUsedThisMonth": 0,
++            "reportCreditsBalance": 0,
++            "fiscalYearStartMonth": 1,
+             "status": "active",
+             "whatsappEnabled": True,
+             "createdAt": ts,
+diff --git a/functions/mychama/reports.py b/functions/mychama/reports.py
+new file mode 100644
+index 0000000..74bfd47
+--- /dev/null
++++ b/functions/mychama/reports.py
+@@ -0,0 +1,347 @@
++"""
++Reports — Phase 4 extension (this patch).
++
++generateReport                — the four NEW report types (contribution
++                                ledger, arrears & penalties, P&L, balance
++                                sheet). Individual Member Statement,
++                                Cashflow (the whole-chama case of the same
++                                statement) and Minutes export stay on the
++                                pre-existing generateStatement in
++                                billing.py, now updated to charge through
++                                the same shared/reports_engine credit
++                                accounting — see billing.py's module
++                                docstring for why the two callables
++                                co-exist instead of one being replaced.
++
++purchaseReportCredits         — prepaid wallet top-up. Exactly the
++                                purchaseSmsCredits pattern (see
++                                functions/mychama/sms.py): creates a
++                                pending doc + Paystack STK push; the PAY
++                                repo's webhook credits chamas.reportCreditsBalance
++                                on success. NOT wired on the PAY side yet
++                                — see TOUCH_BASE.md.
++
++purchasePremiumReportAlaCarte — Starter/Basic one-off premium-report
++                                purchase, capped at PLANS[plan].premiumAlacarteCapPerMonth
++                                per month (checked and reserved AT PURCHASE
++                                time, not at generation time, so several
++                                pending payments can't add up past the
++                                cap). Same PAY-webhook caveat as above.
++"""
++
++from __future__ import annotations
++
++from datetime import timedelta
++
++from firebase_admin import firestore
++from firebase_functions import https_fn
++
++from shared import firestore_paths as paths
++from shared import ids
++from shared import paystack
++from shared import reports_engine as engine
++from shared.constants import PLANS, REPORT_TYPES, ReportTier, SECURITY
++from shared.dates import now_ms
++from shared.errors import bad_request, not_found, precondition, rate_limited, require_auth, upstream_failure
++from shared.idempotency import already_applied, record_result
++from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone
++from shared.roles import require_finance_admin
++from shared.secrets import PAYSTACK_SECRET_KEY
++
++REGION = "africa-south1"
++STATEMENT_URL_TTL = timedelta(hours=48)  # matches billing.py's STATEMENT_URL_TTL
++
++
++def _db():
++    return firestore.client()
++
++
++NEW_REPORT_TYPES = ("contribution_ledger", "arrears_penalties", "profit_loss", "balance_sheet")
++
++
++@https_fn.on_call(region=REGION, secrets=[])
++def generateReport(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    report_type = data.get("reportType")
++    fmt = data.get("format")
++    period_preset = data.get("period")
++    date_from = data.get("from")
++    date_to = data.get("to")
++    as_of = data.get("asOf")
++    encrypt_requested = data.get("encrypt")
++    alacarte_reference = data.get("alacarteReference")  # set when consuming a paid Starter/Basic one-off
++
++    if report_type not in NEW_REPORT_TYPES:
++        raise bad_request(f"reportType must be one of {NEW_REPORT_TYPES}.")
++    if fmt not in ("pdf", "csv"):
++        raise bad_request("format must be 'pdf' or 'csv'.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)  # all four new report types are chama-wide, finance-admin only
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    chama_ref = db.document(paths.chama(chama_id))
++    chama_snap = chama_ref.get()
++    if not chama_snap.exists:
++        raise not_found("Chama not found.")
++    chama = chama_snap.to_dict()
++    plan = chama.get("plan", "free")
++    plan_cfg = PLANS.get(plan, PLANS["free"])
++    spec = REPORT_TYPES[report_type]
++
++    # PDF-only, always-encrypted report types don't offer CSV — encryption
++    # is the whole point of that tier and a CSV can't carry it the same way.
++    if spec["encryptDefault"] and not spec["encryptOptional"] and fmt == "csv":
++        raise bad_request(f"{spec['label']} is only available as an encrypted PDF, not CSV.")
++
++    encrypt = spec["encryptDefault"] if not spec["encryptOptional"] else bool(encrypt_requested if encrypt_requested is not None else spec["encryptDefault"])
++    if fmt == "csv":
++        encrypt = False  # see note above generateReport's module docstring — CSV encryption isn't implemented yet
++
++    # ---- Charging: monthly pool / wallet, OR consume a paid à la carte purchase. ----
++    charge_info = None
++    if spec["tier"] == ReportTier.PREMIUM and plan_cfg["premiumReportCredits"] == 0:
++        # Starter/Basic — must have a successful, unconsumed à la carte purchase for this exact report.
++        if not alacarte_reference:
++            raise precondition(
++                f"{spec['label']} isn't included on the {plan_cfg['name']} plan. "
++                "Buy it as a one-off first with purchasePremiumReportAlaCarte, then pass the reference here."
++            )
++
++        purchase = engine.consume_alacarte_purchase(db, chama_id, report_type, alacarte_reference)
++        # The purchase's own saved parameters are authoritative — a paid-for
++        # report can't be silently redirected to a different period by
++        # resending different from/to/asOf in this call.
++        date_from = purchase.get("dateFrom", date_from)
++        date_to = purchase.get("dateTo", date_to)
++        as_of = purchase.get("asOf", as_of)
++        fmt = purchase.get("format", fmt)
++        encrypt = purchase.get("encrypt", encrypt)
++        period_preset = "custom"  # the purchase's stored concrete dates win over any preset resent here
++        charge_info = {"source": "alacarte", "reference": alacarte_reference}
++    else:
++        charge_info = engine.spend_credits(db, chama_ref, chama, report_type)
++
++    try:
++        # ---- Period resolution. ----
++        fiscal_start = chama.get("fiscalYearStartMonth", 1)
++        if spec["periodMode"] == "range":
++            date_from, date_to = engine.resolve_range(period_preset, date_from, date_to, fiscal_start)
++        else:  # as_of
++            as_of = engine.resolve_as_of(period_preset, as_of)
++
++        chama_name = chama.get("name", "MyChama")
++
++        # ---- Build + render. ----
++        if report_type == "contribution_ledger":
++            report_data = engine.build_contribution_ledger(db, chama_id, date_from, date_to)
++            render_pdf, render_csv = engine.render_contribution_ledger_pdf, engine.render_contribution_ledger_csv
++        elif report_type == "arrears_penalties":
++            report_data = engine.build_arrears_penalties(db, chama_id, as_of)
++            render_pdf, render_csv = engine.render_arrears_penalties_pdf, engine.render_arrears_penalties_csv
++        elif report_type == "profit_loss":
++            report_data = engine.build_profit_and_loss(db, chama_id, date_from, date_to, plan)
++            render_pdf, render_csv = engine.render_profit_and_loss_pdf, engine.render_profit_and_loss_csv
++        else:  # balance_sheet
++            report_data = engine.build_balance_sheet(db, chama_id, as_of, chama)
++            render_pdf, render_csv = engine.render_balance_sheet_pdf, engine.render_balance_sheet_csv
++
++        pin = None
++        if fmt == "csv":
++            content = render_csv(report_data)
++            content_type = "text/csv"
++        else:
++            if encrypt:
++                pin = engine.generate_pin()
++                content = render_pdf(chama_name, report_data, engine.build_encryption(pin))
++            else:
++                content = render_pdf(chama_name, report_data, None)
++            content_type = "application/pdf"
++
++        filename = f"report-{report_type}-{chama_id}-{now_ms()}.{fmt}"
++        url = engine.upload_and_sign(chama_id, filename, content, content_type, STATEMENT_URL_TTL)
++    except Exception:
++        engine.refund_charge(db, chama_id, chama_ref, report_type, charge_info)
++        raise
++
++    pin_sent_to: list[str] = []
++    if pin:
++        # All four new report types are finance-admin-only (chair/treasurer),
++        # so the PIN always goes to the admins, never a self-service case.
++        pin_sent_to = engine.notify_pin(db, chama, pin, spec["label"], engine.admin_pin_recipients(db, chama_id))
++
++    result = {"url": url, "encrypted": bool(pin), "pinSentTo": len(pin_sent_to), "charge": charge_info}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++@https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
++def purchaseReportCredits(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    credits = data.get("credits")
++    phone = data.get("phone") or ""
++
++    if not chama_id:
++        raise bad_request("chamaId is required.")
++    if not isinstance(credits, int) or credits <= 0:
++        raise bad_request("credits must be a positive whole number.")
++    if not is_valid_kenyan_phone(phone):
++        raise bad_request("A valid Kenyan phone number is required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    from shared.constants import REPORT_WALLET_BUNDLES, REPORT_WALLET_CREDIT_PRICE_KES
++    amount_kes = REPORT_WALLET_BUNDLES.get(credits, credits * REPORT_WALLET_CREDIT_PRICE_KES)
++
++    reference = ids.build_report_credit_topup_reference(chama_id)
++    ts = now_ms()
++    normalized_phone = normalize_phone(phone)
++
++    db.document(paths.report_credit_topup(chama_id, reference)).set({
++        "chamaId": chama_id,
++        "credits": credits,
++        "amountKes": float(amount_kes),
++        "phone": normalized_phone,
++        "status": "pending",
++        "createdAt": ts,
++        "expiresAt": ts + SECURITY["PAYMENT_INTENT_TTL_SECONDS"] * 1000,
++    })
++
++    try:
++        paystack.charge_mobile_money(
++            secret_key=PAYSTACK_SECRET_KEY.value,
++            email=f"{chama_id}@mychama.app",
++            amount_kes=float(amount_kes),
++            phone_e164=normalized_phone,
++            provider=detect_provider(phone),
++            reference=reference,
++            metadata={"chargeType": "mychama_report_credit_topup", "targetProject": "mychama1", "chamaId": chama_id, "credits": credits},
++        )
++    except Exception as exc:  # noqa: BLE001
++        db.document(paths.report_credit_topup(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})
++        raise upstream_failure("Could not start the top-up payment with Paystack. Please try again.") from exc
++
++    result = {"reference": reference, "amountKes": amount_kes}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
++@https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
++def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    report_type = data.get("reportType")
++    phone = data.get("phone") or ""
++    fmt = data.get("format", "pdf")
++    period_preset = data.get("period")
++
++    if report_type not in ("cashflow", "profit_loss", "balance_sheet"):
++        raise bad_request("reportType must be one of: cashflow, profit_loss, balance_sheet.")
++    if not is_valid_kenyan_phone(phone):
++        raise bad_request("A valid Kenyan phone number is required.")
++
++    db = _db()
++    require_finance_admin(db, uid, chama_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    chama_ref = db.document(paths.chama(chama_id))
++    chama_snap = chama_ref.get()
++    if not chama_snap.exists:
++        raise not_found("Chama not found.")
++    chama = chama_snap.to_dict()
++    plan = chama.get("plan", "free")
++    plan_cfg = PLANS.get(plan, PLANS["free"])
++    cap = plan_cfg["premiumAlacarteCapPerMonth"]
++
++    if cap is None:
++        raise precondition(
++            f"The {plan_cfg['name']} plan already includes premium reports in its monthly allowance — "
++            "generate it directly with generateReport instead of buying it à la carte."
++        )
++    if cap == 0:
++        raise precondition(f"Premium reports aren't available on the {plan_cfg['name']} plan.")
++
++    from shared.constants import premium_alacarte_price_kes
++
++    # Resolve any preset NOW and store concrete dates on the purchase doc —
++    # a paid-for report must not drift to a different period if it's
++    # consumed after a month/quarter boundary.
++    spec = REPORT_TYPES[report_type]
++    date_from, date_to, as_of = data.get("from"), data.get("to"), data.get("asOf")
++    fiscal_start = chama.get("fiscalYearStartMonth", 1)
++    if spec["periodMode"] == "range":
++        date_from, date_to = engine.resolve_range(period_preset, date_from, date_to, fiscal_start)
++    elif spec["periodMode"] == "as_of":
++        as_of = engine.resolve_as_of(period_preset, as_of)
++
++    @firestore.transactional
++    def _reserve(transaction: firestore.Transaction) -> int:
++        snap = chama_ref.get(transaction=transaction)
++        c = snap.to_dict() or {}
++        used = c.get("premiumAlacarteUsedThisMonth", 0) or 0
++        if used >= cap:
++            raise rate_limited(
++                f"This chama has used its {cap} à la carte premium report{'s' if cap != 1 else ''} for this month. "
++                "Upgrade to Growth for a monthly premium allowance instead."
++            )
++        transaction.update(chama_ref, {"premiumAlacarteUsedThisMonth": used + 1, "updatedAt": now_ms()})
++        return used + 1
++
++    _reserve(db.transaction())
++
++    amount_kes = premium_alacarte_price_kes(report_type)
++    reference = ids.build_report_alacarte_reference(chama_id)
++    ts = now_ms()
++    normalized_phone = normalize_phone(phone)
++
++    db.document(paths.report_alacarte_purchase(chama_id, reference)).set({
++        "chamaId": chama_id,
++        "reportType": report_type,
++        "format": fmt,
++        "encrypt": REPORT_TYPES[report_type]["encryptDefault"],
++        "memberId": data.get("memberId"),
++        "dateFrom": data.get("from"),
++        "dateTo": data.get("to"),
++        "asOf": data.get("asOf"),
++        "amountKes": float(amount_kes),
++        "phone": normalized_phone,
++        "status": "pending",
++        "createdAt": ts,
++        "expiresAt": ts + SECURITY["PAYMENT_INTENT_TTL_SECONDS"] * 1000,
++    })
++
++    try:
++        paystack.charge_mobile_money(
++            secret_key=PAYSTACK_SECRET_KEY.value,
++            email=f"{chama_id}@mychama.app",
++            amount_kes=float(amount_kes),
++            phone_e164=normalized_phone,
++            provider=detect_provider(phone),
++            reference=reference,
++            metadata={"chargeType": "mychama_report_alacarte", "targetProject": "mychama1", "chamaId": chama_id, "reportType": report_type},
++        )
++    except Exception as exc:  # noqa: BLE001
++        db.document(paths.report_alacarte_purchase(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})
++        # Refund the reserved cap slot — the purchase never actually started.
++        chama_ref.update({"premiumAlacarteUsedThisMonth": firestore.Increment(-1), "updatedAt": now_ms()})
++        raise upstream_failure("Could not start the payment with Paystack. Please try again.") from exc
++
++    result = {"reference": reference, "amountKes": amount_kes}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
+diff --git a/functions/shared/constants.py b/functions/shared/constants.py
+index b7f94a5..a8fd269 100644
+--- a/functions/shared/constants.py
++++ b/functions/shared/constants.py
+@@ -48,6 +48,8 @@ class MC:
+     WHATSAPP_AUDIT = "whatsappAuditLog"
+     WHATSAPP_RATE_LIMITS = "whatsappRateLimits"
+     INVITES = "invites"
++    REPORT_CREDIT_TOPUPS = "reportCreditTopUps"
++    REPORT_ALACARTE_PURCHASES = "reportAlacartePurchases"
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -79,16 +81,45 @@ MGR_PAYOUT_MARKUP_RATE = {
+ 
+ # --------------------------------------------------------------------------
+ # Plans — mirrors firestoreData.json -> plans exactly.
++#
++# `minutesQuota` / `minutesExportsUsedThisMonth` (pre-reports-engine) are
++# RETIRED in favour of two explicit credit pools, added by the reports
++# engine (see REPORT_TYPES and functions/shared/reports_engine.py below):
++#
++#   standardReportCredits  — monthly allowance for STANDARD reports
++#                             (member statement, contribution ledger,
++#                             arrears & penalties, minutes export).
++#                             None = unlimited.
++#   premiumReportCredits    — monthly allowance for PREMIUM reports (the
++#                             three formal financial statements: cashflow,
++#                             P&L, balance sheet). 0 means premium reports
++#                             are not unlockable on this plan at all
++#                             (Starter/Basic) except via the à la carte
++#                             one-off purchase below.
++#   premiumAlacarteCapPerMonth — Starter/Basic only. How many premium
++#                             reports/month can be bought one-off (see
++#                             `purchasePremiumReportAlaCarte` in
++#                             functions/mychama/reports.py) WITHOUT
++#                             upgrading. None on Growth/Max — not
++#                             applicable, they already get premiumReportCredits
++#                             + can top up the reportCreditsBalance wallet.
++#
++# A chama on any paid plan keeps ONE prepaid wallet, `reportCreditsBalance`
++# (see Chama in types.py) — on Starter/Basic it tops up STANDARD credits
++# beyond the monthly allowance; on Growth/Max it tops up PREMIUM credits
++# beyond theirs (Growth/Max standard reports are already unlimited, so
++# there's nothing to top up there). Which meaning applies is derived from
++# the chama's current plan at spend time — see reports_engine.spend_credits.
+ # --------------------------------------------------------------------------
+ 
+ PLAN_ORDER = ["free", "starter", "basic", "growth", "max"]
+ 
+ PLANS = {
+-    "free":    {"name": "Free",    "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": False, "onlineCollection": False},
+-    "starter": {"name": "Starter", "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": True,  "onlineCollection": True},
+-    "basic":   {"name": "Basic",   "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "minutesQuota": 3,    "exportsAllowed": True,  "onlineCollection": True},
+-    "growth":  {"name": "Growth",  "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "minutesQuota": None, "exportsAllowed": True,  "onlineCollection": True},
+-    "max":     {"name": "Max",     "price": 4990, "memberLimit": 999, "smsRate": 0.5, "minutesQuota": None, "exportsAllowed": True,  "onlineCollection": True},
++    "free":    {"name": "Free",    "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "exportsAllowed": False, "onlineCollection": False, "standardReportCredits": 0,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 0},
++    "starter": {"name": "Starter", "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "exportsAllowed": True,  "onlineCollection": True,  "standardReportCredits": 3,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 1},
++    "basic":   {"name": "Basic",   "price": 999,  "memberLimit": 25,  "smsRate": 0.9, "exportsAllowed": True,  "onlineCollection": True,  "standardReportCredits": 8,    "premiumReportCredits": 0,  "premiumAlacarteCapPerMonth": 2},
++    "growth":  {"name": "Growth",  "price": 2499, "memberLimit": 60,  "smsRate": 0.7, "exportsAllowed": True,  "onlineCollection": True,  "standardReportCredits": None, "premiumReportCredits": 4,  "premiumAlacarteCapPerMonth": None},
++    "max":     {"name": "Max",     "price": 4990, "memberLimit": 999, "smsRate": 0.5, "exportsAllowed": True,  "onlineCollection": True,  "standardReportCredits": None, "premiumReportCredits": 10, "premiumAlacarteCapPerMonth": None},
+ }
+ 
+ 
+@@ -100,6 +131,66 @@ def member_limit_for(plan: str) -> int:
+     return PLANS.get(plan, PLANS["free"])["memberLimit"]
+ 
+ 
++# --------------------------------------------------------------------------
++# Reports engine — catalog, tiering & pricing.
++#
++# All KES prices below already include the standing 20% discount agreed
++# for launch (base à la carte / surcharge rates were 70 and 180/credit
++# respectively — see the pricing thread in TOUCH_BASE.md "Reports engine
++# pricing"). If the discount is ever revisited, change ONLY the four
++# constants immediately below — everything else derives from them.
++# --------------------------------------------------------------------------
++
++REPORT_WALLET_CREDIT_PRICE_KES = 56          # base rate, à la carte (was 70 pre-discount)
++REPORT_WALLET_BUNDLE_10_KES = 504            # 10 credits (was 630)
++REPORT_WALLET_BUNDLE_30_KES = 1400           # 30 credits (was 1750)
++PREMIUM_ALACARTE_CREDIT_PRICE_KES = 144      # Starter/Basic one-off premium surcharge, per credit (was 180)
++
++REPORT_WALLET_BUNDLES = {
++    1: REPORT_WALLET_CREDIT_PRICE_KES,
++    10: REPORT_WALLET_BUNDLE_10_KES,
++    30: REPORT_WALLET_BUNDLE_30_KES,
++}
++
++
++class ReportTier:
++    STANDARD = "standard"
++    PREMIUM = "premium"
++
++
++class ReportPeriodMode:
++    RANGE = "range"          # needs from/to (Cashflow, P&L, Member Statement, Contribution Ledger)
++    AS_OF = "as_of"           # a single point-in-time snapshot (Balance Sheet, Arrears & Penalties)
++    SINGLE = "single"         # not date-scoped at all (one minutes entry)
++
++
++# credits: how many units this report costs out of its tier's monthly pool
++#          (or the prepaid wallet, once the pool is exhausted).
++# encryptDefault / encryptOptional: see docs/ARCHITECTURE.md "Reports engine
++#   encryption policy" — encryptDefault True + encryptOptional False means
++#   the report is ALWAYS encrypted with a PIN (no UI toggle); encryptDefault
++#   False + encryptOptional True means the admin can flip a toggle on.
++REPORT_TYPES = {
++    "member_statement":    {"label": "Individual Member Statement",         "tier": ReportTier.STANDARD, "credits": 1, "periodMode": ReportPeriodMode.RANGE,  "encryptDefault": True,  "encryptOptional": False},
++    "contribution_ledger": {"label": "Contribution Summary & Tracking Ledger", "tier": ReportTier.STANDARD, "credits": 1, "periodMode": ReportPeriodMode.RANGE,  "encryptDefault": False, "encryptOptional": True},
++    "arrears_penalties":   {"label": "Arrears & Penalties Report",          "tier": ReportTier.STANDARD, "credits": 2, "periodMode": ReportPeriodMode.AS_OF,  "encryptDefault": False, "encryptOptional": True},
++    "minutes":             {"label": "Meeting Minutes Export",              "tier": ReportTier.STANDARD, "credits": 1, "periodMode": ReportPeriodMode.SINGLE, "encryptDefault": False, "encryptOptional": False},
++    "cashflow":            {"label": "Cashflow Statement",                  "tier": ReportTier.PREMIUM,  "credits": 2, "periodMode": ReportPeriodMode.RANGE,  "encryptDefault": False, "encryptOptional": True},
++    "profit_loss":         {"label": "Profit & Loss Statement",             "tier": ReportTier.PREMIUM,  "credits": 3, "periodMode": ReportPeriodMode.RANGE,  "encryptDefault": True,  "encryptOptional": False},
++    "balance_sheet":       {"label": "Balance Sheet",                       "tier": ReportTier.PREMIUM,  "credits": 3, "periodMode": ReportPeriodMode.AS_OF,  "encryptDefault": True,  "encryptOptional": False},
++}
++
++
++def report_price_kes(report_key: str) -> int:
++    """À la carte wallet price for one instance of this report, at the base per-credit rate."""
++    return REPORT_TYPES[report_key]["credits"] * REPORT_WALLET_CREDIT_PRICE_KES
++
++
++def premium_alacarte_price_kes(report_key: str) -> int:
++    """Starter/Basic one-off premium-report price (surcharge rate, not the wallet rate)."""
++    return REPORT_TYPES[report_key]["credits"] * PREMIUM_ALACARTE_CREDIT_PRICE_KES
++
++
+ # --------------------------------------------------------------------------
+ # Security / session windows — mirrors CYBER's MC_SECURITY.
+ # These specific windows govern the WhatsApp bot's session; the app enforces
+@@ -142,6 +233,11 @@ class RefPrefix:
+     APP_PAYMENT = "MCA"        # app-initiated payment intents (contribution / loan_repayment / mgr_contribution)
+     SMS_TOPUP = "MCS"          # SMS credit top-up
+     PLAN_BILLING = "MCP"       # plan subscription / upgrade billing
++    REPORT_CREDIT_TOPUP = "MCX"     # reports-engine prepaid wallet top-up (purchaseReportCredits)
++    REPORT_ALACARTE = "MCR"         # Starter/Basic one-off premium report purchase (purchasePremiumReportAlaCarte)
++    # NEW PREFIXES ARE NOT YET WIRED IN THE EXTERNAL "PAY" REPO'S WEBHOOK.
++    # See TOUCH_BASE.md "Reports engine — PAY-repo follow-up" before relying
++    # on MCX-/MCR- payments actually crediting anything in production.
+ 
+ 
+ class IntentPurposeCode:
+diff --git a/functions/shared/firestore_paths.py b/functions/shared/firestore_paths.py
+index 8b0a9e8..effc808 100644
+--- a/functions/shared/firestore_paths.py
++++ b/functions/shared/firestore_paths.py
+@@ -143,3 +143,19 @@ def user_chama_membership(uid: str, chama_id: str) -> str:
+ 
+ def user_chama_memberships(uid: str) -> str:
+     return f"{MC.USER_CHAMAS}/{uid}/{MC.MEMBERSHIPS}"
++
++
++def report_credit_topups(chama_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_CREDIT_TOPUPS}"
++
++
++def report_credit_topup(chama_id: str, reference: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_CREDIT_TOPUPS}/{reference}"
++
++
++def report_alacarte_purchases(chama_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_ALACARTE_PURCHASES}"
++
++
++def report_alacarte_purchase(chama_id: str, reference: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MC.REPORT_ALACARTE_PURCHASES}/{reference}"
+diff --git a/functions/shared/ids.py b/functions/shared/ids.py
+index 83fb048..f6b7bdb 100644
+--- a/functions/shared/ids.py
++++ b/functions/shared/ids.py
+@@ -40,6 +40,14 @@ def build_plan_billing_reference(chama_id: str) -> str:
+     return f"{RefPrefix.PLAN_BILLING}-{chama_id}-{now_ms()}-{_rand6()}"
+ 
+ 
++def build_report_credit_topup_reference(chama_id: str) -> str:
++    return f"{RefPrefix.REPORT_CREDIT_TOPUP}-{chama_id}-{now_ms()}-{_rand6()}"
++
++
++def build_report_alacarte_reference(chama_id: str) -> str:
++    return f"{RefPrefix.REPORT_ALACARTE}-{chama_id}-{now_ms()}-{_rand6()}"
++
++
+ def build_cash_reference() -> str:
+     """For manual/cash transactions — mirrors the demo's 'CASH...' convention."""
+     return "CASH" + _rand6()
+diff --git a/functions/shared/reports_engine.py b/functions/shared/reports_engine.py
+new file mode 100644
+index 0000000..e0bd361
+--- /dev/null
++++ b/functions/shared/reports_engine.py
+@@ -0,0 +1,849 @@
++"""
++Reports engine — Phase 4 extension.
++
++Everything a report needs that ISN'T "which specific numbers go in a
++Contribution Ledger" lives here: the credit/quota accounting shared by
++every report type (standard pool, premium pool, prepaid wallet, Starter/
++Basic à la carte), PDF encryption + the admin SMS PIN, and the four data
++aggregations this patch adds (Contribution Ledger, Arrears & Penalties,
++P&L, Balance Sheet). `generateStatement` (functions/mychama/billing.py,
++pre-existing) and `generateReport` (functions/mychama/reports.py, new)
++both call into this module so there is exactly ONE place that decides
++"can this chama afford this report, and how".
++
++See functions/shared/constants.py's PLANS/REPORT_TYPES docstrings for the
++pricing model this implements, and docs/ARCHITECTURE.md "Reports engine"
++for the encryption/PIN policy.
++
++IMPORTANT — approximations flagged, not hidden:
++  - `build_profit_and_loss` apportions loan interest income from blended
++    repayment amounts (the loan schedule doesn't timestamp WHEN each
++    installment was paid, only whether it's paid) — see that function's
++    docstring.
++  - `build_balance_sheet`'s loan-receivable figure uses each loan's
++    CURRENT `paidAmount` bookkeeping regardless of `asOf` — a fully
++    historical point-in-time reconstruction isn't possible from this data
++    model without a payment-history log. Flagged inline.
++  - `build_arrears_penalties` has no "penalty fee" to report yet — no
++    chama in this schema tracks a late-fee amount. The report says so
++    rather than inventing a number.
++"""
++
++from __future__ import annotations
++
++import io
++import secrets as pysecrets
++from datetime import datetime, timezone
++from typing import Literal
++
++from firebase_admin import firestore, storage
++
++from . import firestore_paths as paths
++from .constants import MC, PLANS, REPORT_TYPES, ReportTier, ReportPeriodMode
++from .dates import today_iso, now_ms
++from .errors import bad_request, not_found, precondition, rate_limited
++from .money import kes
++
++REGION_STORAGE_BUCKET = "mychama1.firebasestorage.app"  # matches functions/mychama/billing.py — must stay in sync
++
++
++# --------------------------------------------------------------------- #
++# Period resolution — the UI offers named presets; the server turns them
++# into concrete dates so no date math ever has to be trusted from the
++# client (see docs/API_CONTRACT.md "generateReport").
++# --------------------------------------------------------------------- #
++
++PeriodPreset = Literal[
++    "this_month", "last_month", "this_quarter", "last_quarter",
++    "this_fy", "last_fy", "custom",
++]
++
++
++def _month_bounds(year: int, month: int) -> tuple[str, str]:
++    from calendar import monthrange
++    last_day = monthrange(year, month)[1]
++    return f"{year:04d}-{month:02d}-01", f"{year:04d}-{month:02d}-{last_day:02d}"
++
++
++def resolve_range(preset: str | None, custom_from: str | None, custom_to: str | None, fiscal_year_start_month: int = 1) -> tuple[str, str]:
++    """Returns (from, to) as ISO date strings for a RANGE-mode report."""
++    today = datetime.now(timezone.utc)
++    y, m = today.year, today.month
++
++    if preset == "custom" or not preset:
++        if not custom_from or not custom_to:
++            raise precondition("A custom period needs both a from and a to date.")
++        return custom_from, custom_to
++
++    if preset == "this_month":
++        return _month_bounds(y, m)
++    if preset == "last_month":
++        py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
++        return _month_bounds(py, pm)
++
++    if preset in ("this_quarter", "last_quarter"):
++        q_start_month = ((m - 1) // 3) * 3 + 1
++        if preset == "last_quarter":
++            q_start_month -= 3
++            qy = y if q_start_month >= 1 else y - 1
++            q_start_month = q_start_month if q_start_month >= 1 else q_start_month + 12
++        else:
++            qy = y
++        start, _ = _month_bounds(qy, q_start_month)
++        end_month = q_start_month + 2
++        end_year = qy + (1 if end_month > 12 else 0)
++        end_month = end_month if end_month <= 12 else end_month - 12
++        _, end = _month_bounds(end_year, end_month)
++        return start, end
++
++    if preset in ("this_fy", "last_fy"):
++        fy_start_month = fiscal_year_start_month or 1
++        # Which fiscal year contains "today"?
++        fy_year = y if m >= fy_start_month else y - 1
++        if preset == "last_fy":
++            fy_year -= 1
++        start, _ = _month_bounds(fy_year, fy_start_month)
++        end_month = fy_start_month - 1 if fy_start_month > 1 else 12
++        end_year = fy_year + 1 if fy_start_month > 1 else fy_year
++        _, end = _month_bounds(end_year, end_month)
++        return start, end
++
++    raise precondition(f"Unknown period preset '{preset}'.")
++
++
++def resolve_as_of(preset: str | None, custom_as_of: str | None) -> str:
++    """Returns an ISO date string for an AS_OF-mode report (Balance Sheet, Arrears & Penalties)."""
++    if preset == "custom" or preset is None:
++        return custom_as_of or today_iso()
++    if preset == "today":
++        return today_iso()
++    # Named presets ("this_month" etc.) resolve to their END date for an as-of report —
++    # "as of the end of last month" is the natural reading of that preset here.
++    date_from, date_to = resolve_range(preset, None, None)
++    return date_to
++
++
++# --------------------------------------------------------------------- #
++# Credit accounting — the single gate every paid report goes through.
++# --------------------------------------------------------------------- #
++
++def standard_used(chama: dict) -> float:
++    """Falls back to the pre-engine field name for chamas provisioned before this patch."""
++    if "standardReportsUsedThisMonth" in chama:
++        return chama.get("standardReportsUsedThisMonth", 0) or 0
++    return chama.get("minutesExportsUsedThisMonth", 0) or 0
++
++
++def premium_used(chama: dict) -> float:
++    return chama.get("premiumReportsUsedThisMonth", 0) or 0
++
++
++def wallet_balance(chama: dict) -> float:
++    return chama.get("reportCreditsBalance", 0) or 0
++
++
++def spend_credits(db, chama_ref, chama: dict, report_key: str) -> dict:
++    """
++    Atomically charges `report_key`'s credit cost against the chama's
++    monthly allowance, then its prepaid wallet, in a single transaction.
++    Raises `precondition` (plan doesn't offer this tier at all — Starter/
++    Basic + a premium report) or `rate_limited` (allowance AND wallet both
++    exhausted — a "top up or upgrade" case, not a hard plan block) if it
++    can't be covered. Returns a small dict describing what was charged,
++    for logging/response purposes; does NOT render or upload anything.
++
++    Callers MUST call this (or the free-self-service / à la carte-consume
++    path) before rendering — never render first and charge after; a
++    failed charge must mean nothing was generated.
++    """
++    spec = REPORT_TYPES[report_key]
++    cost = spec["credits"]
++    plan = chama.get("plan", "free")
++    plan_cfg = PLANS.get(plan, PLANS["free"])
++
++    if not plan_cfg["exportsAllowed"]:
++        raise precondition(f"Reports aren't available on the {plan_cfg['name']} plan — upgrade to generate them.")
++
++    if spec["tier"] == ReportTier.PREMIUM and plan_cfg["premiumReportCredits"] == 0:
++        # Starter/Basic: premium reports are not covered by any pool here —
++        # see functions/mychama/reports.py::purchasePremiumReportAlaCarte.
++        raise precondition(
++            f"{spec['label']} isn't included on the {plan_cfg['name']} plan. "
++            "Buy it as a one-off, or upgrade to Growth for unlimited standard reports plus a monthly premium allowance."
++        )
++
++    @firestore.transactional
++    def _txn(transaction: firestore.Transaction) -> dict:
++        snap = chama_ref.get(transaction=transaction)
++        c = snap.to_dict() or {}
++        wallet = wallet_balance(c)
++
++        if spec["tier"] == ReportTier.STANDARD:
++            quota = plan_cfg["standardReportCredits"]
++            used = standard_used(c)
++            if quota is None or used + cost <= quota:
++                transaction.update(chama_ref, {
++                    "standardReportsUsedThisMonth": used + cost,
++                    "minutesExportsUsedThisMonth": used + cost,  # kept in lockstep — see LEGACY note in types.py
++                    "updatedAt": now_ms(),
++                })
++                return {"source": "standardAllowance", "creditsCharged": cost, "walletAfter": wallet}
++            if wallet >= cost:
++                transaction.update(chama_ref, {"reportCreditsBalance": wallet - cost, "updatedAt": now_ms()})
++                return {"source": "wallet", "creditsCharged": cost, "walletAfter": wallet - cost}
++            raise rate_limited(
++                f"This chama has used its {quota} free standard report credit{'s' if quota != 1 else ''} for this month. "
++                "Top up report credits, or wait for next month's allowance."
++            )
++
++        # Premium — only reachable here for Growth/Max (Starter/Basic raised above).
++        quota = plan_cfg["premiumReportCredits"]
++        used = premium_used(c)
++        if used + cost <= quota:
++            transaction.update(chama_ref, {"premiumReportsUsedThisMonth": used + cost, "updatedAt": now_ms()})
++            return {"source": "premiumAllowance", "creditsCharged": cost, "walletAfter": wallet}
++        if wallet >= cost:
++            transaction.update(chama_ref, {"reportCreditsBalance": wallet - cost, "updatedAt": now_ms()})
++            return {"source": "wallet", "creditsCharged": cost, "walletAfter": wallet - cost}
++        raise rate_limited(
++            f"This chama has used its {quota} free premium report credit{'s' if quota != 1 else ''} for this month. "
++            "Top up report credits to generate more."
++        )
++
++    return _txn(db.transaction())
++
++
++def consume_alacarte_purchase(db, chama_id: str, report_key: str, reference: str) -> dict:
++    """
++    Marks a Starter/Basic one-off premium purchase 'consumed' and returns
++    its saved parameters — used by both generateStatement (Cashflow) and
++    generateReport (P&L, Balance Sheet) so a paid-for report can't be
++    silently redirected to different parameters by resending different
++    ones in the generation call. Raises if the reference doesn't exist,
++    hasn't completed payment, or doesn't match `report_key`.
++    """
++    @firestore.transactional
++    def _txn(transaction: firestore.Transaction) -> dict:
++        ref = db.document(paths.report_alacarte_purchase(chama_id, reference))
++        snap = ref.get(transaction=transaction)
++        if not snap.exists:
++            raise not_found("That à la carte purchase reference was not found.")
++        purchase = snap.to_dict()
++        if purchase.get("status") != "success":
++            raise precondition("That purchase hasn't completed payment yet.")
++        if purchase.get("reportType") != report_key:
++            raise bad_request("That purchase reference is for a different report type.")
++        transaction.update(ref, {"status": "consumed", "updatedAt": now_ms()})
++        return purchase
++
++    return _txn(db.transaction())
++
++
++def refund_charge(db, chama_id: str, chama_ref, report_key: str, charge_info: dict | None) -> None:
++    """
++    Best-effort reversal of a charge taken by spend_credits /
++    consume_alacarte_purchase when the report then FAILS to render or upload.
++    Charging happens before rendering on purpose (a failed charge must mean
++    nothing was generated) — this is the other half of that promise: a
++    failed generation must not cost the chama anything. Never raises; if the
++    refund itself fails it is logged for a human to reconcile.
++    """
++    if not charge_info:
++        return
++    cost = REPORT_TYPES[report_key]["credits"]
++    source = charge_info.get("source")
++    try:
++        if source == "standardAllowance":
++            chama_ref.update({
++                "standardReportsUsedThisMonth": firestore.Increment(-cost),
++                "minutesExportsUsedThisMonth": firestore.Increment(-cost),
++                "updatedAt": now_ms(),
++            })
++        elif source == "premiumAllowance":
++            chama_ref.update({"premiumReportsUsedThisMonth": firestore.Increment(-cost), "updatedAt": now_ms()})
++        elif source == "wallet":
++            chama_ref.update({"reportCreditsBalance": firestore.Increment(cost), "updatedAt": now_ms()})
++        elif source == "alacarte" and charge_info.get("reference"):
++            db.document(paths.report_alacarte_purchase(chama_id, charge_info["reference"])).update(
++                {"status": "success", "updatedAt": now_ms()}
++            )
++    except Exception:  # noqa: BLE001
++        import logging
++        logging.exception("refund_charge failed for chama=%s report=%s charge=%s — reconcile manually", chama_id, report_key, charge_info)
++
++
++# --------------------------------------------------------------------- #
++# Encryption + admin PIN.
++# --------------------------------------------------------------------- #
++
++def generate_pin() -> str:
++    """Cryptographically-random 6-digit PIN — never logged, never returned to the caller; SMS only."""
++    return f"{pysecrets.randbelow(1_000_000):06d}"
++
++
++def build_encryption(pin: str):
++    """
++    A reportlab `StandardEncryption` object, ready to pass as the optional
++    `encrypt_enc` argument every `render_*_pdf` function below accepts.
++    reportlab has no "encrypt an existing PDF" API — the document has to
++    be BUILT with encryption already attached — so this is a factory, not
++    a post-processing step. Owner password is a random, never-surfaced
++    value (blocks the print/edit-permission bits from being lifted even
++    if the 6-digit user PIN is somehow guessed); only the userPassword
++    (the PIN) is ever given to a person, and only via SMS — never in a
++    callable's return value.
++    """
++    from reportlab.lib.pdfencrypt import StandardEncryption
++    owner_password = pysecrets.token_urlsafe(18)
++    return StandardEncryption(pin, ownerPassword=owner_password, canPrint=1, canModify=0, canCopy=0, canAnnotate=0)
++
++
++def notify_pin(db, chama: dict, pin: str, report_label: str, phones: list[str]) -> list[str]:
++    """
++    Sends the PIN via HostPinnacle directly — same low-level call
++    sms.py's sendSmsCampaign uses, but this deliberately BYPASSES the
++    smsCredits deduction path: a security notification isn't a billable
++    campaign message, exactly like an OTP. Returns the phone numbers it
++    actually reached (for logging/response purposes) — never raises; a
++    PIN SMS failure shouldn't fail report generation (the PDF is already
++    generated and paid for), so failures are swallowed here and should be
++    watched via Cloud Logging instead.
++    """
++    from .hostpinnacle import send_sms
++    from .phone import normalize_sms_phone
++    from .secrets import HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
++
++    chama_name = chama.get("name", "MyChama")
++    message = f"{chama_name}: your {report_label} PDF is ready. Open-file PIN: {pin}. Do not share this PIN."
++
++    sent_to: list[str] = []
++    for phone in phones:
++        try:
++            send_sms(
++                userid=HP_USERID.value, password=HP_PASSWORD.value,
++                apikey=HP_APIKEY.value, sender_id=HP_SENDER_ID.value,
++                phone_e164=normalize_sms_phone(phone), message=message,
++            )
++            sent_to.append(phone)
++        except Exception:  # noqa: BLE001 — see docstring
++            continue
++    return sent_to
++
++
++def admin_pin_recipients(db, chama_id: str) -> list[str]:
++    """Chair + treasurer's phones — the default recipients for an admin-pulled report's PIN."""
++    admins = [m.to_dict() for m in db.collection(paths.members(chama_id)).where("status", "==", "active").stream()]
++    return [m["phoneNormalized"] for m in admins if m.get("role") in ("chair", "treasurer") and m.get("phoneNormalized")]
++
++
++def upload_and_sign(chama_id: str, filename: str, content: bytes, content_type: str, ttl) -> str:
++    bucket = storage.bucket(REGION_STORAGE_BUCKET)
++    blob = bucket.blob(f"statements/{chama_id}/{filename}")
++    blob.upload_from_string(content, content_type=content_type)
++    return blob.generate_signed_url(version="v4", expiration=ttl, method="GET")
++
++
++# --------------------------------------------------------------------- #
++# Shared small helpers used by more than one builder below.
++# --------------------------------------------------------------------- #
++
++def _member_name_map(db, chama_id: str) -> dict:
++    return {d.id: (d.to_dict() or {}).get("name", "Member") for d in db.collection(paths.members(chama_id)).stream()}
++
++
++def _pdf_styles():
++    from reportlab.lib.styles import getSampleStyleSheet
++    return getSampleStyleSheet()
++
++
++def _base_doc(buf, encrypt_enc=None):
++    from reportlab.lib.pagesizes import A4
++    from reportlab.lib.units import mm
++    from reportlab.platypus import SimpleDocTemplate
++    kwargs = dict(pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
++    if encrypt_enc is not None:
++        kwargs["encrypt"] = encrypt_enc
++    return SimpleDocTemplate(buf, **kwargs)
++
++
++def _styled_table(data: list[list[str]]):
++    from reportlab.lib import colors
++    from reportlab.platypus import Table, TableStyle
++    table = Table(data, repeatRows=1)
++    table.setStyle(TableStyle([
++        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4D3A")),
++        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
++        ("FONTSIZE", (0, 0), (-1, -1), 8),
++        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F9F5")]),
++        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D8E8DC")),
++        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
++        ("TOPPADDING", (0, 0), (-1, -1), 4),
++        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
++    ]))
++    return table
++
++
++# --------------------------------------------------------------------- #
++# 1. Contribution Summary & Tracking Ledger
++# --------------------------------------------------------------------- #
++
++def build_contribution_ledger(db, chama_id: str, date_from: str, date_to: str) -> dict:
++    period_from = date_from[:7]  # periodKey is YYYY-MM
++    period_to = date_to[:7]
++    rows = [
++        d.to_dict()
++        for d in db.collection(paths.contributions(chama_id))
++        .where("periodKey", ">=", period_from).where("periodKey", "<=", period_to)
++        .stream()
++    ]
++    names = _member_name_map(db, chama_id)
++
++    by_member: dict[str, dict] = {}
++    for r in rows:
++        mid = r.get("memberId", "")
++        b = by_member.setdefault(mid, {"memberId": mid, "name": names.get(mid, "Member"), "due": 0.0, "paid": 0.0, "periods": []})
++        b["due"] += float(r.get("amount") or 0)
++        b["paid"] += float(r.get("paidAmount") or 0)
++        b["periods"].append({"period": r.get("period", r.get("periodKey", "")), "status": r.get("status", ""), "due": r.get("amount"), "paid": r.get("paidAmount")})
++
++    members_out = sorted(by_member.values(), key=lambda b: b["name"])
++    for b in members_out:
++        b["outstanding"] = round(b["due"] - b["paid"], 2)
++
++    return {
++        "reportType": "contribution_ledger",
++        "dateFrom": date_from, "dateTo": date_to,
++        "members": members_out,
++        "totals": {
++            "due": round(sum(b["due"] for b in members_out), 2),
++            "paid": round(sum(b["paid"] for b in members_out), 2),
++            "outstanding": round(sum(b["outstanding"] for b in members_out), 2),
++        },
++    }
++
++
++def render_contribution_ledger_pdf(chama_name: str, data: dict, encrypt_enc=None) -> bytes:
++    from reportlab.platypus import Paragraph, Spacer
++    styles = _pdf_styles()
++    buf = io.BytesIO()
++    doc = _base_doc(buf, encrypt_enc)
++    story = [
++        Paragraph(chama_name, styles["Title"]),
++        Paragraph("Contribution Summary &amp; Tracking Ledger", styles["Heading3"]),
++        Paragraph(f"{data['dateFrom']} to {data['dateTo']} &middot; generated {today_iso()}", styles["Normal"]),
++        Spacer(1, 8),
++    ]
++    table_rows = [["Member", "Due (KES)", "Paid (KES)", "Outstanding (KES)"]]
++    for b in data["members"]:
++        table_rows.append([b["name"], f"{b['due']:,.2f}", f"{b['paid']:,.2f}", f"{b['outstanding']:,.2f}"])
++    if len(table_rows) == 1:
++        table_rows.append(["—", "No contributions in this period", "", ""])
++    story.append(_styled_table(table_rows))
++    story.append(Spacer(1, 8))
++    t = data["totals"]
++    story.append(Paragraph(
++        f"Total due: <b>{kes(t['due'])}</b> &nbsp; Total paid: <b>{kes(t['paid'])}</b> &nbsp; Outstanding: <b>{kes(t['outstanding'])}</b>",
++        styles["Normal"],
++    ))
++    doc.build(story)
++    return buf.getvalue()
++
++
++def render_contribution_ledger_csv(data: dict) -> bytes:
++    import csv
++    buf = io.StringIO()
++    w = csv.writer(buf)
++    w.writerow(["Contribution Summary & Tracking Ledger", f"{data['dateFrom']} to {data['dateTo']}"])
++    w.writerow([])
++    w.writerow(["Member", "Due", "Paid", "Outstanding"])
++    for b in data["members"]:
++        w.writerow([b["name"], b["due"], b["paid"], b["outstanding"]])
++    w.writerow([])
++    t = data["totals"]
++    w.writerow(["Total", t["due"], t["paid"], t["outstanding"]])
++    return buf.getvalue().encode("utf-8")
++
++
++# --------------------------------------------------------------------- #
++# 2. Arrears & Penalties Report
++# --------------------------------------------------------------------- #
++
++def build_arrears_penalties(db, chama_id: str, as_of: str) -> dict:
++    names = _member_name_map(db, chama_id)
++
++    # Contribution arrears — reconstructed from dueDate/paidAmount rather than
++    # the mutable `status` field, so an as_of DATE actually means something
++    # (status only reflects the LATEST sweep, not history).
++    contrib_arrears = []
++    for d in db.collection(paths.contributions(chama_id)).where("dueDate", "<=", as_of).stream():
++        r = d.to_dict()
++        owed = round(float(r.get("amount") or 0) - float(r.get("paidAmount") or 0), 2)
++        if owed > 0:
++            contrib_arrears.append({"memberId": r.get("memberId"), "name": names.get(r.get("memberId"), "Member"), "period": r.get("period"), "dueDate": r.get("dueDate"), "owed": owed})
++
++    # Loan arrears — from each active/overdue loan's own schedule.
++    loan_arrears = []
++    for d in db.collection(paths.loans(chama_id)).where("status", "in", ["active", "overdue"]).stream():
++        loan = d.to_dict()
++        overdue_amt = sum(
++            round(float(i.get("due") or 0) - float(i.get("paidAmount") or 0), 2)
++            for i in (loan.get("schedule") or [])
++            if i.get("dueDate", "9999-12-31") <= as_of and not i.get("paid")
++        )
++        if overdue_amt > 0:
++            loan_arrears.append({"memberId": loan.get("memberId"), "name": names.get(loan.get("memberId"), "Member"), "loanId": d.id, "owed": round(overdue_amt, 2)})
++
++    # MGR arrears — per-pot subcollections (mirrors mychama/mgr.py's _all_arrears
++    # iteration rather than a collection-group query — no chamaId field is
++    # stored on the arrear doc itself, so scoping happens via the pot loop).
++    mgr_arrears = []
++    as_of_ms = int(datetime.strptime(as_of, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
++    for pot_doc in db.collection(paths.mgr_pots(chama_id)).stream():
++        pot = pot_doc.to_dict()
++        for a_doc in db.collection(paths.mgr_arrears(chama_id, pot_doc.id)).where("status", "==", "open").stream():
++            a = a_doc.to_dict()
++            if a.get("createdAt", 0) <= as_of_ms:
++                mgr_arrears.append({"memberId": a.get("memberId"), "name": names.get(a.get("memberId"), "Member"), "pot": pot.get("name", "Merry-go-round"), "owed": a.get("amount", 0)})
++
++    return {
++        "reportType": "arrears_penalties",
++        "asOf": as_of,
++        "contributionArrears": contrib_arrears,
++        "loanArrears": loan_arrears,
++        "mgrArrears": mgr_arrears,
++        "totals": {
++            "contributions": round(sum(x["owed"] for x in contrib_arrears), 2),
++            "loans": round(sum(x["owed"] for x in loan_arrears), 2),
++            "mgr": round(sum(x["owed"] for x in mgr_arrears), 2),
++        },
++        # No chama in this schema tracks a late-fee/penalty AMOUNT field yet
++        # (only overdue status). Reported honestly rather than invented —
++        # see TOUCH_BASE.md "Reports engine — penalty fee field".
++        "penaltiesNote": "No penalty-fee field is configured for this chama yet — this section will populate once one is added.",
++    }
++
++
++def render_arrears_penalties_pdf(chama_name: str, data: dict, encrypt_enc=None) -> bytes:
++    from reportlab.platypus import Paragraph, Spacer
++    styles = _pdf_styles()
++    buf = io.BytesIO()
++    doc = _base_doc(buf, encrypt_enc)
++    story = [
++        Paragraph(chama_name, styles["Title"]),
++        Paragraph("Arrears &amp; Penalties Report", styles["Heading3"]),
++        Paragraph(f"As of {data['asOf']} &middot; generated {today_iso()}", styles["Normal"]),
++        Spacer(1, 8),
++    ]
++
++    story.append(Paragraph("Overdue contributions", styles["Heading4"]))
++    t1 = [["Member", "Period", "Due date", "Owed (KES)"]] + (
++        [[x["name"], x["period"], x["dueDate"], f"{x['owed']:,.2f}"] for x in data["contributionArrears"]] or [["—", "None outstanding", "", ""]]
++    )
++    story.append(_styled_table(t1))
++    story.append(Spacer(1, 8))
++
++    story.append(Paragraph("Overdue loan installments", styles["Heading4"]))
++    t2 = [["Member", "Loan", "Owed (KES)"]] + (
++        [[x["name"], x["loanId"], f"{x['owed']:,.2f}"] for x in data["loanArrears"]] or [["—", "None outstanding", ""]]
++    )
++    story.append(_styled_table(t2))
++    story.append(Spacer(1, 8))
++
++    story.append(Paragraph("Open merry-go-round arrears", styles["Heading4"]))
++    t3 = [["Member", "Pot", "Owed (KES)"]] + (
++        [[x["name"], x["pot"], f"{x['owed']:,.2f}"] for x in data["mgrArrears"]] or [["—", "None open", ""]]
++    )
++    story.append(_styled_table(t3))
++    story.append(Spacer(1, 8))
++
++    tt = data["totals"]
++    story.append(Paragraph(
++        f"Total overdue — contributions: <b>{kes(tt['contributions'])}</b>, loans: <b>{kes(tt['loans'])}</b>, MGR: <b>{kes(tt['mgr'])}</b>",
++        styles["Normal"],
++    ))
++    story.append(Spacer(1, 6))
++    story.append(Paragraph(f"<i>{data['penaltiesNote']}</i>", styles["Normal"]))
++    doc.build(story)
++    return buf.getvalue()
++
++
++def render_arrears_penalties_csv(data: dict) -> bytes:
++    import csv
++    buf = io.StringIO()
++    w = csv.writer(buf)
++    w.writerow(["Arrears & Penalties Report", f"as of {data['asOf']}"])
++    w.writerow([])
++    w.writerow(["Type", "Member", "Detail", "Owed (KES)"])
++    for x in data["contributionArrears"]:
++        w.writerow(["Contribution", x["name"], x["period"], x["owed"]])
++    for x in data["loanArrears"]:
++        w.writerow(["Loan", x["name"], x["loanId"], x["owed"]])
++    for x in data["mgrArrears"]:
++        w.writerow(["MGR", x["name"], x["pot"], x["owed"]])
++    w.writerow([])
++    w.writerow([data["penaltiesNote"]])
++    return buf.getvalue().encode("utf-8")
++
++
++# --------------------------------------------------------------------- #
++# 3. Profit & Loss Statement (premium)
++# --------------------------------------------------------------------- #
++
++def build_profit_and_loss(db, chama_id: str, date_from: str, date_to: str, plan: str) -> dict:
++    """
++    Revenue: loan interest income, apportioned from `loan_repayment`
++    transactions in the period using each loan's blended interest ratio
++    (totalInterest / totalPay) — an APPROXIMATION, since installments
++    don't record a per-payment timestamp, only paid/unpaid. A repayment
++    made mid-period is fully counted in that period even if it covered an
++    installment due earlier.
++
++    Expenses: Paystack + MyChama processing fees on money OUT (loan
++    disbursements, MGR payouts) in the period, SMS spend logged in the
++    period, and this chama's plan subscription cost prorated across the
++    number of days in [date_from, date_to].
++    """
++    loans_by_id = {d.id: d.to_dict() for d in db.collection(paths.loans(chama_id)).stream()}
++
++    tx = [
++        d.to_dict()
++        for d in db.collection(paths.transactions(chama_id))
++        .where("date", ">=", date_from).where("date", "<=", date_to)
++        .stream()
++    ]
++
++    interest_income = 0.0
++    for t in tx:
++        if t.get("type") != "loan_repayment":
++            continue
++        loan = loans_by_id.get(t.get("loanId") or "", {})
++        total_pay = float(loan.get("totalPay") or 0)
++        total_interest = float(loan.get("totalInterest") or 0)
++        if total_pay > 0:
++            interest_income += float(t.get("amount") or 0) * (total_interest / total_pay)
++
++    processing_fees = sum(float(t.get("paystackFee") or 0) + float(t.get("ourFee") or 0) for t in tx if t.get("direction") == "out")
++
++    # smsLog has no ISO `date` field, only epoch-ms `createdAt` — convert the
++    # [date_from, date_to] bounds to an epoch-ms range once and compare directly.
++    from_ms = int(datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
++    to_ms = int(datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) + 24 * 60 * 60 * 1000 - 1
++    sms_expense = sum(
++        float(s.to_dict().get("creditsUsed") or 0)
++        for s in db.collection(paths.sms_log(chama_id)).stream()
++        if from_ms <= (s.to_dict().get("createdAt") or 0) <= to_ms
++    )
++    days = max(1, (datetime.strptime(date_to, "%Y-%m-%d") - datetime.strptime(date_from, "%Y-%m-%d")).days + 1)
++    plan_cost_prorated = PLANS.get(plan, PLANS["free"])["price"] * (days / 30.0)
++
++    revenue_total = round(interest_income, 2)
++    expense_total = round(processing_fees + sms_expense + plan_cost_prorated, 2)
++
++    return {
++        "reportType": "profit_loss",
++        "dateFrom": date_from, "dateTo": date_to,
++        "revenue": {"loanInterestIncome": round(interest_income, 2), "total": revenue_total},
++        "expenses": {
++            "paymentProcessingFees": round(processing_fees, 2),
++            "smsSpend": round(sms_expense, 2),
++            "planSubscription": round(plan_cost_prorated, 2),
++            "total": expense_total,
++        },
++        "netProfit": round(revenue_total - expense_total, 2),
++    }
++
++
++def render_profit_and_loss_pdf(chama_name: str, data: dict, encrypt_enc=None) -> bytes:
++    from reportlab.platypus import Paragraph, Spacer
++    styles = _pdf_styles()
++    buf = io.BytesIO()
++    doc = _base_doc(buf, encrypt_enc)
++    story = [
++        Paragraph(chama_name, styles["Title"]),
++        Paragraph("Profit &amp; Loss Statement", styles["Heading3"]),
++        Paragraph(f"{data['dateFrom']} to {data['dateTo']} &middot; generated {today_iso()}", styles["Normal"]),
++        Spacer(1, 8),
++    ]
++    r, e = data["revenue"], data["expenses"]
++    story.append(_styled_table([
++        ["Revenue", "KES"],
++        ["Loan interest income", f"{r['loanInterestIncome']:,.2f}"],
++        ["Total revenue", f"{r['total']:,.2f}"],
++    ]))
++    story.append(Spacer(1, 8))
++    story.append(_styled_table([
++        ["Expenses", "KES"],
++        ["Payment processing fees", f"{e['paymentProcessingFees']:,.2f}"],
++        ["SMS spend", f"{e['smsSpend']:,.2f}"],
++        ["Plan subscription (prorated)", f"{e['planSubscription']:,.2f}"],
++        ["Total expenses", f"{e['total']:,.2f}"],
++    ]))
++    story.append(Spacer(1, 10))
++    story.append(Paragraph(f"Net {'profit' if data['netProfit'] >= 0 else 'loss'}: <b>{kes(abs(data['netProfit']))}</b>", styles["Heading3"]))
++    story.append(Spacer(1, 6))
++    story.append(Paragraph(
++        "<i>Loan interest income is apportioned from blended repayments — see the report engine's documented approximation.</i>",
++        styles["Normal"],
++    ))
++    doc.build(story)
++    return buf.getvalue()
++
++
++def render_profit_and_loss_csv(data: dict) -> bytes:
++    import csv
++    buf = io.StringIO()
++    w = csv.writer(buf)
++    w.writerow(["Profit & Loss Statement", f"{data['dateFrom']} to {data['dateTo']}"])
++    w.writerow([])
++    r, e = data["revenue"], data["expenses"]
++    w.writerow(["Revenue"])
++    w.writerow(["Loan interest income", r["loanInterestIncome"]])
++    w.writerow(["Total revenue", r["total"]])
++    w.writerow([])
++    w.writerow(["Expenses"])
++    w.writerow(["Payment processing fees", e["paymentProcessingFees"]])
++    w.writerow(["SMS spend", e["smsSpend"]])
++    w.writerow(["Plan subscription (prorated)", e["planSubscription"]])
++    w.writerow(["Total expenses", e["total"]])
++    w.writerow([])
++    w.writerow(["Net profit/(loss)", data["netProfit"]])
++    return buf.getvalue().encode("utf-8")
++
++
++# --------------------------------------------------------------------- #
++# 4. Balance Sheet (premium, point-in-time — NOT a from/to range)
++# --------------------------------------------------------------------- #
++
++def build_balance_sheet(db, chama_id: str, as_of: str, chama: dict) -> dict:
++    """
++    See this module's docstring for the loan-receivable approximation.
++    Retained earnings/reserve is reported as a labeled BALANCING FIGURE
++    (Assets − Liabilities − Member equity), not independently derived from
++    period-by-period P&L history — see docs/ARCHITECTURE.md "Reports
++    engine" for why that's a reasonable v1 simplification.
++    """
++    tx = [d.to_dict() for d in db.collection(paths.transactions(chama_id)).where("date", "<=", as_of).stream()]
++    net_cash_movement = sum((float(t.get("amount") or 0) if t.get("direction") == "in" else -float(t.get("amount") or 0)) for t in tx)
++    cash_position = round(float(chama.get("openingBalance") or 0) + net_cash_movement, 2)
++
++    loans_receivable = 0.0
++    for d in db.collection(paths.loans(chama_id)).where("status", "in", ["active", "overdue"]).stream():
++        loan = d.to_dict()
++        paid_total = sum(float(i.get("paidAmount") or 0) for i in (loan.get("schedule") or []))
++        loans_receivable += max(0.0, float(loan.get("totalPay") or 0) - paid_total)
++
++    mgr_arrears_receivable = 0.0
++    mgr_exit_refunds_payable = 0.0
++    mgr_exit_clawbacks_receivable = 0.0
++    for pot_doc in db.collection(paths.mgr_pots(chama_id)).stream():
++        for a in db.collection(paths.mgr_arrears(chama_id, pot_doc.id)).where("status", "==", "open").stream():
++            mgr_arrears_receivable += float(a.to_dict().get("amount") or 0)
++        for e in db.collection(paths.mgr_exits(chama_id, pot_doc.id)).where("status", "==", "open").stream():
++            ed = e.to_dict()
++            mgr_exit_refunds_payable += max(0.0, float(ed.get("refundDue") or 0) - float(ed.get("refundPaid") or 0))
++            mgr_exit_clawbacks_receivable += max(0.0, float(ed.get("clawbackDue") or 0) - float(ed.get("clawbackRecovered") or 0))
++
++    sms_prepaid = float(chama.get("smsCredits") or 0)
++    from .constants import REPORT_WALLET_CREDIT_PRICE_KES
++    report_credits_prepaid = float(chama.get("reportCreditsBalance") or 0) * REPORT_WALLET_CREDIT_PRICE_KES
++
++    assets = {
++        "cashAndBank": cash_position,
++        "loansReceivable": round(loans_receivable, 2),
++        "mgrArrearsReceivable": round(mgr_arrears_receivable, 2),
++        "mgrExitClawbacksReceivable": round(mgr_exit_clawbacks_receivable, 2),
++        "prepaidSmsCredits": round(sms_prepaid, 2),
++        "prepaidReportCredits": round(report_credits_prepaid, 2),
++    }
++    total_assets = round(sum(assets.values()), 2)
++
++    liabilities = {"mgrExitRefundsPayable": round(mgr_exit_refunds_payable, 2)}
++    total_liabilities = round(sum(liabilities.values()), 2)
++
++    member_equity = 0.0
++    for m in db.collection(paths.members(chama_id)).where("status", "==", "active").stream():
++        md = m.to_dict()
++        member_equity += float(md.get("totalContributed") or 0) + float(md.get("creditBalance") or 0)
++    member_equity = round(member_equity, 2)
++
++    retained_earnings = round(total_assets - total_liabilities - member_equity, 2)
++
++    return {
++        "reportType": "balance_sheet",
++        "asOf": as_of,
++        "assets": assets, "totalAssets": total_assets,
++        "liabilities": liabilities, "totalLiabilities": total_liabilities,
++        "equity": {"memberContributionsAndCredit": member_equity, "retainedEarningsReserve": retained_earnings},
++        "totalEquity": round(member_equity + retained_earnings, 2),
++    }
++
++
++def render_balance_sheet_pdf(chama_name: str, data: dict, encrypt_enc=None) -> bytes:
++    from reportlab.platypus import Paragraph, Spacer
++    styles = _pdf_styles()
++    buf = io.BytesIO()
++    doc = _base_doc(buf, encrypt_enc)
++    story = [
++        Paragraph(chama_name, styles["Title"]),
++        Paragraph("Balance Sheet", styles["Heading3"]),
++        Paragraph(f"As of {data['asOf']} &middot; generated {today_iso()}", styles["Normal"]),
++        Spacer(1, 8),
++    ]
++    a = data["assets"]
++    story.append(_styled_table([
++        ["Assets", "KES"],
++        ["Cash & bank", f"{a['cashAndBank']:,.2f}"],
++        ["Loans receivable", f"{a['loansReceivable']:,.2f}"],
++        ["Merry-go-round arrears receivable", f"{a['mgrArrearsReceivable']:,.2f}"],
++        ["Merry-go-round exit clawbacks receivable", f"{a['mgrExitClawbacksReceivable']:,.2f}"],
++        ["Prepaid SMS credits", f"{a['prepaidSmsCredits']:,.2f}"],
++        ["Prepaid report credits", f"{a['prepaidReportCredits']:,.2f}"],
++        ["Total assets", f"{data['totalAssets']:,.2f}"],
++    ]))
++    story.append(Spacer(1, 8))
++    l = data["liabilities"]
++    story.append(_styled_table([
++        ["Liabilities", "KES"],
++        ["Merry-go-round exit refunds payable", f"{l['mgrExitRefundsPayable']:,.2f}"],
++        ["Total liabilities", f"{data['totalLiabilities']:,.2f}"],
++    ]))
++    story.append(Spacer(1, 8))
++    eq = data["equity"]
++    story.append(_styled_table([
++        ["Equity", "KES"],
++        ["Member contributions & credit balances", f"{eq['memberContributionsAndCredit']:,.2f}"],
++        ["Retained earnings / reserve (balancing figure)", f"{eq['retainedEarningsReserve']:,.2f}"],
++        ["Total equity", f"{data['totalEquity']:,.2f}"],
++    ]))
++    story.append(Spacer(1, 6))
++    story.append(Paragraph(
++        "<i>Retained earnings/reserve is a balancing figure (assets − liabilities − member equity), "
++        "not independently tracked period-by-period. Loan receivables use current repayment records "
++        "rather than a strict historical reconstruction — see the report engine's documented approximations.</i>",
++        styles["Normal"],
++    ))
++    doc.build(story)
++    return buf.getvalue()
++
++
++def render_balance_sheet_csv(data: dict) -> bytes:
++    import csv
++    buf = io.StringIO()
++    w = csv.writer(buf)
++    w.writerow(["Balance Sheet", f"as of {data['asOf']}"])
++    w.writerow([])
++    w.writerow(["Assets"])
++    for k, v in data["assets"].items():
++        w.writerow([k, v])
++    w.writerow(["Total assets", data["totalAssets"]])
++    w.writerow([])
++    w.writerow(["Liabilities"])
++    for k, v in data["liabilities"].items():
++        w.writerow([k, v])
++    w.writerow(["Total liabilities", data["totalLiabilities"]])
++    w.writerow([])
++    w.writerow(["Equity"])
++    for k, v in data["equity"].items():
++        w.writerow([k, v])
++    w.writerow(["Total equity", data["totalEquity"]])
++    return buf.getvalue().encode("utf-8")
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 686c1f6..ed787d2 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -64,7 +64,22 @@ class Chama(TypedDict):
+     autoSettle: NotRequired[bool]
+     settlementFreq: NotRequired[Frequency]
+     lastSettlement: NotRequired[str]
+-    minutesExportsUsedThisMonth: NotRequired[float]
++    # --- Reports engine (retires minutesExportsUsedThisMonth/minutesQuota —
++    #     see functions/shared/constants.py's PLANS docstring). A chama
++    #     provisioned before this patch has the OLD field instead; every
++    #     reader falls back to it — see reports_engine.standard_used(). ---
++    minutesExportsUsedThisMonth: NotRequired[float]  # LEGACY — pre-reports-engine name, read as a fallback only
++    standardReportsUsedThisMonth: NotRequired[float]
++    premiumReportsUsedThisMonth: NotRequired[float]
++    premiumAlacarteUsedThisMonth: NotRequired[int]
++    # Prepaid top-up wallet — spent as STANDARD credits on Starter/Basic,
++    # or PREMIUM credits on Growth/Max (see constants.py). Credited by the
++    # PAY repo's webhook on an MCX- reference succeeding.
++    reportCreditsBalance: NotRequired[float]
++    # 1-12; which month a chama's financial year starts (for the P&L /
++    # Balance Sheet "This/Last Financial Year" period presets). Defaults to
++    # 1 (January) when absent.
++    fiscalYearStartMonth: NotRequired[int]
+     status: Literal["active", "suspended"]
+     whatsappEnabled: NotRequired[bool]
+     createdAt: NotRequired[int]
+@@ -369,3 +384,47 @@ class Invite(TypedDict):
+     claimedAt: NotRequired[int]
+     claimedByUid: NotRequired[str]
+     expiresAt: int
++
++
++class ReportCreditTopUp(TypedDict):
++    """
++    chamas/{chamaId}/reportCreditTopUps/{reference} — reports-engine wallet
++    top-up. Same shape/trust model as SmsTopUp (doc ID IS the payment
++    reference, prefix MCX-), settled by the PAY repo's webhook — see
++    functions/mychama/reports.py::purchaseReportCredits and TOUCH_BASE.md
++    "Reports engine — PAY-repo follow-up".
++    """
++    chamaId: str
++    credits: int              # how many wallet credits this purchase adds on success
++    amountKes: float
++    phone: str
++    status: Literal["pending", "success", "failed"]
++    createdAt: int
++    expiresAt: int
++    updatedAt: NotRequired[int]
++
++
++class ReportAlacartePurchase(TypedDict):
++    """
++    chamas/{chamaId}/reportAlacartePurchases/{reference} — Starter/Basic
++    one-off premium-report purchase (prefix MCR-). The report's parameters
++    are captured at purchase time so `generateReport` can find and consume
++    this doc once payment succeeds, without the caller having to resend
++    them. Counts against `chamas.premiumAlacarteUsedThisMonth` from the
++    moment it's CREATED (not from success) so a chama can't get around its
++    monthly cap by leaving several payments pending at once.
++    """
++    chamaId: str
++    reportType: str            # one of REPORT_TYPES' premium keys (cashflow / profit_loss / balance_sheet)
++    memberId: NotRequired[str]
++    dateFrom: NotRequired[str]
++    dateTo: NotRequired[str]
++    asOf: NotRequired[str]
++    format: Literal["pdf", "csv"]
++    encrypt: bool
++    amountKes: float
++    phone: str
++    status: Literal["pending", "success", "failed", "consumed"]
++    createdAt: int
++    expiresAt: int
++    updatedAt: NotRequired[int]
+diff --git a/functions/tests/test_reports_credit_gate.py b/functions/tests/test_reports_credit_gate.py
+new file mode 100644
+index 0000000..dbaeb78
+--- /dev/null
++++ b/functions/tests/test_reports_credit_gate.py
+@@ -0,0 +1,123 @@
++"""
++Self-contained checks for the reports engine's money-critical logic:
++the credit/wallet/à-la-carte gate (spend_credits, consume_alacarte_purchase)
++and period-preset resolution, including year/quarter boundaries and leap
++years. No Firestore or emulator needed — the transaction layer is faked.
++
++Run:  python functions/tests/test_reports_credit_gate.py   (exit code 1 on failure)
++"""
++import os, sys, types
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++import shared.reports_engine as engine
++from firebase_functions import https_fn
++
++# ---- fake Firestore transaction layer -------------------------------------
++class Snap:
++    def __init__(s, d): s._d = d
++    @property
++    def exists(s): return s._d is not None
++    def to_dict(s): return dict(s._d)
++class Ref:
++    def __init__(s, store, key): s.store, s.key = store, key
++    def get(s, transaction=None): return Snap(s.store.get(s.key))
++class Txn:
++    def update(s, ref, data): ref.store[ref.key].update(data)
++class DB:
++    def __init__(s, store): s.store = store
++    def transaction(s): return Txn()
++    def document(s, path): return Ref(s.store, path)
++engine.firestore = types.SimpleNamespace(transactional=lambda f: f)
++
++def chama(plan, **kw):
++    store = {"c": {"plan": plan, **kw}}
++    return DB(store), Ref(store, "c"), store
++
++def code(fn):
++    try: fn(); return "OK"
++    except https_fn.HttpsError as e: return e.code.value if hasattr(e.code,'value') else str(e.code)
++
++def check(name, got, want):
++    print(("PASS " if got == want else "FAIL ") + name, "" if got == want else f"(got {got!r}, want {want!r})")
++    return got == want
++
++ok = True
++# Starter: 3 standard credits, no wallet
++db, ref, st = chama("starter")
++for i in range(3): ok &= check(f"starter ledger #{i+1}", code(lambda: engine.spend_credits(db, ref, st["c"], "contribution_ledger")), "OK")
++ok &= check("starter 4th ledger, empty wallet -> resource-exhausted", code(lambda: engine.spend_credits(db, ref, st["c"], "contribution_ledger")), "resource-exhausted")
++ok &= check("starter used counter", st["c"]["standardReportsUsedThisMonth"], 3)
++
++# Starter with wallet 3: allowance spent, then wallet pays; arrears costs 2
++db, ref, st = chama("starter", standardReportsUsedThisMonth=3, reportCreditsBalance=3)
++r = engine.spend_credits(db, ref, st["c"], "arrears_penalties")
++ok &= check("wallet pays arrears (2)", (r["source"], st["c"]["reportCreditsBalance"]), ("wallet", 1))
++ok &= check("wallet 1 < arrears 2 -> exhausted", code(lambda: engine.spend_credits(db, ref, st["c"], "arrears_penalties")), "resource-exhausted")
++
++# Legacy field fallback: old chama with minutesExportsUsedThisMonth=3 is exhausted
++db, ref, st = chama("starter", minutesExportsUsedThisMonth=3)
++ok &= check("legacy counter respected", code(lambda: engine.spend_credits(db, ref, st["c"], "contribution_ledger")), "resource-exhausted")
++
++# Premium blocked below Growth even with a huge wallet
++db, ref, st = chama("basic", reportCreditsBalance=100)
++ok &= check("basic + premium + wallet -> failed-precondition", code(lambda: engine.spend_credits(db, ref, st["c"], "balance_sheet")), "failed-precondition")
++db, ref, st = chama("free", reportCreditsBalance=100)
++ok &= check("free -> failed-precondition", code(lambda: engine.spend_credits(db, ref, st["c"], "contribution_ledger")), "failed-precondition")
++
++# Growth: standard unlimited & uncharged wallet; premium 4 allowance
++db, ref, st = chama("growth", reportCreditsBalance=5)
++for i in range(5): engine.spend_credits(db, ref, st["c"], "contribution_ledger")
++ok &= check("growth standard unlimited, wallet untouched", st["c"]["reportCreditsBalance"], 5)
++engine.spend_credits(db, ref, st["c"], "profit_loss")           # 3 of 4
++ok &= check("growth P&L uses allowance", st["c"]["premiumReportsUsedThisMonth"], 3)
++r = engine.spend_credits(db, ref, st["c"], "profit_loss")       # 3+3>4 -> wallet
++ok &= check("growth 2nd P&L falls to wallet", (r["source"], st["c"]["reportCreditsBalance"]), ("wallet", 2))
++ok &= check("growth 3rd P&L, wallet 2<3 -> exhausted", code(lambda: engine.spend_credits(db, ref, st["c"], "profit_loss")), "resource-exhausted")
++
++# Max: cashflow (2) x5 fits in 10
++db, ref, st = chama("max")
++for i in range(5): engine.spend_credits(db, ref, st["c"], "cashflow")
++ok &= check("max 5 cashflows = 10 credits", st["c"]["premiumReportsUsedThisMonth"], 10)
++ok &= check("max 6th -> exhausted", code(lambda: engine.spend_credits(db, ref, st["c"], "cashflow")), "resource-exhausted")
++
++# À la carte consumption
++p = "chamas/x/reportAlacartePurchases/MCR-1"
++store = {}
++import shared.firestore_paths as paths
++key = paths.report_alacarte_purchase("x", "MCR-1")
++store[key] = {"status": "success", "reportType": "balance_sheet", "dateFrom": None}
++db = DB(store)
++ok &= check("consume ok", code(lambda: engine.consume_alacarte_purchase(db, "x", "balance_sheet", "MCR-1")), "OK")
++ok &= check("now consumed", store[key]["status"], "consumed")
++ok &= check("double-consume blocked", code(lambda: engine.consume_alacarte_purchase(db, "x", "balance_sheet", "MCR-1")), "failed-precondition")
++store[key] = {"status": "pending", "reportType": "balance_sheet"}
++ok &= check("pending blocked", code(lambda: engine.consume_alacarte_purchase(db, "x", "balance_sheet", "MCR-1")), "failed-precondition")
++store[key] = {"status": "success", "reportType": "cashflow"}
++ok &= check("wrong report type blocked", code(lambda: engine.consume_alacarte_purchase(db, "x", "balance_sheet", "MCR-1")), "invalid-argument")
++ok &= check("unknown reference", code(lambda: engine.consume_alacarte_purchase(db, "x", "balance_sheet", "NOPE")), "not-found")
++
++# ---- period edge cases with a frozen clock --------------------------------
++import datetime as _dt
++def frozen(y, m, d):
++    class F(_dt.datetime):
++        @classmethod
++        def now(cls, tz=None): return cls(y, m, d, tzinfo=tz)
++    return F
++orig = engine.datetime
++engine.datetime = frozen(2026, 1, 15)
++ok &= check("Jan: last_quarter", engine.resolve_range("last_quarter", None, None), ("2025-10-01", "2025-12-31"))
++ok &= check("Jan: this_quarter", engine.resolve_range("this_quarter", None, None), ("2026-01-01", "2026-03-31"))
++ok &= check("Jan: last_month", engine.resolve_range("last_month", None, None), ("2025-12-01", "2025-12-31"))
++ok &= check("Jan: this_fy(Jul start)", engine.resolve_range("this_fy", None, None, 7), ("2025-07-01", "2026-06-30"))
++ok &= check("Jan: last_fy(Jul start)", engine.resolve_range("last_fy", None, None, 7), ("2024-07-01", "2025-06-30"))
++engine.datetime = frozen(2026, 12, 31)
++ok &= check("Dec31: this_quarter", engine.resolve_range("this_quarter", None, None), ("2026-10-01", "2026-12-31"))
++ok &= check("Dec31: this_fy(Jan)", engine.resolve_range("this_fy", None, None, 1), ("2026-01-01", "2026-12-31"))
++engine.datetime = frozen(2028, 3, 1)  # leap year
++ok &= check("leap Feb via last_month", engine.resolve_range("last_month", None, None), ("2028-02-01", "2028-02-29"))
++ok &= check("as_of last_quarter = its end", engine.resolve_as_of("last_quarter", None), "2027-12-31")
++engine.datetime = orig
++ok &= check("custom needs both dates", code(lambda: engine.resolve_range("custom", "2026-01-01", None)), "failed-precondition")
++ok &= check("unknown preset", code(lambda: engine.resolve_range("nonsense", None, None)), "failed-precondition")
++
++print("\nALL PASSED" if ok else "\nSOME FAILED")
++sys.exit(0 if ok else 1)
+diff --git a/src/features/contributions/MyContributions.tsx b/src/features/contributions/MyContributions.tsx
+index 9871d7f..30846d0 100644
+--- a/src/features/contributions/MyContributions.tsx
++++ b/src/features/contributions/MyContributions.tsx
+@@ -9,6 +9,7 @@ import { kes } from '../../lib/money';
+ import { contributionFees } from '../../lib/money';
+ import { PLANS } from '../../lib/constants';
+ import type { Contribution } from '../../lib/types';
++import MyStatementCard from '../reports/MyStatementCard';
+ 
+ const STATUS_LABEL: Record<string, string> = { paid: 'Paid', partial: 'Partial', pending: 'Due', overdue: 'Overdue' };
+ const STATUS_CLASS: Record<string, string> = {
+@@ -51,6 +52,8 @@ export default function MyContributions() {
+         )}
+       </div>
+ 
++      <MyStatementCard />
++
+       <div className="card overflow-hidden">
+         <div className="overflow-x-auto">
+           <table className="w-full text-sm">
+diff --git a/src/features/reports/MyStatementCard.tsx b/src/features/reports/MyStatementCard.tsx
+new file mode 100644
+index 0000000..09579ef
+--- /dev/null
++++ b/src/features/reports/MyStatementCard.tsx
+@@ -0,0 +1,74 @@
++import { useState } from 'react';
++import { useChama } from '../../app/ChamaProvider';
++import { generateStatement } from '../../lib/callables';
++import { describeCallError } from '../../lib/errorMessages';
++
++const PRESETS: { key: string; label: string }[] = [
++  { key: 'this_month', label: 'This month' },
++  { key: 'last_month', label: 'Last month' },
++  { key: 'this_quarter', label: 'This quarter' },
++  { key: 'last_quarter', label: 'Last quarter' },
++  { key: 'this_fy', label: 'This financial year' },
++  { key: 'last_fy', label: 'Last financial year' },
++];
++
++/**
++ * A member's OWN statement — free on every plan (including Free) and never
++ * touches the chama's report credits. Enforced server-side in
++ * generateStatement (is_self_service), not here; this card only offers it.
++ * The PDF is always PIN-protected, and the PIN is SMSed to the member.
++ */
++export default function MyStatementCard() {
++  const { chamaId, membership } = useChama();
++  const [period, setPeriod] = useState('this_fy');
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [result, setResult] = useState<{ url: string; pinSentTo: number } | null>(null);
++
++  if (!chamaId || !membership) return null;
++
++  async function submit() {
++    setBusy(true);
++    setError(null);
++    setResult(null);
++    try {
++      const res = await generateStatement({ chamaId: chamaId!, memberId: membership!.memberId, period, format: 'pdf' });
++      setResult({ url: res.url, pinSentTo: res.pinSentTo });
++    } catch (e) {
++      setError(describeCallError(e).message);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="card p-6">
++      <h3 className="font-display font-semibold mb-1">My statement</h3>
++      <p className="text-xs text-forest-900/50 mb-4">
++        Free for every member. Your PDF is password-protected — the 6-digit PIN is sent to your phone by SMS.
++      </p>
++      <div className="flex flex-wrap gap-2 items-center">
++        <select value={period} onChange={(e) => setPeriod(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100 text-sm">
++          {PRESETS.map((p) => (
++            <option key={p.key} value={p.key}>
++              {p.label}
++            </option>
++          ))}
++        </select>
++        <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
++          {busy ? 'Generating…' : 'Get my statement'}
++        </button>
++      </div>
++      {error && <p className="text-sm text-brick-500 font-medium mt-2">{error}</p>}
++      {result && (
++        <p className="text-sm mt-3">
++          Ready —{' '}
++          <a href={result.url} target="_blank" rel="noreferrer" className="font-semibold text-forest-700 underline">
++            download your statement
++          </a>
++          . {result.pinSentTo > 0 ? 'Your PIN was sent by SMS.' : "We couldn't send the PIN by SMS — contact your chama officials."}
++        </p>
++      )}
++    </div>
++  );
++}
+diff --git a/src/features/reports/Reports.tsx b/src/features/reports/Reports.tsx
+index 56969e5..6498b70 100644
+--- a/src/features/reports/Reports.tsx
++++ b/src/features/reports/Reports.tsx
+@@ -1,13 +1,22 @@
+-import { useState } from 'react';
+-import { collection, getDocs } from 'firebase/firestore';
++import { useEffect, useRef, useState } from 'react';
++import { collection, doc, getDocs, onSnapshot } from 'firebase/firestore';
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+ import { useMembers } from '../../app/useMembers';
+-import { generateStatement } from '../../lib/callables';
++import { generateReport, generateStatement, purchasePremiumReportAlaCarte, purchaseReportCredits } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { todayISO } from '../../lib/dates';
+-import { PLANS } from '../../lib/constants';
++import { kes } from '../../lib/money';
++import {
++  PLANS,
++  REPORT_TYPES,
++  REPORT_WALLET_BUNDLES,
++  premiumAlacartePriceKes,
++  type ReportKey,
++} from '../../lib/constants';
++import type { Chama, ReportAlacartePurchase } from '../../lib/types';
++import MyStatementCard from './MyStatementCard';
+ 
+ // A tiny CSV builder — no library needed for a handful of flat exports.
+ function toCsv(rows: Record<string, unknown>[]): string {
+@@ -30,6 +39,8 @@ function downloadText(filename: string, content: string, mime = 'text/csv') {
+   URL.revokeObjectURL(url);
+ }
+ 
++// Raw CSV dumps stay exactly as before: client-side reads from the local
++// Firestore cache, so they work offline and cost no credits on any paid plan.
+ const BULK_EXPORTS = [
+   { key: 'members', label: 'Members', collection: (chamaId: string) => paths.members(chamaId) },
+   { key: 'contributions', label: 'Contributions', collection: (chamaId: string) => paths.contributions(chamaId) },
+@@ -37,6 +48,72 @@ const BULK_EXPORTS = [
+   { key: 'transactions', label: 'Transactions', collection: (chamaId: string) => paths.transactions(chamaId) },
+ ] as const;
+ 
++const RANGE_PRESETS = [
++  { key: 'this_month', label: 'This month' },
++  { key: 'last_month', label: 'Last month' },
++  { key: 'this_quarter', label: 'This quarter' },
++  { key: 'last_quarter', label: 'Last quarter' },
++  { key: 'this_fy', label: 'This financial year' },
++  { key: 'last_fy', label: 'Last financial year' },
++  { key: 'custom', label: 'Custom range…' },
++];
++
++const AS_OF_PRESETS = [
++  { key: 'today', label: 'Today' },
++  { key: 'last_month', label: 'End of last month' },
++  { key: 'last_quarter', label: 'End of last quarter' },
++  { key: 'last_fy', label: 'End of last financial year' },
++  { key: 'custom', label: 'Pick a date…' },
++];
++
++const ALACARTE_WAIT_MS = 3 * 60 * 1000;
++
++/** What this chama has left, described from its own doc. Display only — the server is the source of truth. */
++function creditPosition(chama: Chama) {
++  const cfg = PLANS[chama.plan];
++  const standardUsed = chama.standardReportsUsedThisMonth ?? chama.minutesExportsUsedThisMonth ?? 0;
++  const premiumUsed = chama.premiumReportsUsedThisMonth ?? 0;
++  const wallet = chama.reportCreditsBalance ?? 0;
++  return {
++    cfg,
++    wallet,
++    standardLeft: cfg.standardReportCredits === null ? null : Math.max(0, cfg.standardReportCredits - standardUsed),
++    premiumLeft: Math.max(0, cfg.premiumReportCredits - premiumUsed),
++    alacarteLeft: cfg.premiumAlacarteCapPerMonth === null ? null : Math.max(0, cfg.premiumAlacarteCapPerMonth - (chama.premiumAlacarteUsedThisMonth ?? 0)),
++  };
++}
++
++type Mode = 'included' | 'wallet' | 'exhausted' | 'alacarte' | 'alacarte_capped' | 'locked';
++
++function costFor(chama: Chama, key: ReportKey): { mode: Mode; text: string } {
++  const spec = REPORT_TYPES[key];
++  const p = creditPosition(chama);
++  const n = spec.credits;
++  const credits = `${n} credit${n === 1 ? '' : 's'}`;
++
++  if (spec.tier === 'standard') {
++    if (p.standardLeft === null) return { mode: 'included', text: 'Included — unlimited on your plan.' };
++    if (p.standardLeft >= n) return { mode: 'included', text: `Uses ${credits} of your monthly allowance (${p.standardLeft} left).` };
++    if (p.wallet >= n) return { mode: 'wallet', text: `Uses ${credits} from your wallet (${p.wallet} in wallet).` };
++    return { mode: 'exhausted', text: `Out of credits for this month — top up below to generate this (${credits}).` };
++  }
++
++  // Premium
++  if (p.cfg.premiumReportCredits === 0) {
++    if (!p.cfg.premiumAlacarteCapPerMonth) return { mode: 'locked', text: `Not available on the ${p.cfg.name} plan.` };
++    if ((p.alacarteLeft ?? 0) <= 0) {
++      return { mode: 'alacarte_capped', text: 'Monthly one-off limit reached. Upgrade to Growth for a monthly premium allowance.' };
++    }
++    return {
++      mode: 'alacarte',
++      text: `One-off purchase: ${kes(premiumAlacartePriceKes(key))} (${p.alacarteLeft} one-off left this month). Growth includes a monthly allowance.`,
++    };
++  }
++  if (p.premiumLeft >= n) return { mode: 'included', text: `Uses ${credits} of your monthly premium allowance (${p.premiumLeft} left).` };
++  if (p.wallet >= n) return { mode: 'wallet', text: `Uses ${credits} from your wallet (${p.wallet} in wallet).` };
++  return { mode: 'exhausted', text: `Premium allowance used up — top up below to generate this (${credits}).` };
++}
++
+ export default function Reports() {
+   const { chama, chamaId, chamaReady } = useChama();
+   const { members } = useMembers(chamaId, false);
+@@ -46,8 +123,6 @@ export default function Reports() {
+   if (!chamaReady || !chama || !chamaId) return <p className="text-forest-900/60">Loading…</p>;
+ 
+   const exportsAllowed = PLANS[chama.plan].exportsAllowed;
+-  const quota = PLANS[chama.plan].minutesQuota;
+-  const used = chama.minutesExportsUsedThisMonth ?? 0;
+ 
+   async function runBulkExport(key: (typeof BULK_EXPORTS)[number]) {
+     setBulkBusy(key.key);
+@@ -83,14 +158,16 @@ export default function Reports() {
+ 
+       {!exportsAllowed ? (
+         <div className="card p-5">
+-          <p className="text-sm text-ink">Exports aren't available on the {PLANS[chama.plan].name} plan.</p>
+-          <p className="text-xs text-forest-900/50 mt-1">Upgrade from Plan & Billing to unlock data exports and statements.</p>
++          <p className="text-sm text-ink">Reports and exports aren't available on the {PLANS[chama.plan].name} plan.</p>
++          <p className="text-xs text-forest-900/50 mt-1">Upgrade from Plan & Billing to unlock statements, ledgers and financial reports.</p>
+         </div>
+       ) : (
+         <>
++          <CreditStrip chama={chama} />
++
+           <div className="card p-6">
+             <h3 className="font-display font-semibold mb-1">Raw data exports</h3>
+-            <p className="text-xs text-forest-900/50 mb-4">Unlimited on your plan — a full CSV of everything currently in each list.</p>
++            <p className="text-xs text-forest-900/50 mb-4">Unlimited on your plan, and they work offline — a full CSV of everything currently in each list.</p>
+             <div className="flex flex-wrap gap-2">
+               {BULK_EXPORTS.map((e) => (
+                 <button
+@@ -106,96 +183,324 @@ export default function Reports() {
+             {bulkError && <p className="text-sm text-brick-500 font-medium mt-2">{bulkError}</p>}
+           </div>
+ 
+-          <StatementForm chamaId={chamaId} members={members} quota={quota} used={used} />
++          <ReportBuilder chama={chama} chamaId={chamaId} members={members} />
++          <WalletTopUp chama={chama} chamaId={chamaId} />
+         </>
+       )}
++
++      <MyStatementCard />
++    </div>
++  );
++}
++
++function CreditStrip({ chama }: { chama: Chama }) {
++  const p = creditPosition(chama);
++  return (
++    <div className="card p-4 flex flex-wrap gap-x-8 gap-y-2 text-sm">
++      <span>
++        <span className="text-forest-900/50">Standard reports: </span>
++        <b>{p.standardLeft === null ? 'Unlimited' : `${p.standardLeft} left this month`}</b>
++      </span>
++      {p.cfg.premiumReportCredits > 0 ? (
++        <span>
++          <span className="text-forest-900/50">Premium reports: </span>
++          <b>{p.premiumLeft} left this month</b>
++        </span>
++      ) : (
++        <span>
++          <span className="text-forest-900/50">Premium reports: </span>
++          <b>{p.alacarteLeft ? `${p.alacarteLeft} one-off left this month` : 'Growth plan and above'}</b>
++        </span>
++      )}
++      <span>
++        <span className="text-forest-900/50">Wallet: </span>
++        <b>{p.wallet} credit{p.wallet === 1 ? '' : 's'}</b>
++      </span>
+     </div>
+   );
+ }
+ 
+-function StatementForm({
+-  chamaId,
+-  members,
+-  quota,
+-  used,
+-}: {
+-  chamaId: string;
+-  members: { id: string; name: string }[];
+-  quota: number | null;
+-  used: number;
+-}) {
++function ReportBuilder({ chama, chamaId, members }: { chama: Chama; chamaId: string; members: { id: string; name: string }[] }) {
+   const today = todayISO();
++  const keys = (Object.keys(REPORT_TYPES) as ReportKey[]).filter((k) => k !== 'minutes'); // minutes are exported from the Minutes screen
++  const [reportKey, setReportKey] = useState<ReportKey>('contribution_ledger');
+   const [memberId, setMemberId] = useState('');
++  const [preset, setPreset] = useState('this_month');
+   const [from, setFrom] = useState(today.slice(0, 8) + '01');
+   const [to, setTo] = useState(today);
++  const [asOf, setAsOf] = useState(today);
+   const [format, setFormat] = useState<'pdf' | 'csv'>('pdf');
+-  const [busy, setBusy] = useState(false);
++  const [encrypt, setEncrypt] = useState(false);
++  const [phone, setPhone] = useState('');
++  const [busy, setBusy] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+-  const [url, setUrl] = useState<string | null>(null);
++  const [result, setResult] = useState<{ url: string; encrypted: boolean; pinSentTo: number } | null>(null);
++  const unsub = useRef<(() => void) | null>(null);
++
++  useEffect(() => () => unsub.current?.(), []);
++
++  const spec = REPORT_TYPES[reportKey];
++  const pdfOnly = spec.encryptDefault && !spec.encryptOptional;
++  const cost = costFor(chama, reportKey);
++  const asOfMode = spec.periodMode === 'as_of';
++  const presetList = asOfMode ? AS_OF_PRESETS : RANGE_PRESETS;
++  const needsAlacarte = cost.mode === 'alacarte';
++  const blocked = cost.mode === 'locked' || cost.mode === 'alacarte_capped' || cost.mode === 'exhausted';
++
++  function pickReport(k: ReportKey) {
++    setReportKey(k);
++    const s = REPORT_TYPES[k];
++    setPreset(s.periodMode === 'as_of' ? 'today' : 'this_month');
++    if (s.encryptDefault && !s.encryptOptional) setFormat('pdf');
++    setEncrypt(s.encryptDefault);
++    setError(null);
++    setResult(null);
++  }
++
++  function periodArgs() {
++    return asOfMode
++      ? { period: preset, asOf: preset === 'custom' ? asOf : undefined }
++      : { period: preset, from: preset === 'custom' ? from : undefined, to: preset === 'custom' ? to : undefined };
++  }
++
++  async function generate(alacarteReference?: string) {
++    const common = { chamaId, format: pdfOnly ? ('pdf' as const) : format, encrypt: spec.encryptOptional ? encrypt : undefined, alacarteReference };
++    if (reportKey === 'member_statement') {
++      return generateStatement({ ...common, memberId, ...(periodArgs() as { period: string; from?: string; to?: string }) });
++    }
++    if (reportKey === 'cashflow') {
++      return generateStatement({ ...common, ...(periodArgs() as { period: string; from?: string; to?: string }) });
++    }
++    return generateReport({
++      ...common,
++      reportType: reportKey as 'contribution_ledger' | 'arrears_penalties' | 'profit_loss' | 'balance_sheet',
++      ...periodArgs(),
++    });
++  }
+ 
+-  const remaining = quota === null ? null : Math.max(0, quota - used);
++  /** Waits for the PAY webhook to flip the one-off purchase to 'success' (or 'failed'). */
++  function waitForPurchase(reference: string): Promise<'success' | 'failed'> {
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => {
++        unsub.current?.();
++        reject(new Error("We didn't receive the payment confirmation in time. If money left your phone, it will show once it settles — try again in a minute."));
++      }, ALACARTE_WAIT_MS);
++      unsub.current = onSnapshot(doc(db, paths.reportAlacartePurchase(chamaId, reference)), (snap) => {
++        const status = (snap.data() as ReportAlacartePurchase | undefined)?.status;
++        if (status === 'success' || status === 'failed') {
++          clearTimeout(timer);
++          unsub.current?.();
++          resolve(status);
++        }
++      });
++    });
++  }
+ 
+   async function submit() {
+     setError(null);
+-    setUrl(null);
+-    setBusy(true);
++    setResult(null);
++    if (reportKey === 'member_statement' && !memberId) {
++      setError('Choose a member first.');
++      return;
++    }
+     try {
+-      const res = await generateStatement({ chamaId, memberId: memberId || undefined, from, to, format });
+-      setUrl(res.url);
++      if (needsAlacarte) {
++        if (!phone.trim()) {
++          setError('Enter the M-Pesa/Airtel number to pay from.');
++          return;
++        }
++        setBusy('Check your phone and approve the payment…');
++        const { reference } = await purchasePremiumReportAlaCarte({
++          chamaId,
++          reportType: reportKey as 'cashflow' | 'profit_loss' | 'balance_sheet',
++          format: pdfOnly ? 'pdf' : format,
++          phone,
++          ...periodArgs(),
++        });
++        const outcome = await waitForPurchase(reference);
++        if (outcome === 'failed') throw new Error('The payment did not go through, so no report was generated.');
++        setBusy('Payment received — generating…');
++        setResult(await generate(reference));
++      } else {
++        setBusy('Generating…');
++        setResult(await generate());
++      }
+     } catch (e) {
+-      setError(describeCallError(e).message);
++      setError(e instanceof Error && !('code' in e) ? e.message : describeCallError(e).message);
+     } finally {
+-      setBusy(false);
++      setBusy(null);
+     }
+   }
+ 
++  const field = 'px-3 py-2 rounded-lg border border-forest-100';
++
+   return (
+     <div className="card p-6">
+-      <h3 className="font-display font-semibold mb-1">Statement</h3>
+-      <p className="text-xs text-forest-900/50 mb-4">
+-        {quota === null ? 'Unlimited exports on your plan.' : `${remaining} of ${quota} free export${quota === 1 ? '' : 's'} left this month — extra exports need a plan upgrade.`}
+-      </p>
++      <h3 className="font-display font-semibold mb-1">Generate a report</h3>
++      <p className="text-xs text-forest-900/50 mb-4">Pick a report and a period — everything else (pricing, credits, encryption) is handled for you.</p>
++
+       <div className="grid sm:grid-cols-2 gap-3">
++        <label className="flex flex-col gap-1 text-sm font-medium sm:col-span-2">
++          Report
++          <select value={reportKey} onChange={(e) => pickReport(e.target.value as ReportKey)} disabled={!!busy} className={field}>
++            <optgroup label="Standard">
++              {keys.filter((k) => REPORT_TYPES[k].tier === 'standard').map((k) => (
++                <option key={k} value={k}>{REPORT_TYPES[k].label}</option>
++              ))}
++            </optgroup>
++            <optgroup label="Financial statements (premium)">
++              {keys.filter((k) => REPORT_TYPES[k].tier === 'premium').map((k) => (
++                <option key={k} value={k}>{REPORT_TYPES[k].label}</option>
++              ))}
++            </optgroup>
++          </select>
++        </label>
++
++        {reportKey === 'member_statement' && (
++          <label className="flex flex-col gap-1 text-sm font-medium sm:col-span-2">
++            Member
++            <select value={memberId} onChange={(e) => setMemberId(e.target.value)} disabled={!!busy} className={field}>
++              <option value="">Choose a member…</option>
++              {members.map((m) => (
++                <option key={m.id} value={m.id}>{m.name}</option>
++              ))}
++            </select>
++          </label>
++        )}
++
+         <label className="flex flex-col gap-1 text-sm font-medium">
+-          Member (leave blank for whole chama)
+-          <select value={memberId} onChange={(e) => setMemberId(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
+-            <option value="">Whole chama</option>
+-            {members.map((m) => (
+-              <option key={m.id} value={m.id}>
+-                {m.name}
+-              </option>
++          {asOfMode ? 'As of' : 'Period'}
++          <select value={preset} onChange={(e) => setPreset(e.target.value)} disabled={!!busy} className={field}>
++            {presetList.map((p) => (
++              <option key={p.key} value={p.key}>{p.label}</option>
+             ))}
+           </select>
+         </label>
++
+         <label className="flex flex-col gap-1 text-sm font-medium">
+           Format
+-          <select value={format} onChange={(e) => setFormat(e.target.value as 'pdf' | 'csv')} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100">
++          <select value={pdfOnly ? 'pdf' : format} onChange={(e) => setFormat(e.target.value as 'pdf' | 'csv')} disabled={!!busy || pdfOnly} className={field}>
+             <option value="pdf">PDF</option>
+-            <option value="csv">CSV</option>
++            {!pdfOnly && <option value="csv">CSV</option>}
+           </select>
+         </label>
+-        <label className="flex flex-col gap-1 text-sm font-medium">
+-          From
+-          <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-        </label>
+-        <label className="flex flex-col gap-1 text-sm font-medium">
+-          To
+-          <input type="date" value={to} onChange={(e) => setTo(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-        </label>
++
++        {preset === 'custom' && !asOfMode && (
++          <>
++            <label className="flex flex-col gap-1 text-sm font-medium">
++              From
++              <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} disabled={!!busy} className={field} />
++            </label>
++            <label className="flex flex-col gap-1 text-sm font-medium">
++              To
++              <input type="date" value={to} onChange={(e) => setTo(e.target.value)} disabled={!!busy} className={field} />
++            </label>
++          </>
++        )}
++        {preset === 'custom' && asOfMode && (
++          <label className="flex flex-col gap-1 text-sm font-medium">
++            Date
++            <input type="date" value={asOf} onChange={(e) => setAsOf(e.target.value)} disabled={!!busy} className={field} />
++          </label>
++        )}
++
++        {needsAlacarte && (
++          <label className="flex flex-col gap-1 text-sm font-medium sm:col-span-2">
++            Pay from (M-Pesa / Airtel Money number)
++            <input value={phone} onChange={(e) => setPhone(e.target.value)} disabled={!!busy} placeholder="07XX XXX XXX" inputMode="tel" className={field} />
++          </label>
++        )}
+       </div>
+-      <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-4 disabled:opacity-50">
+-        {busy ? 'Generating…' : 'Generate statement'}
++
++      {spec.encryptOptional && (pdfOnly ? false : format === 'pdf') && (
++        <label className="flex items-center gap-2 text-sm mt-3">
++          <input type="checkbox" checked={encrypt} onChange={(e) => setEncrypt(e.target.checked)} disabled={!!busy} />
++          Protect this PDF with a PIN
++        </label>
++      )}
++      {spec.encryptDefault && (
++        <p className="text-xs text-forest-900/50 mt-3">This report is always password-protected. The 6-digit PIN is sent by SMS to your chair and treasurer — free of charge.</p>
++      )}
++
++      <p className={`text-sm mt-3 ${blocked ? 'text-brick-500 font-medium' : 'text-forest-700'}`}>{cost.text}</p>
++
++      <button
++        onClick={submit}
++        disabled={!!busy || cost.mode === 'locked' || cost.mode === 'alacarte_capped' || cost.mode === 'exhausted'}
++        className="btn-primary text-sm font-semibold px-4 py-2 rounded-full mt-4 disabled:opacity-50"
++      >
++        {busy ?? (needsAlacarte ? `Pay ${kes(premiumAlacartePriceKes(reportKey))} & generate` : 'Generate report')}
+       </button>
++
+       {error && <p className="text-sm text-brick-500 font-medium mt-2">{error}</p>}
+-      {url && (
+-        <p className="text-sm mt-3">
+-          Ready —{' '}
+-          <a href={url} target="_blank" rel="noreferrer" className="font-semibold text-forest-700 underline">
+-            download the statement
+-          </a>{' '}
+-          (link expires in 48 hours).
+-        </p>
++      {result && (
++        <div className="text-sm mt-3 space-y-1">
++          <p>
++            Ready —{' '}
++            <a href={result.url} target="_blank" rel="noreferrer" className="font-semibold text-forest-700 underline">
++              download the report
++            </a>{' '}
++            (link expires in 48 hours).
++          </p>
++          {result.encrypted && (
++            <p className={result.pinSentTo > 0 ? 'text-forest-900/60' : 'text-brick-500 font-medium'}>
++              {result.pinSentTo > 0
++                ? `The PIN was sent by SMS to ${result.pinSentTo} official${result.pinSentTo === 1 ? '' : 's'}.`
++                : "We couldn't send the PIN by SMS — check that the chair and treasurer have phone numbers on file."}
++            </p>
++          )}
++        </div>
+       )}
+     </div>
+   );
+ }
++
++function WalletTopUp({ chama, chamaId }: { chama: Chama; chamaId: string }) {
++  const [phone, setPhone] = useState('');
++  const [busy, setBusy] = useState<number | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [started, setStarted] = useState(false);
++  const p = creditPosition(chama);
++
++  async function buy(credits: number) {
++    if (!phone.trim()) {
++      setError('Enter the M-Pesa/Airtel number to pay from.');
++      return;
++    }
++    setBusy(credits);
++    setError(null);
++    setStarted(false);
++    try {
++      await purchaseReportCredits({ chamaId, credits, phone });
++      setStarted(true);
++    } catch (e) {
++      setError(describeCallError(e).message);
++    } finally {
++      setBusy(null);
++    }
++  }
++
++  return (
++    <div className="card p-6">
++      <h3 className="font-display font-semibold mb-1">Top up report credits</h3>
++      <p className="text-xs text-forest-900/50 mb-4">
++        Credits never expire. {p.cfg.premiumReportCredits > 0 ? 'On your plan they cover premium reports once the monthly allowance is used.' : 'On your plan they cover standard reports once the monthly allowance is used.'}
++      </p>
++      <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="07XX XXX XXX" inputMode="tel" className="px-3 py-2 rounded-lg border border-forest-100 text-sm mb-3 w-full sm:w-64" />
++      <div className="flex flex-wrap gap-2">
++        {Object.entries(REPORT_WALLET_BUNDLES).map(([credits, price]) => (
++          <button
++            key={credits}
++            onClick={() => buy(Number(credits))}
++            disabled={busy !== null}
++            className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full hover:bg-forest-50 disabled:opacity-50"
++          >
++            {busy === Number(credits) ? 'Starting…' : `${credits} credit${credits === '1' ? '' : 's'} — ${kes(price)}`}
++          </button>
++        ))}
++      </div>
++      {started && <p className="text-sm text-forest-700 mt-3">Check your phone for the payment prompt — your balance updates automatically once it clears.</p>}
++      {error && <p className="text-sm text-brick-500 font-medium mt-2">{error}</p>}
++    </div>
++  );
++}
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 39e0735..8ea422b 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -364,11 +364,57 @@ export const upgradePlan = liveCallable<
+ /**
+  * Not queueable: generates and returns a document URL live.
+  * Either a date-ranged statement (from/to/format, memberId optional for a
+- * whole-chama statement) OR — a small, documented addition beyond the
+- * original contract, see TOUCH_BASE.md "Billing & statements" — a single
+- * minutes entry's PDF via minutesId, which ignores from/to/memberId.
++ * whole-chama statement — PREMIUM as of the reports engine, see
++ * REPORT_TYPES['cashflow'] in constants.ts) OR — a small, documented
++ * addition beyond the original contract, see TOUCH_BASE.md "Billing &
++ * statements" — a single minutes entry's PDF via minutesId, which ignores
++ * from/to/memberId. `alacarteReference` is only needed on Starter/Basic,
++ * to consume a purchase made with purchasePremiumReportAlaCarte first.
+  */
+ export const generateStatement = liveCallable<
+-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string },
+-  { url: string }
++  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string; period?: string; encrypt?: boolean; alacarteReference?: string },
++  { url: string; encrypted: boolean; pinSentTo: number; charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
+ >('generateStatement', 'Generating statement');
++
++// ---------------------------------------------------------------------------
++// Reports engine (this patch) — Contribution Ledger, Arrears & Penalties,
++// P&L, Balance Sheet + the wallet/à la carte purchase flows. See
++// functions/shared/reports_engine.py and functions/mychama/reports.py.
++// ---------------------------------------------------------------------------
++
++/** Not queueable — same reasoning as generateStatement above. */
++export const generateReport = liveCallable<
++  {
++    chamaId: string;
++    reportType: 'contribution_ledger' | 'arrears_penalties' | 'profit_loss' | 'balance_sheet';
++    format: 'pdf' | 'csv';
++    period?: string; // preset key, e.g. 'this_month' | 'last_quarter' | 'this_fy' | 'custom' — see reports_engine.resolve_range
++    from?: string;
++    to?: string;
++    asOf?: string;
++    encrypt?: boolean;
++    alacarteReference?: string; // Starter/Basic consuming a paid purchase — see purchasePremiumReportAlaCarte
++  },
++  { url: string; encrypted: boolean; pinSentTo: number; charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
++>('generateReport', 'Generating report');
++
++/** Not queueable: live payment, mirrors purchaseSmsCredits exactly. Pass 1, 10 or 30 for a bundle rate — see REPORT_WALLET_BUNDLES. */
++export const purchaseReportCredits = liveCallable<
++  { chamaId: string; credits: number; phone: string },
++  { reference: string; amountKes: number }
++>('purchaseReportCredits', 'Starting report-credit top-up payment');
++
++/** Not queueable: live payment. Starter/Basic only — Growth/Max already have premiumReportCredits + the wallet. */
++export const purchasePremiumReportAlaCarte = liveCallable<
++  {
++    chamaId: string;
++    reportType: 'cashflow' | 'profit_loss' | 'balance_sheet';
++    format?: 'pdf' | 'csv';
++    phone: string;
++    memberId?: string;
++    from?: string;
++    to?: string;
++    asOf?: string;
++  },
++  { reference: string; amountKes: number }
++>('purchasePremiumReportAlaCarte', 'Starting one-off report payment');
+diff --git a/src/lib/constants.ts b/src/lib/constants.ts
+index 93362b1..93eb837 100644
+--- a/src/lib/constants.ts
++++ b/src/lib/constants.ts
+@@ -33,6 +33,8 @@ export const MC = {
+   SMS_SCHEDULES: 'smsSchedules',
+   WHATSAPP_AUDIT: 'whatsappAuditLog',
+   INVITES: 'invites',
++  REPORT_CREDIT_TOPUPS: 'reportCreditTopUps',
++  REPORT_ALACARTE_PURCHASES: 'reportAlacartePurchases',
+ } as const;
+ 
+ export const FEES = {
+@@ -57,6 +59,12 @@ export const FEES = {
+ 
+ export const PLAN_ORDER: ChamaPlan[] = ['free', 'starter', 'basic', 'growth', 'max'];
+ 
++/**
++ * `minutesQuota` (pre-reports-engine) is RETIRED in favour of two explicit
++ * credit pools — see functions/shared/constants.py's PLANS docstring for
++ * the full explanation (standardReportCredits / premiumReportCredits /
++ * premiumAlacarteCapPerMonth), which this MUST stay value-identical to.
++ */
+ export const PLANS: Record<
+   ChamaPlan,
+   {
+@@ -64,18 +72,74 @@ export const PLANS: Record<
+     price: number;
+     memberLimit: number;
+     smsRate: number;
+-    minutesQuota: number | null;
+     exportsAllowed: boolean;
+     onlineCollection: boolean;
++    standardReportCredits: number | null; // null = unlimited
++    premiumReportCredits: number;
++    premiumAlacarteCapPerMonth: number | null; // null = not applicable (Growth/Max use premiumReportCredits + the wallet instead)
++  }
++> = {
++  free: { name: 'Free', price: 0, memberLimit: 6, smsRate: 0.9, exportsAllowed: false, onlineCollection: false, standardReportCredits: 0, premiumReportCredits: 0, premiumAlacarteCapPerMonth: 0 },
++  starter: { name: 'Starter', price: 499, memberLimit: 15, smsRate: 0.9, exportsAllowed: true, onlineCollection: true, standardReportCredits: 3, premiumReportCredits: 0, premiumAlacarteCapPerMonth: 1 },
++  basic: { name: 'Basic', price: 999, memberLimit: 25, smsRate: 0.9, exportsAllowed: true, onlineCollection: true, standardReportCredits: 8, premiumReportCredits: 0, premiumAlacarteCapPerMonth: 2 },
++  growth: { name: 'Growth', price: 2499, memberLimit: 60, smsRate: 0.7, exportsAllowed: true, onlineCollection: true, standardReportCredits: null, premiumReportCredits: 4, premiumAlacarteCapPerMonth: null },
++  max: { name: 'Max', price: 4990, memberLimit: 999, smsRate: 0.5, exportsAllowed: true, onlineCollection: true, standardReportCredits: null, premiumReportCredits: 10, premiumAlacarteCapPerMonth: null },
++};
++
++// ---------------------------------------------------------------------------
++// Reports engine — catalog, tiering & pricing. All KES prices already
++// include the standing 20% launch discount — see functions/shared/constants.py's
++// matching docstring before changing any of these four numbers.
++// ---------------------------------------------------------------------------
++
++export const REPORT_WALLET_CREDIT_PRICE_KES = 56;
++export const REPORT_WALLET_BUNDLE_10_KES = 504;
++export const REPORT_WALLET_BUNDLE_30_KES = 1400;
++export const PREMIUM_ALACARTE_CREDIT_PRICE_KES = 144;
++
++export const REPORT_WALLET_BUNDLES: Record<number, number> = {
++  1: REPORT_WALLET_CREDIT_PRICE_KES,
++  10: REPORT_WALLET_BUNDLE_10_KES,
++  30: REPORT_WALLET_BUNDLE_30_KES,
++};
++
++export type ReportKey =
++  | 'member_statement'
++  | 'contribution_ledger'
++  | 'arrears_penalties'
++  | 'minutes'
++  | 'cashflow'
++  | 'profit_loss'
++  | 'balance_sheet';
++
++export const REPORT_TYPES: Record<
++  ReportKey,
++  {
++    label: string;
++    tier: 'standard' | 'premium';
++    credits: number;
++    periodMode: 'range' | 'as_of' | 'single';
++    encryptDefault: boolean;
++    encryptOptional: boolean;
+   }
+ > = {
+-  free: { name: 'Free', price: 0, memberLimit: 6, smsRate: 0.9, minutesQuota: 0, exportsAllowed: false, onlineCollection: false },
+-  starter: { name: 'Starter', price: 499, memberLimit: 15, smsRate: 0.9, minutesQuota: 1, exportsAllowed: true, onlineCollection: true },
+-  basic: { name: 'Basic', price: 999, memberLimit: 25, smsRate: 0.9, minutesQuota: 3, exportsAllowed: true, onlineCollection: true },
+-  growth: { name: 'Growth', price: 2499, memberLimit: 60, smsRate: 0.7, minutesQuota: null, exportsAllowed: true, onlineCollection: true },
+-  max: { name: 'Max', price: 4990, memberLimit: 999, smsRate: 0.5, minutesQuota: null, exportsAllowed: true, onlineCollection: true },
++  member_statement: { label: 'Individual Member Statement', tier: 'standard', credits: 1, periodMode: 'range', encryptDefault: true, encryptOptional: false },
++  contribution_ledger: { label: 'Contribution Summary & Tracking Ledger', tier: 'standard', credits: 1, periodMode: 'range', encryptDefault: false, encryptOptional: true },
++  arrears_penalties: { label: 'Arrears & Penalties Report', tier: 'standard', credits: 2, periodMode: 'as_of', encryptDefault: false, encryptOptional: true },
++  minutes: { label: 'Meeting Minutes Export', tier: 'standard', credits: 1, periodMode: 'single', encryptDefault: false, encryptOptional: false },
++  cashflow: { label: 'Cashflow Statement', tier: 'premium', credits: 2, periodMode: 'range', encryptDefault: false, encryptOptional: true },
++  profit_loss: { label: 'Profit & Loss Statement', tier: 'premium', credits: 3, periodMode: 'range', encryptDefault: true, encryptOptional: false },
++  balance_sheet: { label: 'Balance Sheet', tier: 'premium', credits: 3, periodMode: 'as_of', encryptDefault: true, encryptOptional: false },
+ };
+ 
++export function reportPriceKes(key: ReportKey): number {
++  return REPORT_TYPES[key].credits * REPORT_WALLET_CREDIT_PRICE_KES;
++}
++
++export function premiumAlacartePriceKes(key: ReportKey): number {
++  return REPORT_TYPES[key].credits * PREMIUM_ALACARTE_CREDIT_PRICE_KES;
++}
++
+ /**
+  * Presentational-only plan copy for the Billing screen — ported verbatim
+  * from the demo's PLANS[key].blurb/features. NOT part of the cross-repo
+@@ -101,8 +165,8 @@ export const PLAN_COPY: Record<ChamaPlan, { blurb: string; features: string[] }>
+       'Up to 15 members',
+       'Paystack collections (contributions, loan repayments, MGR-ins)',
+       'Merry-go-round with smart draws — payouts recorded in cash for now',
+-      'Excel + PDF exports',
+-      '1 free export/month, KES 100 after',
++      'Statements, contribution ledger & arrears reports — 3 credits/month',
++      '1 premium financial statement/month as a one-off purchase',
+       'Email support',
+     ],
+   },
+@@ -112,8 +176,8 @@ export const PLAN_COPY: Record<ChamaPlan, { blurb: string; features: string[] }>
+       'Up to 25 members',
+       'Paystack collections (contributions, loan repayments, MGR-ins)',
+       'Merry-go-round with smart draws — payouts recorded in cash for now',
+-      'Excel + PDF exports',
+-      '3 free exports/month, KES 100 after',
++      'Statements, contribution ledger & arrears reports — 8 credits/month',
++      '2 premium financial statements/month as a one-off purchase',
+       'Email support',
+     ],
+   },
+@@ -124,7 +188,8 @@ export const PLAN_COPY: Record<ChamaPlan, { blurb: string; features: string[] }>
+       'Unlimited loan products',
+       'Automatic settlement to your paybill/till/bank',
+       'Merry-go-round with smart draws — payouts recorded in cash for now',
+-      'Unlimited exports',
++      'Unlimited statements, contribution ledger & arrears reports',
++      'Cashflow, P&L & Balance Sheet — 4 premium credits/month included',
+       'Priority support',
+     ],
+   },
+@@ -135,7 +200,8 @@ export const PLAN_COPY: Record<ChamaPlan, { blurb: string; features: string[] }>
+       'Multiple sub-groups (coming soon)',
+       'Cheapest SMS credit rate',
+       'Merry-go-round with smart draws — payouts recorded in cash for now',
+-      'Unlimited exports',
++      'Unlimited statements, contribution ledger & arrears reports',
++      'Cashflow, P&L & Balance Sheet — 10 premium credits/month included',
+       'Priority phone support',
+     ],
+   },
+@@ -154,6 +220,8 @@ export const REF_PREFIX = {
+   APP_PAYMENT: 'MCA',
+   SMS_TOPUP: 'MCS',
+   PLAN_BILLING: 'MCP',
++  REPORT_CREDIT_TOPUP: 'MCX',
++  REPORT_ALACARTE: 'MCR',
+ } as const;
+ 
+ export const INTENT_PURPOSE_CODE = {
+diff --git a/src/lib/firestorePaths.ts b/src/lib/firestorePaths.ts
+index 82a0a86..4cbbc8a 100644
+--- a/src/lib/firestorePaths.ts
++++ b/src/lib/firestorePaths.ts
+@@ -55,4 +55,8 @@ export const paths = {
+ 
+   userChamaMembership: (uid: string, chamaId: string) => `${MC.USER_CHAMAS}/${uid}/${MC.MEMBERSHIPS}/${chamaId}`,
+   userChamaMemberships: (uid: string) => `${MC.USER_CHAMAS}/${uid}/${MC.MEMBERSHIPS}`,
++  reportCreditTopUps: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_CREDIT_TOPUPS}`,
++  reportCreditTopUp: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_CREDIT_TOPUPS}/${reference}`,
++  reportAlacartePurchases: (chamaId: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_ALACARTE_PURCHASES}`,
++  reportAlacartePurchase: (chamaId: string, reference: string) => `${MC.CHAMAS}/${chamaId}/${MC.REPORT_ALACARTE_PURCHASES}/${reference}`,
+ };
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 33bf91e..2da1f5c 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -34,7 +34,15 @@ export interface Chama {
+   autoSettle?: boolean;
+   settlementFreq?: 'daily' | 'weekly' | 'monthly';
+   lastSettlement?: string;
++  /** LEGACY — pre-reports-engine field name, read as a fallback only. See PLANS docstring in src/lib/constants.ts. */
+   minutesExportsUsedThisMonth?: number;
++  standardReportsUsedThisMonth?: number;
++  premiumReportsUsedThisMonth?: number;
++  premiumAlacarteUsedThisMonth?: number;
++  /** Prepaid report-credit wallet — spent as STANDARD credits on Starter/Basic, PREMIUM credits on Growth/Max. */
++  reportCreditsBalance?: number;
++  /** 1-12; defaults to 1 (January) when absent. */
++  fiscalYearStartMonth?: number;
+   status: 'active' | 'suspended';
+   whatsappEnabled?: boolean;
+   createdAt?: number;
+@@ -359,6 +367,36 @@ export interface Invite {
+   expiresAt: number;
+ }
+ 
++/** chamas/{chamaId}/reportCreditTopUps/{reference} — prefix MCX-. See functions/shared/types.py. */
++export interface ReportCreditTopUp {
++  chamaId: string;
++  credits: number;
++  amountKes: number;
++  phone: string;
++  status: 'pending' | 'success' | 'failed';
++  createdAt: number;
++  expiresAt: number;
++  updatedAt?: number;
++}
++
++/** chamas/{chamaId}/reportAlacartePurchases/{reference} — prefix MCR-. See functions/shared/types.py. */
++export interface ReportAlacartePurchase {
++  chamaId: string;
++  reportType: string;
++  memberId?: string;
++  dateFrom?: string;
++  dateTo?: string;
++  asOf?: string;
++  format: 'pdf' | 'csv';
++  encrypt: boolean;
++  amountKes: number;
++  phone: string;
++  status: 'pending' | 'success' | 'failed' | 'consumed';
++  createdAt: number;
++  expiresAt: number;
++  updatedAt?: number;
++}
++
+ export interface Minute {
+   id: string;
+   title: string;

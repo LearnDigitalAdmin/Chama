@@ -45,14 +45,16 @@ LATE_DECAY = 0.7
 
 def late_score(records: list[dict], member_id: str) -> float:
     """records: this pot's full records list (any period). Sorted by period
-    ascending internally so the decay walk is chronological."""
+    ascending internally so the decay walk is chronological. A 'partial'
+    period (paid less than the full amount) counts the same as 'missed' —
+    only a fully 'paid' period earns the decay."""
     recs = sorted(
         [r for r in records if r["memberId"] == member_id],
         key=lambda r: r["period"],
     )
     score = 0.0
     for r in recs:
-        score = score + 1 if r["status"] == "missed" else score * LATE_DECAY
+        score = score + 1 if r["status"] in ("missed", "partial") else score * LATE_DECAY
     return round(score * 100) / 100
 
 
@@ -61,7 +63,9 @@ def paid_count(records: list[dict], member_id: str) -> int:
 
 
 def missed_count(records: list[dict], member_id: str) -> int:
-    return sum(1 for r in records if r["memberId"] == member_id and r["status"] == "missed")
+    """Counts both full misses and partial payments — anything short of
+    the full amount still leaves a gap the member owes."""
+    return sum(1 for r in records if r["memberId"] == member_id and r["status"] in ("missed", "partial"))
 
 
 def reliability(records: list[dict], member_id: str) -> int:
@@ -108,8 +112,12 @@ def pool_for_round(pot: dict, records: list[dict]) -> RoundInfo:
     periods_per_round = pot["periodsPerRound"]
     periods_this_round = list(range(period - periods_per_round + 1, period + 1))
     expected = pot["amount"] * len(pot["memberIds"]) * periods_per_round
+    # 'partial' records carry real cash already collected (see
+    # recordCashMgrPayment) — it counts toward the round's actual total
+    # just like a full 'paid' record; only the un-covered remainder is a
+    # real shortfall.
     actual = sum(
-        r["amount"] for r in records if r["period"] in periods_this_round and r["status"] == "paid"
+        r["amount"] for r in records if r["period"] in periods_this_round and r["status"] in ("paid", "partial")
     )
     shortfall = max(0.0, round((expected - actual) * 100) / 100)
     return RoundInfo(periodsThisRound=periods_this_round, expected=expected, actual=actual, shortfall=shortfall)
@@ -209,7 +217,16 @@ def health_check(pot: dict, records: list[dict], payouts: list[dict], arrears: l
     for m in queue_set - member_set:
         findings.append({"code": "orphaned_in_queue", "memberId": m, "message": "In the payout queue but no longer a pot member."})
 
-    for m in member_set - queue_set:
+    # A member absent from the queue isn't necessarily "missing" — the
+    # normal, correct outcome of a payout is removal from the queue (see
+    # recordMgrPayoutCash). Only flag members who are neither in the queue
+    # NOR already paid out THIS cycle; cycleNumber-gated so someone paid
+    # in a PRIOR cycle, now legitimately back for a fresh mgrStartNewCycle
+    # draw, still gets flagged if they're genuinely absent from the new
+    # queue.
+    current_cycle = pot.get("cycleNumber", 1)
+    paid_out_this_cycle = {p["memberId"] for p in payouts if p.get("cycleNumber", 1) == current_cycle}
+    for m in member_set - queue_set - paid_out_this_cycle:
         if pot["status"] == "active":
             findings.append({"code": "missing_from_queue", "memberId": m, "message": "A pot member with no place in the payout queue."})
 

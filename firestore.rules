@@ -447,9 +447,14 @@ service cloud.firestore {
 
       match /smsSchedules/{scheduleId} {
         allow read: if isOfficial(chamaId);
+        // 385 = shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385
+        // segment cap) — was 480 here, out of sync with the app's own
+        // segment/credit rules, so a schedule written directly against
+        // these rules (see ScheduleForm) could carry a body the cron
+        // (run_sms_schedules) would never have priced correctly.
         allow create, update: if isOfficial(chamaId)
                               && request.resource.data.status in ['active', 'paused']
-                              && request.resource.data.body.size() <= 480;
+                              && request.resource.data.body.size() <= 385;
         allow delete: if isOfficial(chamaId);
       }
 

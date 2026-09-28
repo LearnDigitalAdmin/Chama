@@ -230,7 +230,8 @@ export interface MgrRecord {
   id: string;
   period: number;
   memberId: string;
-  status: 'paid' | 'missed' | 'pending';
+  /** 'partial' — cash was recorded but less than the pot's full per-period amount; the gap is tracked as an arrear. */
+  status: 'paid' | 'partial' | 'missed' | 'pending';
   amount: number;
   date: string | null;
   method: PayMethod;
@@ -243,6 +244,8 @@ export interface MgrPayout {
   id: string;
   memberId: string;
   round: number;
+  /** The pot's cycleNumber when this payout was made. Absent on payouts recorded before this field existed — treat as cycle 1. */
+  cycleNumber?: number;
   amount: number;
   date: string;
   method: PayMethod;

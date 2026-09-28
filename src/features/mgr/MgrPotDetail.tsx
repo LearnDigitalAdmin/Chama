@@ -27,7 +27,7 @@ import {
 } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { kes } from '../../lib/money';
-import { lateScore, recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
+import { recentReliability, healthCheck, previewSmartOrder, isShortRound } from '../../lib/mgrEngine';
 import { Spinner } from '../../components/Spinner';
 import { AdminChargeButton } from '../payments/AdminChargeButton';
 import type { MgrArrear, MgrExit, MgrPayout, MgrPot, MgrRecord } from '../../lib/types';
@@ -73,6 +73,7 @@ export default function MgrPotDetail() {
   const [settleClawbackId, setSettleClawbackId] = useState<string | null>(null);
   const [settleArrearId, setSettleArrearId] = useState<string | null>(null);
   const [writeOffArrearId, setWriteOffArrearId] = useState<string | null>(null);
+  const [partialPayId, setPartialPayId] = useState<string | null>(null); // member id — inline "record partial cash" form open
   const [shortfallAmount, setShortfallAmount] = useState<number>(0);
   const [shortfallSource, setShortfallSource] = useState<'reserve' | 'member'>('reserve');
   const [shortfallMember, setShortfallMember] = useState<string>('');
@@ -106,7 +107,7 @@ export default function MgrPotDetail() {
     };
   }, [chamaId, potId]);
 
-  const findings = useMemo(() => (pot ? healthCheck(pot, arrears) : []), [pot, arrears]);
+  const findings = useMemo(() => (pot ? healthCheck(pot, arrears, payouts) : []), [pot, arrears, payouts]);
   const openArrears = arrears.filter((a) => a.status === 'open');
   const openExits = exits.filter((x) => x.status === 'open');
 
@@ -117,6 +118,11 @@ export default function MgrPotDetail() {
 
   const currentPeriodRecords = records.filter((r) => r.period === pot.period);
   const paidThisPeriod = new Set(currentPeriodRecords.filter((r) => r.status === 'paid').map((r) => r.memberId));
+  const partialThisPeriod = new Map(currentPeriodRecords.filter((r) => r.status === 'partial').map((r) => [r.memberId, r.amount]));
+  // Once any payout has run this cycle, a re-draw could reshuffle the
+  // order money already went out on — never offer it past that point
+  // (server-side, runMgrDraw refuses the same way).
+  const paidOutThisCycle = payouts.some((p) => (p.cycleNumber ?? 1) === (pot.cycleNumber ?? 1));
 
   function handleErr(e: unknown, fallback: string) {
     const { message, isQueued } = describeCallError(e);
@@ -139,7 +145,8 @@ export default function MgrPotDetail() {
 
   const draw = (method: 'smart' | 'random') => run('draw', () => runMgrDraw({ chamaId: cid, potId: pid, method }));
 
-  const recordPaid = (memberId: string) => run(`pay-${memberId}`, () => recordCashMgrPayment({ chamaId: cid, potId: pid, memberId }));
+  const recordPaid = (memberId: string, amount?: number) =>
+    run(`pay-${memberId}`, () => recordCashMgrPayment({ chamaId: cid, potId: pid, memberId, amount }), () => setPartialPayId(null));
 
   const close = () =>
     run('close', () => closeMgrPeriod({ chamaId: cid, potId: pid }), (res) => {
@@ -199,7 +206,7 @@ export default function MgrPotDetail() {
   // real figures without a round trip, mirroring the demo's
   // openMgrRemoveMember.
   function memberExitPreview(memberId: string) {
-    const contributed = records.filter((r) => r.memberId === memberId && r.status === 'paid').reduce((s, r) => s + r.amount, 0);
+    const contributed = records.filter((r) => r.memberId === memberId && (r.status === 'paid' || r.status === 'partial')).reduce((s, r) => s + r.amount, 0);
     const received = payouts.filter((p) => p.memberId === memberId).reduce((s, p) => s + p.amount, 0);
     return { contributed: Math.round(contributed * 100) / 100, received: Math.round(received * 100) / 100 };
   }
@@ -400,56 +407,73 @@ export default function MgrPotDetail() {
                 <tr className="text-left text-forest-900/50 text-xs border-b border-forest-100">
                   <th className="px-4 py-3 font-medium">Member</th>
                   <th className="px-4 py-3 font-medium">This period</th>
-                  <th className="px-4 py-3 font-medium">Late score</th>
                   <th className="px-4 py-3 font-medium">Recent reliability</th>
                   {isFinanceAdmin && <th className="px-4 py-3"></th>}
                 </tr>
               </thead>
               <tbody>
-                {pot.memberIds.map((id) => (
-                  <tr key={id} className="border-b border-forest-50 last:border-0">
-                    <td className="px-4 py-3 font-medium">{memberName(members, id)}</td>
-                    <td className="px-4 py-3">
-                      {paidThisPeriod.has(id) ? (
-                        <span className="chip bg-forest-50 text-forest-700">Paid</span>
-                      ) : (
-                        <span className="chip bg-forest-50 text-forest-900/50">Not yet</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">{lateScore(records, id)}</td>
-                    <td className="px-4 py-3">{recentReliability(records, id)}%</td>
-                    {isFinanceAdmin && (
+                {pot.memberIds.map((id) => {
+                  const partialPaid = partialThisPeriod.get(id);
+                  return (
+                    <tr key={id} className="border-b border-forest-50 last:border-0">
+                      <td className="px-4 py-3 font-medium">{memberName(members, id)}</td>
                       <td className="px-4 py-3">
-                        <div className="flex flex-col gap-2 items-start">
-                          {!paidThisPeriod.has(id) && (
-                            <>
-                              <button onClick={() => recordPaid(id)} disabled={!!busyKey} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-2">
-                                {busyKey === `pay-${id}` && <Spinner />} Record cash
-                              </button>
-                              <AdminChargeButton
-                                chamaId={cid}
-                                memberId={id}
-                                memberPhone={memberPhone(members, id)}
-                                amount={pot.amount}
-                                purpose="mgr_contribution"
-                                potId={pid}
-                                potPeriod={pot.period}
-                              />
-                            </>
-                          )}
-                          <div className="flex gap-2">
-                            <button onClick={() => removeMember(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
-                              Remove
-                            </button>
-                            <button onClick={() => openExitConfirm(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
-                              Exit
-                            </button>
-                          </div>
-                        </div>
+                        {paidThisPeriod.has(id) ? (
+                          <span className="chip bg-forest-50 text-forest-700">Paid</span>
+                        ) : partialPaid != null ? (
+                          <span className="chip bg-gold-50 text-gold-700">Partial — {kes(partialPaid)} of {kes(pot.amount)}</span>
+                        ) : (
+                          <span className="chip bg-forest-50 text-forest-900/50">Not yet</span>
+                        )}
                       </td>
-                    )}
-                  </tr>
-                ))}
+                      <td className="px-4 py-3">{recentReliability(records, id)}%</td>
+                      {isFinanceAdmin && (
+                        <td className="px-4 py-3">
+                          <div className="flex flex-col gap-2 items-start">
+                            {!paidThisPeriod.has(id) && (
+                              <>
+                                {partialPayId === id ? (
+                                  <SettleArrearForm
+                                    amount={Math.round((pot.amount - (partialPaid ?? 0)) * 100) / 100}
+                                    busy={busyKey === `pay-${id}`}
+                                    onCancel={() => setPartialPayId(null)}
+                                    onSubmit={(amt) => recordPaid(id, amt)}
+                                  />
+                                ) : (
+                                  <div className="flex items-center gap-2">
+                                    <button onClick={() => recordPaid(id)} disabled={!!busyKey} className="btn-primary text-xs font-semibold px-3 py-1.5 rounded-full flex items-center gap-2">
+                                      {busyKey === `pay-${id}` && <Spinner />} Record cash
+                                    </button>
+                                    <button onClick={() => setPartialPayId(id)} disabled={!!busyKey} className="text-xs font-semibold text-forest-700">
+                                      Partial…
+                                    </button>
+                                  </div>
+                                )}
+                                <AdminChargeButton
+                                  chamaId={cid}
+                                  memberId={id}
+                                  memberPhone={memberPhone(members, id)}
+                                  amount={pot.amount}
+                                  purpose="mgr_contribution"
+                                  potId={pid}
+                                  potPeriod={pot.period}
+                                />
+                              </>
+                            )}
+                            <div className="flex gap-2">
+                              <button onClick={() => removeMember(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
+                                Remove
+                              </button>
+                              <button onClick={() => openExitConfirm(id)} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500">
+                                Exit
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -479,18 +503,21 @@ export default function MgrPotDetail() {
               ))}
             </ol>
             {isFinanceAdmin && (
-              <div className="flex gap-2 mt-3">
-                <button onClick={() => setQueueDraft(previewSmartOrder(records, pot.queue))} className="text-xs font-semibold text-forest-700">
-                  Suggest smart order
-                </button>
-                {queueDraft && (
-                  <>
-                    <button onClick={saveQueue} disabled={busyKey === 'reorder'} className="btn-primary text-xs font-semibold px-3 py-1 rounded-full flex items-center gap-2">
-                      {busyKey === 'reorder' && <Spinner />} Save order
-                    </button>
-                    <button onClick={() => setQueueDraft(null)} className="text-xs text-forest-900/50">Cancel</button>
-                  </>
-                )}
+              <div className="flex flex-col gap-1.5 mt-3">
+                <div className="flex gap-2">
+                  <button onClick={() => setQueueDraft(previewSmartOrder(records, pot.queue))} className="text-xs font-semibold text-forest-700">
+                    Suggest smart order
+                  </button>
+                  {queueDraft && (
+                    <>
+                      <button onClick={saveQueue} disabled={busyKey === 'reorder'} className="btn-primary text-xs font-semibold px-3 py-1 rounded-full flex items-center gap-2">
+                        {busyKey === 'reorder' && <Spinner />} Save order
+                      </button>
+                      <button onClick={() => setQueueDraft(null)} className="text-xs text-forest-900/50">Cancel</button>
+                    </>
+                  )}
+                </div>
+                <p className="text-xs text-forest-900/40">Puts members who've paid on time nearer the front, and gives a rough patch less weight the longer someone's since paid consistently.</p>
               </div>
             )}
           </div>
@@ -500,16 +527,18 @@ export default function MgrPotDetail() {
               <button onClick={close} disabled={!!busyKey} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full flex items-center gap-2">
                 {busyKey === 'close' && <Spinner />} {busyKey === 'close' ? 'Closing…' : 'Close this period'}
               </button>
-              <button
-                onClick={() => {
-                  if (!confirm('Re-draw the remaining queue? This reshuffles who\'s left — anyone already paid out stays out.')) return;
-                  draw('smart');
-                }}
-                disabled={!!busyKey}
-                className="text-xs font-semibold text-forest-700 flex items-center gap-1"
-              >
-                {busyKey === 'draw' && <Spinner className="spinner-dark" />} Re-draw remaining queue
-              </button>
+              {!paidOutThisCycle && (
+                <button
+                  onClick={() => {
+                    if (!confirm('Re-draw the remaining queue? This reshuffles who\'s left — anyone already paid out stays out.')) return;
+                    draw('smart');
+                  }}
+                  disabled={!!busyKey}
+                  className="text-xs font-semibold text-forest-700 flex items-center gap-1"
+                >
+                  {busyKey === 'draw' && <Spinner className="spinner-dark" />} Re-draw remaining queue
+                </button>
+              )}
             </div>
           )}
         </>
@@ -587,12 +616,24 @@ export default function MgrPotDetail() {
         </div>
       )}
 
-      {isFinanceAdmin && (records.length > 0 || payouts.length > 0) && (
+      {isFinanceAdmin && (records.length > 0 || payouts.length > 0 || arrears.length > 0) && (
         <div className="card p-4">
           <h3 className="font-display font-semibold text-sm">Books</h3>
           {(() => {
-            const collected = records.filter((r) => r.status === 'paid').reduce((s, r) => s + r.amount, 0);
+            const collectedFromRecords = records.filter((r) => r.status === 'paid' || r.status === 'partial').reduce((s, r) => s + r.amount, 0);
+            // Money a member pays back on an arrear (or partially pays
+            // toward one) is real cash that came in, even though it never
+            // creates/updates a record — without this, the balance below
+            // would show that money as permanently missing (see
+            // TOUCH_BASE.md "MGR books/health/redraw fixes").
+            const collectedFromArrears = arrears.reduce((s, a) => s + (a.settledAmount || 0), 0);
+            const collected = collectedFromRecords + collectedFromArrears;
             const paidOut = payouts.reduce((s, p) => s + p.amount, 0);
+            // What's been forgiven outright — shown separately so it reads
+            // as an accounted-for write-off rather than a debt that just
+            // disappeared. This portion of the balance gap below it is
+            // permanent and expected, not a bug.
+            const writtenOff = arrears.filter((a) => a.status === 'written_off').reduce((s, a) => s + a.amount, 0);
             return (
               <dl className="text-sm grid grid-cols-3 gap-y-1 mt-2">
                 <dt className="text-forest-900/50">Collected</dt>
@@ -601,6 +642,12 @@ export default function MgrPotDetail() {
                 <dd className="num col-span-2">{kes(paidOut)}</dd>
                 <dt className="text-forest-900/50">Balance</dt>
                 <dd className="num col-span-2 font-semibold">{kes(collected - paidOut)}</dd>
+                {writtenOff > 0 && (
+                  <>
+                    <dt className="text-forest-900/50">Written off</dt>
+                    <dd className="num col-span-2 text-brick-500">{kes(writtenOff)}</dd>
+                  </>
+                )}
                 <dt className="text-forest-900/50">Entries</dt>
                 <dd className="num col-span-2">{records.length} contributions · {payouts.length} payouts</dd>
               </dl>
@@ -626,9 +673,17 @@ export default function MgrPotDetail() {
       )}
 
       {isFinanceAdmin && pot.status !== 'closed' && (
-        <button onClick={closeForever} disabled={!!busyKey} className="text-xs text-forest-900/40 hover:text-brick-500 flex items-center gap-2">
-          {busyKey === 'closeForever' && <Spinner className="spinner-dark" />} Close this pot forever
-        </button>
+        <div className="card p-4 border-brick-200">
+          <h3 className="font-display font-semibold text-sm text-brick-600">Danger zone</h3>
+          <p className="text-xs text-forest-900/60 mt-1">Retires this pot for good — it can't be reopened afterwards.</p>
+          <button
+            onClick={closeForever}
+            disabled={!!busyKey}
+            className="mt-3 text-xs font-semibold text-white bg-brick-500 hover:bg-brick-600 disabled:opacity-50 rounded-full px-4 py-2 flex items-center gap-2"
+          >
+            {busyKey === 'closeForever' && <Spinner />} Close this pot forever
+          </button>
+        </div>
       )}
 
       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}

@@ -16,13 +16,23 @@ import re
 import requests
 
 SMS_API_URL = "https://smsportal.hostpinnacle.co.ke/SMSApi/send"
-MAX_SMS_LENGTH = 400
+# Matches shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385 segment
+# cap) — sendSmsCampaign/run_sms_schedules already reject anything over
+# this before it gets here, so this trim is a last-resort safety net,
+# not the primary enforcement point.
+MAX_SMS_LENGTH = 385
 
 _NON_GSM = re.compile(r"[^\x00-\x7F\u00A0-\u00FF]")
 
 
 def clean_sms_text(text: str) -> str:
-    """Strips non-GSM characters and trims to the HostPinnacle length cap — mirrors the PAY repo's equivalent helper."""
+    """
+    Strips non-GSM characters and trims to the HostPinnacle length cap —
+    mirrors the PAY repo's equivalent helper. Defense-in-depth only:
+    shared.sms_validation.validate_sms_content() is what actually blocks
+    emoji/non-GSM content and over-length messages before send, so this
+    should normally be a no-op.
+    """
     cleaned = _NON_GSM.sub("", text or "")
     return cleaned[:MAX_SMS_LENGTH]
 

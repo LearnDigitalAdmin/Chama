@@ -6,11 +6,30 @@ import { useChama } from '../../app/ChamaProvider';
 import { useMembers } from '../../app/useMembers';
 import { sendSmsCampaign, purchaseSmsCredits } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
-import { AUDIENCE_LABEL, PLANS, SMS_SEGMENT_LEN } from '../../lib/constants';
+import { AUDIENCE_LABEL, PLANS } from '../../lib/constants';
+import { countSmsSegments, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
 import { kes } from '../../lib/money';
-import type { SmsLogEntry, SmsSchedule } from '../../lib/types';
+import type { Chama, ChamaMember, SmsLogEntry, SmsSchedule } from '../../lib/types';
 
 type Audience = 'all' | 'overdue' | 'custom' | 'loan_holders' | 'admins';
+
+/** Mirrors functions/mychama/sms.py's _recipients() filtering for the live
+ *  cost preview below — used by both the compose form and the schedule
+ *  form, since a scheduled message needs the same precheck as an
+ *  immediate send. */
+function estimateRecipients(
+  audience: Audience,
+  customIds: string[],
+  activeMembers: ChamaMember[],
+  overdueMemberIds: Set<string>,
+  loanHolderMemberIds: Set<string>
+): number {
+  if (audience === 'all') return activeMembers.length;
+  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin).length;
+  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id)).length;
+  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id)).length;
+  return customIds.length;
+}
 
 export default function Communication() {
   const { chama, chamaId, chamaReady, isOfficial } = useChama();
@@ -61,15 +80,18 @@ export default function Communication() {
 
   const recipientEstimate = useMemo(() => {
     const active = members.filter((m) => m.status === 'active');
-    if (audience === 'all') return active.length;
-    if (audience === 'admins') return active.filter((m) => m.isAdmin).length;
-    if (audience === 'overdue') return active.filter((m) => overdueMemberIds.has(m.id)).length;
-    if (audience === 'loan_holders') return active.filter((m) => loanHolderMemberIds.has(m.id)).length;
-    return customIds.length;
+    return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
 
-  const segments = Math.max(1, Math.ceil(message.length / SMS_SEGMENT_LEN));
-  const costEstimate = chama ? segments * recipientEstimate * PLANS[chama.plan].smsRate : 0;
+  const trimmedMessage = message.trim();
+  const segments = countSmsSegments(trimmedMessage); // null once over the 385-char cap
+  const overLength = segments === null;
+  const contentError = trimmedMessage ? validateSmsContent(trimmedMessage) : null;
+  const creditsNeeded = segments ? segments * recipientEstimate : 0;
+  const kesEquivalent = chama ? creditsNeeded * PLANS[chama.plan].smsRate : 0;
+  const availableCredits = chama?.smsCredits ?? 0;
+  const insufficientCredits = creditsNeeded > availableCredits;
+  const canSend = !busy && !!trimmedMessage && !overLength && !contentError && !insufficientCredits;
 
   if (!chamaReady || !chama) return <p className="text-forest-900/60">Loading…</p>;
 
@@ -81,8 +103,20 @@ export default function Communication() {
     if (!chamaId) return;
     setError(null);
     setResult(null);
-    if (!message.trim()) {
+    if (!trimmedMessage) {
       setError('Write a message first.');
+      return;
+    }
+    if (overLength) {
+      setError(`Message is too long — SMS campaigns are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
+      return;
+    }
+    if (contentError) {
+      setError(contentError);
+      return;
+    }
+    if (insufficientCredits) {
+      setError(`Not enough SMS credits — this campaign needs ${creditsNeeded}, you have ${availableCredits}. Top up to continue.`);
       return;
     }
     setBusy(true);
@@ -91,7 +125,7 @@ export default function Communication() {
         chamaId,
         audience,
         memberIds: audience === 'custom' ? customIds : undefined,
-        message: message.trim(),
+        message: trimmedMessage,
       });
       setResult(res);
       setMessage('');
@@ -163,20 +197,34 @@ export default function Communication() {
             )}
             <label className="flex flex-col gap-1 text-sm font-medium">
               Message
-              <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+              <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
             </label>
             <p className="text-xs text-forest-900/50">
-              {message.length}/400 characters · {segments} segment{segments === 1 ? '' : 's'} × {recipientEstimate} recipient
-              {recipientEstimate === 1 ? '' : 's'} ≈ {kes(costEstimate)}
+              {message.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
+              {recipientEstimate === 1 ? '' : 's'} = {creditsNeeded} credit{creditsNeeded === 1 ? '' : 's'} (≈ {kes(kesEquivalent)})
             </p>
-            <button onClick={send} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
+            {overLength && (
+              <p className="text-sm text-brick-500 font-medium">
+                Too long — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments).
+              </p>
+            )}
+            {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
+            {!overLength && !contentError && insufficientCredits && trimmedMessage && (
+              <p className="text-sm text-brick-500 font-medium">
+                Not enough SMS credits — needs {creditsNeeded}, you have {availableCredits}.{' '}
+                <button onClick={() => setShowTopUp(true)} className="underline font-semibold">
+                  Top up now
+                </button>
+              </p>
+            )}
+            <button onClick={send} disabled={!canSend} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
               {busy ? 'Sending…' : 'Send SMS'}
             </button>
             {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
             {queuedMsg && <p className="text-sm text-gold-700 font-medium">{queuedMsg}</p>}
             {result && (
               <p className="text-sm text-forest-700 font-medium">
-                Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credits used.
+                Sent to {result.sent} member{result.sent === 1 ? '' : 's'} — {result.creditsUsed} credit{result.creditsUsed === 1 ? '' : 's'} used.
               </p>
             )}
           </div>
@@ -205,7 +253,16 @@ export default function Communication() {
         </>
       )}
 
-      {tab === 'scheduled' && chamaId && isOfficial && <ScheduledTab chamaId={chamaId} members={members} />}
+      {tab === 'scheduled' && chamaId && isOfficial && (
+        <ScheduledTab
+          chamaId={chamaId}
+          chama={chama}
+          members={members}
+          overdueMemberIds={overdueMemberIds}
+          loanHolderMemberIds={loanHolderMemberIds}
+          onRequestTopUp={() => setShowTopUp(true)}
+        />
+      )}
     </div>
   );
 }
@@ -222,7 +279,21 @@ const FREQUENCY_LABEL: Record<string, string> = { daily: 'Daily', weekly: 'Weekl
  * pattern src/features/mgr/MgrPotDetail.tsx's per-pot reminder toggle
  * already uses — so this is a screen, not a new backend.
  */
-function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: string; name: string }[] }) {
+function ScheduledTab({
+  chamaId,
+  chama,
+  members,
+  overdueMemberIds,
+  loanHolderMemberIds,
+  onRequestTopUp,
+}: {
+  chamaId: string;
+  chama: Chama;
+  members: ChamaMember[];
+  overdueMemberIds: Set<string>;
+  loanHolderMemberIds: Set<string>;
+  onRequestTopUp: () => void;
+}) {
   const [schedules, setSchedules] = useState<SmsSchedule[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -261,7 +332,11 @@ function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: st
       {showForm && (
         <ScheduleForm
           chamaId={chamaId}
+          chama={chama}
           members={members}
+          overdueMemberIds={overdueMemberIds}
+          loanHolderMemberIds={loanHolderMemberIds}
+          onRequestTopUp={onRequestTopUp}
           onDone={() => setShowForm(false)}
           onError={setError}
         />
@@ -301,12 +376,20 @@ function ScheduledTab({ chamaId, members }: { chamaId: string; members: { id: st
 
 function ScheduleForm({
   chamaId,
+  chama,
   members,
+  overdueMemberIds,
+  loanHolderMemberIds,
+  onRequestTopUp,
   onDone,
   onError,
 }: {
   chamaId: string;
-  members: { id: string; name: string }[];
+  chama: Chama;
+  members: ChamaMember[];
+  overdueMemberIds: Set<string>;
+  loanHolderMemberIds: Set<string>;
+  onRequestTopUp: () => void;
   onDone: () => void;
   onError: (msg: string | null) => void;
 }) {
@@ -320,17 +403,47 @@ function ScheduleForm({
     setCustomIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }
 
+  const recipientEstimate = useMemo(() => {
+    const active = members.filter((m) => m.status === 'active');
+    return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
+  }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
+
+  const trimmedBody = body.trim();
+  const segments = countSmsSegments(trimmedBody);
+  const overLength = segments === null;
+  const contentError = trimmedBody ? validateSmsContent(trimmedBody) : null;
+  // Each occurrence of a recurring schedule costs this many credits — the
+  // same precheck as a one-off send, run against the audience's current
+  // size (a later run may differ if membership changes, but this is the
+  // best estimate available at creation time).
+  const creditsNeededPerRun = segments ? segments * recipientEstimate : 0;
+  const availableCredits = chama.smsCredits ?? 0;
+  const insufficientCredits = creditsNeededPerRun > availableCredits;
+  const canSubmit = !busy && !!trimmedBody && !overLength && !contentError && !insufficientCredits;
+
   async function submit() {
     onError(null);
-    if (!body.trim()) {
+    if (!trimmedBody) {
       onError('Write a message first.');
+      return;
+    }
+    if (overLength) {
+      onError(`Message is too long — SMS schedules are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
+      return;
+    }
+    if (contentError) {
+      onError(contentError);
+      return;
+    }
+    if (insufficientCredits) {
+      onError(`Not enough SMS credits — each run of this schedule needs ${creditsNeededPerRun}, you have ${availableCredits}. Top up to continue.`);
       return;
     }
     setBusy(true);
     try {
       await setDoc(doc(collection(db, paths.smsSchedules(chamaId))), {
         status: 'active',
-        body: body.trim(),
+        body: trimmedBody,
         audience,
         memberIds: audience === 'custom' ? customIds : null,
         frequency,
@@ -350,7 +463,7 @@ function ScheduleForm({
       <h3 className="font-display font-semibold">New schedule</h3>
       <label className="flex flex-col gap-1 text-sm font-medium">
         Message
-        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} maxLength={400} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+        <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={3} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
       </label>
       <label className="flex flex-col gap-1 text-sm font-medium">
         Audience
@@ -380,9 +493,27 @@ function ScheduleForm({
           <option value="monthly">Monthly</option>
         </select>
       </label>
+      <p className="text-xs text-forest-900/50">
+        {body.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
+        {recipientEstimate === 1 ? '' : 's'} = {creditsNeededPerRun} credit{creditsNeededPerRun === 1 ? '' : 's'} per run
+      </p>
       <p className="text-xs text-forest-900/50">Starts within about 15 minutes, then repeats on this cadence until paused or deleted.</p>
+      {overLength && (
+        <p className="text-sm text-brick-500 font-medium">
+          Too long — SMS schedules are capped at {MAX_SMS_LENGTH} characters (3 segments).
+        </p>
+      )}
+      {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
+      {!overLength && !contentError && insufficientCredits && trimmedBody && (
+        <p className="text-sm text-brick-500 font-medium">
+          Not enough SMS credits for even one run — needs {creditsNeededPerRun}, you have {availableCredits}.{' '}
+          <button onClick={onRequestTopUp} className="underline font-semibold">
+            Top up now
+          </button>
+        </p>
+      )}
       <div className="flex gap-2">
-        <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+        <button onClick={submit} disabled={!canSubmit} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
           {busy ? 'Saving…' : 'Create schedule'}
         </button>
         <button onClick={onDone} disabled={busy} className="border border-forest-200 text-sm font-semibold px-4 py-2 rounded-full">

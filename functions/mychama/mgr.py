@@ -80,6 +80,31 @@ audit): three gaps found beyond what that audit already listed —
      arrears — an unsettled exit had no persistent card to come back to.
      Replaced with mgrExitMember (immediate removal) + two independently
      payable balances, matching how arrears already work.
+
+MGR audit re-check 2 (post-testing bug pass, see TOUCH_BASE.md "MGR
+books/health/redraw fixes"): four more gaps found by actually running a
+pot end to end:
+  4. recordCashMgrPayment always marked a record 'paid' regardless of how
+     much cash was actually handed over, so there was no way to record or
+     later top up a partial contribution — the shortfall just vanished
+     with no arrear ever opened for it. Fixed with a new 'partial' record
+     status; closeMgrPeriod now opens/tops up an arrear for a partial
+     payer's remaining gap exactly as it already did for a full miss, and
+     mgr_engine.pool_for_round counts a partial payment's actual cash
+     toward the round.
+  5. mgrRepairPot (and the health_check it acts on) treated EVERY pot
+     member absent from the queue as "missing" — including members who
+     are absent for the correct reason: they already received this
+     cycle's payout (recordMgrPayoutCash deliberately removes them).
+     Clicking "Repair queue" re-added them, so they could draw and get
+     paid again. Both now check the payouts subcollection (payouts are
+     tagged with the cycleNumber they were paid in) and only ever
+     re-add a member who hasn't been paid out THIS cycle.
+  6. runMgrDraw could re-shuffle the queue at any time the pot was
+     'active', including after real money had already gone out on the
+     strength of the old order. Now refuses once any payout has been
+     recorded for the pot's current cycle — manual reordering
+     (mgrReorderQueue) is unaffected, only the random/smart re-draw.
 """
 
 from __future__ import annotations
@@ -234,6 +259,21 @@ def runMgrDraw(req: https_fn.CallableRequest) -> dict:
 
     pot_ref, pot = _get_pot(db, chama_id, pot_id)
 
+    # Once any payout has actually run this cycle, the queue can never be
+    # re-drawn — a re-shuffle after real money has already gone out on the
+    # strength of the old order would be confusing at best (see
+    # TOUCH_BASE.md). Reordering the remaining queue by hand is still fine
+    # (mgrReorderQueue); only the random/smart re-draw is blocked here.
+    # Gated by THIS cycle's payouts so mgrStartNewCycle's fresh draw is
+    # unaffected by a prior cycle's history.
+    if pot["status"] == "active":
+        current_cycle = pot.get("cycleNumber", 1)
+        already_paid_this_cycle = any(
+            p.get("cycleNumber", 1) == current_cycle for p in _all_payouts(db, chama_id, pot_id)
+        )
+        if already_paid_this_cycle:
+            raise precondition("This pot has already paid out this cycle — the queue can no longer be re-drawn.")
+
     pool = pot["memberIds"] if pot["status"] == "draft" else pot["queue"]
     records = _all_records(db, chama_id, pot_id)
     queue = mgr_engine.run_draw(records, pool, method)
@@ -273,12 +313,21 @@ def recordCashMgrPayment(req: https_fn.CallableRequest) -> dict:
     if pot["status"] != "active":
         raise precondition("This pot isn't in an active collection period.")
 
-    use_amount = float(amount) if isinstance(amount, (int, float)) and amount > 0 else pot["amount"]
+    if isinstance(amount, (int, float)) and amount > 0:
+        pay_amount = float(amount)
+    else:
+        pay_amount = pot["amount"]
     ts = now_ms()
     today = today_iso()
 
-    # One record per (member, period) — update if it already exists (e.g.
-    # correcting a 'missed' mark), else create.
+    # One record per (member, period) — top up if it already exists (e.g.
+    # a second cash drop finishing off an earlier partial payment), else
+    # create. new_total is what the member has now paid toward this
+    # period in total; capping it at pot["amount"] means an accidental
+    # overpayment is simply treated as paying the period in full rather
+    # than silently inflating this period's own collected total (an
+    # intentional over-payment toward an arrear belongs in
+    # mgrSettleArrear instead).
     existing_q = (
         db.collection(paths.mgr_records(chama_id, pot_id))
         .where("memberId", "==", member_id)
@@ -287,15 +336,18 @@ def recordCashMgrPayment(req: https_fn.CallableRequest) -> dict:
         .stream()
     )
     existing = list(existing_q)
+    already_paid = existing[0].to_dict().get("amount", 0) if existing and existing[0].to_dict().get("status") == "partial" else 0
+    new_total = min(round((already_paid + pay_amount) * 100) / 100, pot["amount"])
+    new_status = "paid" if new_total >= pot["amount"] - 0.01 else "partial"
 
     if existing:
-        existing[0].reference.update({"status": "paid", "amount": use_amount, "date": today, "method": "manual", "updatedAt": ts})
+        existing[0].reference.update({"status": new_status, "amount": new_total, "date": today, "method": "manual", "updatedAt": ts})
     else:
         db.collection(paths.mgr_records(chama_id, pot_id)).document().set({
             "period": pot["period"],
             "memberId": member_id,
-            "status": "paid",
-            "amount": use_amount,
+            "status": new_status,
+            "amount": new_total,
             "date": today,
             "method": "manual",
             "createdAt": ts,
@@ -305,20 +357,20 @@ def recordCashMgrPayment(req: https_fn.CallableRequest) -> dict:
     db.collection(paths.transactions(chama_id)).document().set({
         "type": "mgr_contribution",
         "memberId": member_id,
-        "amount": use_amount,
+        "amount": pay_amount,
         "method": "manual",
         "ref": "CASH" + str(ts)[-8:],
         "date": today,
         "settled": False,
         "direction": "in",
         "channel": "app",
-        "note": pot["name"],
+        "note": pot["name"] + (" (partial)" if new_status == "partial" else ""),
         "potId": pot_id,
         "createdAt": ts,
     })
-    _log(db, chama_id, pot_id, "contribution", member_id=member_id, amount=use_amount, note="cash")
+    _log(db, chama_id, pot_id, "contribution", member_id=member_id, amount=pay_amount, note="cash" + (" (partial)" if new_status == "partial" else ""))
 
-    result = {"ok": True}
+    result = {"ok": True, "status": new_status, "totalPaidThisPeriod": new_total, "remaining": round((pot["amount"] - new_total) * 100) / 100}
     record_result(db, chama_id, data.get("clientRequestId"), result)
     return result
 
@@ -346,15 +398,26 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
     ts = now_ms()
     today = today_iso()
 
-    # Anyone with no record for this period is marked missed, and gets (or
-    # tops up) an open arrears balance — this is what turns a bare "missed"
-    # flag into a chaseable running total instead of a fact that's only
-    # ever visible one period at a time.
-    have_records = {
-        d.to_dict()["memberId"]
+    # Anyone with no record for this period is marked missed. Anyone with a
+    # 'partial' record paid something but not the full amount. Either way
+    # there's a gap for this period — it gets (or tops up) an open arrears
+    # balance for exactly that gap, so a bare "missed"/"partial" flag turns
+    # into a chaseable running total instead of a fact that's only ever
+    # visible one period at a time.
+    period_records = {
+        d.to_dict()["memberId"]: d.to_dict()
         for d in db.collection(paths.mgr_records(chama_id, pot_id)).where("period", "==", pot["period"]).stream()
     }
-    missed_ids = [m for m in pot["memberIds"] if m not in have_records]
+    missed_ids = [m for m in pot["memberIds"] if m not in period_records]
+    # memberId -> shortfall for this period (full pot amount for a total
+    # miss, the un-paid remainder for a partial payment).
+    gaps: dict[str, float] = {m: pot["amount"] for m in missed_ids}
+    for member_id, rec in period_records.items():
+        if rec.get("status") == "partial":
+            gap = round((pot["amount"] - rec.get("amount", 0)) * 100) / 100
+            if gap > 0.01:
+                gaps[member_id] = gap
+
     batch = db.batch()
     for member_id in missed_ids:
         rec_ref = db.collection(paths.mgr_records(chama_id, pot_id)).document()
@@ -368,11 +431,12 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
             "createdAt": ts,
             "updatedAt": ts,
         })
+    for member_id, gap in gaps.items():
         existing_arrear = _open_arrear_for(db, chama_id, pot_id, member_id)
         if existing_arrear:
             a = existing_arrear.to_dict()
             batch.update(existing_arrear.reference, {
-                "amount": round((a["amount"] + pot["amount"]) * 100) / 100,
+                "amount": round((a["amount"] + gap) * 100) / 100,
                 "periods": a.get("periods", []) + [pot["period"]],
                 "updatedAt": ts,
             })
@@ -381,14 +445,14 @@ def closeMgrPeriod(req: https_fn.CallableRequest) -> dict:
             batch.set(arrear_ref, {
                 "memberId": member_id,
                 "periods": [pot["period"]],
-                "amount": pot["amount"],
+                "amount": gap,
                 "status": "open",
                 "createdAt": ts,
                 "updatedAt": ts,
             })
     batch.commit()
-    for member_id in missed_ids:
-        _log(db, chama_id, pot_id, "arrear_opened", member_id=member_id, amount=pot["amount"], note=f"period {pot['period']}")
+    for member_id, gap in gaps.items():
+        _log(db, chama_id, pot_id, "arrear_opened", member_id=member_id, amount=gap, note=f"period {pot['period']}")
 
     records = _all_records(db, chama_id, pot_id)
     queue = pot["queue"]
@@ -479,6 +543,7 @@ def recordMgrPayoutCash(req: https_fn.CallableRequest) -> dict:
         batch.set(payout_ref, {
             "memberId": member_id,
             "round": round_no,
+            "cycleNumber": pot.get("cycleNumber", 1),
             "amount": share,
             "date": today,
             "method": "manual",
@@ -906,7 +971,12 @@ def mgrExitMember(req: https_fn.CallableRequest) -> dict:
 
     records = _all_records(db, chama_id, pot_id)
     payouts = _all_payouts(db, chama_id, pot_id)
-    contributed = round(sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] == "paid") * 100) / 100
+    # Includes 'partial' amounts — a partial cash payment is still real
+    # money the member put in and is owed back on exit, same as a full
+    # 'paid' period.
+    contributed = round(
+        sum(r["amount"] for r in records if r["memberId"] == member_id and r["status"] in ("paid", "partial")) * 100
+    ) / 100
     received = round(sum(p["amount"] for p in payouts if p["memberId"] == member_id) * 100) / 100
     cut_amount = round(contributed * (cut_percent / 100) * 100) / 100
     refund_due = max(0.0, round((contributed - cut_amount) * 100) / 100)
@@ -1073,6 +1143,14 @@ def mgrRepairPot(req: https_fn.CallableRequest) -> dict:
     pot_ref, pot = _get_pot(db, chama_id, pot_id)
 
     member_set = set(pot["memberIds"])
+    # A member absent from the queue because they've already been paid out
+    # THIS cycle is not a repair target — re-adding them would let them
+    # draw and get paid again. Only genuinely unplaced members (never
+    # reached the front of the queue this cycle) get appended back.
+    current_cycle = pot.get("cycleNumber", 1)
+    paid_out_this_cycle = {
+        p["memberId"] for p in _all_payouts(db, chama_id, pot_id) if p.get("cycleNumber", 1) == current_cycle
+    }
     seen: set[str] = set()
     fixed_queue = []
     for m in pot["queue"]:
@@ -1081,7 +1159,7 @@ def mgrRepairPot(req: https_fn.CallableRequest) -> dict:
             seen.add(m)
     if pot["status"] == "active":
         for m in pot["memberIds"]:
-            if m not in seen:
+            if m not in seen and m not in paid_out_this_cycle:
                 fixed_queue.append(m)
                 seen.add(m)
 

@@ -83,6 +83,12 @@ MGR_PAYOUT_MARKUP_RATE = {
 
 PLAN_ORDER = ["free", "starter", "basic", "growth", "max"]
 
+# NOTE: smsRate below is the KES price paid PER CREDIT when topping up
+# (cheaper tiers get a bulk discount), converted by the PAY repo's webhook
+# when it credits chamas.smsCredits on a successful top-up. It is NOT the
+# number of credits an SMS costs to send — sending always costs exactly 1
+# credit per segment (see functions/shared/sms_validation.py), regardless
+# of plan. Don't multiply smsRate into a send-time cost again.
 PLANS = {
     "free":    {"name": "Free",    "price": 0,    "memberLimit": 6,   "smsRate": 0.9, "minutesQuota": 0,    "exportsAllowed": False, "onlineCollection": False},
     "starter": {"name": "Starter", "price": 499,  "memberLimit": 15,  "smsRate": 0.9, "minutesQuota": 1,    "exportsAllowed": True,  "onlineCollection": True},

@@ -255,7 +255,11 @@ class MgrRecord(TypedDict):
     id: NotRequired[str]
     period: int
     memberId: str
-    status: Literal["paid", "missed", "pending"]
+    # 'partial' — a cash payment less than the pot's full per-period amount
+    # was recorded; the shortfall is tracked as an arrear exactly like a
+    # full miss (see closeMgrPeriod). Only 'paid' counts as fully honored
+    # for late_score/reliability purposes.
+    status: Literal["paid", "partial", "missed", "pending"]
     amount: float
     date: Optional[str]
     method: PayMethod
@@ -268,6 +272,13 @@ class MgrPayout(TypedDict):
     id: NotRequired[str]
     memberId: str
     round: int
+    # The pot's cycleNumber at the moment this payout was made. Lets a
+    # later health check / repair tell "already paid out THIS cycle"
+    # (correctly absent from the queue) apart from "paid out in a PRIOR
+    # cycle, now back in the queue after mgrStartNewCycle" (genuinely
+    # missing). Absent on payouts written before this field existed —
+    # treat those as cycle 1.
+    cycleNumber: NotRequired[int]
     amount: float
     date: str
     method: PayMethod
