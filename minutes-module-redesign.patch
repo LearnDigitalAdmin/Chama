@@ -1,0 +1,1323 @@
+diff --git a/functions/main.py b/functions/main.py
+index d7b4778..6315e08 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -77,6 +77,7 @@ from mychama.sms import (  # noqa: E402,F401
+ from mychama.billing import (  # noqa: E402,F401
+     upgradePlan,
+     generateStatement,
++    recordMinutesExport,
+     sweep_plan_expiry,
+     reset_monthly_export_quota,
+ )
+diff --git a/functions/mychama/billing.py b/functions/mychama/billing.py
+index c637165..1c2c503 100644
+--- a/functions/mychama/billing.py
++++ b/functions/mychama/billing.py
+@@ -1,7 +1,7 @@
+ """
+ Billing, reports & exports — Phase 4.
+ 
+-Three callables plus two scheduled sweeps:
++Four callables plus two scheduled sweeps:
+ 
+   upgradePlan        — chair-only. Changing to a plan with price > 0 follows
+                         the EXACT same pending-payment pattern as
+@@ -27,6 +27,13 @@ Three callables plus two scheduled sweeps:
+                         Enforces PLANS[plan].exportsAllowed and
+                         minutesQuota/minutesExportsUsedThisMonth.
+ 
++  recordMinutesExport — any active member. Logs a minutes PDF export against
++                        the SAME shared quota as generateStatement. Renders
++                        nothing — the minutes PDF is now built entirely
++                        client-side (src/lib/minutesPdf.ts) so it works
++                        offline; this just keeps the server-owned usage
++                        counter honest, queued automatically if offline.
++
+   sweep_plan_expiry          — daily. Downgrades lapsed paid plans to Free
+                                 and sends a renewal reminder a few days out.
+   reset_monthly_export_quota — runs on the 1st of the month. Zeroes
+@@ -305,43 +312,6 @@ def _render_pdf(chama_name: str, rows: list[dict], names: dict, scope_label: str
+     return buf.getvalue()
+ 
+ 
+-def _render_minutes_pdf(chama_name: str, minute: dict) -> bytes:
+-    from reportlab.lib.pagesizes import A4
+-    from reportlab.lib.styles import getSampleStyleSheet
+-    from reportlab.lib.units import mm
+-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+-
+-    styles = getSampleStyleSheet()
+-    buf = io.BytesIO()
+-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+-    story = [
+-        Paragraph(chama_name, styles["Title"]),
+-        Paragraph(minute.get("title", "Meeting minutes"), styles["Heading2"]),
+-        Paragraph(f"{minute.get('date', '')}" + (f" &middot; {minute.get('venue')}" if minute.get("venue") else ""), styles["Normal"]),
+-        Spacer(1, 6 * mm),
+-    ]
+-
+-    def section(title: str, items: list[str]):
+-        if not items:
+-            return
+-        story.append(Paragraph(title, styles["Heading3"]))
+-        story.append(ListFlowable([ListItem(Paragraph(i, styles["Normal"])) for i in items], bulletType="bullet"))
+-        story.append(Spacer(1, 4 * mm))
+-
+-    section("Attendees", minute.get("attendees") or [])
+-    section("Agenda", minute.get("agenda") or [])
+-    section("Resolutions", minute.get("resolutions") or [])
+-    if minute.get("aob"):
+-        story.append(Paragraph("Any other business", styles["Heading3"]))
+-        story.append(Paragraph(minute["aob"], styles["Normal"]))
+-        story.append(Spacer(1, 4 * mm))
+-    if minute.get("nextMeeting"):
+-        story.append(Paragraph(f"Next meeting: {minute['nextMeeting']}", styles["Normal"]))
+-
+-    doc.build(story)
+-    return buf.getvalue()
+-
+-
+ STORAGE_BUCKET = "mychama1.firebasestorage.app"  # must match src/lib/firebase.ts storageBucket
+ 
+ 
+@@ -365,12 +335,11 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     date_from = data.get("from")
+     date_to = data.get("to")
+     fmt = data.get("format")
+-    minutes_id = data.get("minutesId")  # minimal, documented addition — see TOUCH_BASE.md
+     pot_id = data.get("potId")  # optional — scopes the statement to one MGR pot, see mychama/mgr.py
+ 
+     if not chama_id or fmt not in ("pdf", "csv"):
+         raise bad_request("chamaId and a valid format ('pdf' or 'csv') are required.")
+-    if not minutes_id and (not date_from or not date_to):
++    if not date_from or not date_to:
+         raise bad_request("from and to dates are required.")
+ 
+     db = _db()
+@@ -389,7 +358,7 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     plan_cfg = PLANS.get(plan, PLANS["free"])
+ 
+     if not plan_cfg["exportsAllowed"]:
+-        raise precondition(f"Exports aren't available on the {plan_cfg['name']} plan — upgrade to generate statements or export minutes.")
++        raise precondition(f"Exports aren't available on the {plan_cfg['name']} plan — upgrade to generate statements.")
+ 
+     quota = plan_cfg["minutesQuota"]
+     used = chama.get("minutesExportsUsedThisMonth", 0)
+@@ -402,31 +371,23 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     chama_ref = db.document(paths.chama(chama_id))
+     chama_name = chama.get("name", "MyChama")
+ 
+-    if minutes_id:
+-        minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
+-        if not minute_snap.exists:
+-            raise not_found("Minutes not found.")
+-        content = _render_minutes_pdf(chama_name, minute_snap.to_dict())
+-        filename = f"minutes-{minutes_id}-{now_ms()}.pdf"
+-        content_type = "application/pdf"
++    names = _member_name_map(db, chama_id)
++    pot_label = None
++    if pot_id:
++        pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
++        if not pot_snap.exists:
++            raise not_found("Merry-go-round pot not found.")
++        pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
++    base_label = names.get(member_id, "Member") if member_id else "Whole chama"
++    scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
++    rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
++    if fmt == "csv":
++        content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
++        content_type = "text/csv"
+     else:
+-        names = _member_name_map(db, chama_id)
+-        pot_label = None
+-        if pot_id:
+-            pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
+-            if not pot_snap.exists:
+-                raise not_found("Merry-go-round pot not found.")
+-            pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
+-        base_label = names.get(member_id, "Member") if member_id else "Whole chama"
+-        scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
+-        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
+-        if fmt == "csv":
+-            content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
+-            content_type = "text/csv"
+-        else:
+-            content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to)
+-            content_type = "application/pdf"
+-        filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
++        content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to)
++        content_type = "application/pdf"
++    filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
+ 
+     url = _upload_and_sign(chama_id, filename, content, content_type)
+ 
+@@ -434,6 +395,65 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
+     return {"url": url}
+ 
+ 
++@https_fn.on_call(region=REGION)
++def recordMinutesExport(req: https_fn.CallableRequest) -> dict:
++    """Logs a minutes PDF export against the plan's shared export quota.
++
++    The PDF itself is rendered and downloaded entirely client-side (see
++    src/lib/minutesPdf.ts) — there is nothing for this function to render
++    or upload. It exists only so minutesExportsUsedThisMonth (server-owned;
++    see firestore.rules) stays an honest count. Called through callables.ts'
++    queueable `callable()` wrapper, so offline it queues and replays here
++    later rather than blocking the download.
++
++    Any active member may call this — minutes are already readable by the
++    whole chama (see firestore.rules), unlike a member statement, so this
++    intentionally doesn't require the finance-admin role generateStatement
++    does for a whole-chama export.
++    """
++    uid = require_auth(req)
++    data = req.data or {}
++    chama_id = data.get("chamaId")
++    minutes_id = data.get("minutesId")
++    if not chama_id or not minutes_id:
++        raise bad_request("chamaId and minutesId are required.")
++
++    db = _db()
++    require_membership(db, uid, chama_id)
++
++    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
++    if dedup is not None:
++        return dedup
++
++    minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
++    if not minute_snap.exists:
++        raise not_found("Minutes not found.")
++
++    chama_ref = db.document(paths.chama(chama_id))
++    chama_snap = chama_ref.get()
++    if not chama_snap.exists:
++        raise not_found("Chama not found.")
++    chama = chama_snap.to_dict()
++    plan_cfg = PLANS.get(chama.get("plan", "free"), PLANS["free"])
++
++    if not plan_cfg["exportsAllowed"]:
++        raise precondition(f"Exports aren't available on the {plan_cfg['name']} plan — upgrade to export minutes.")
++
++    quota = plan_cfg["minutesQuota"]
++    used = chama.get("minutesExportsUsedThisMonth", 0)
++    if quota is not None and used >= quota:
++        raise precondition(
++            f"This chama has used its {quota} free export{'s' if quota != 1 else ''} for this month. "
++            "More free exports are available next month, or upgrade the plan for a higher (or unlimited) allowance."
++        )
++
++    used += 1
++    chama_ref.update({"minutesExportsUsedThisMonth": used, "updatedAt": now_ms()})
++    result = {"minutesExportsUsedThisMonth": used}
++    record_result(db, chama_id, data.get("clientRequestId"), result)
++    return result
++
++
+ # --------------------------------------------------------------------- #
+ # Scheduled sweeps
+ # --------------------------------------------------------------------- #
+diff --git a/package.json b/package.json
+index eb8977c..59bbf54 100644
+--- a/package.json
++++ b/package.json
+@@ -15,7 +15,11 @@
+     "react-dom": "^19.2.8",
+     "tailwindcss": "^4.3.3",
+     "firebase": "^11.1.0",
+-    "react-router-dom": "^7.1.1"
++    "react-router-dom": "^7.1.1",
++    "jspdf": "^4.2.1",
++    "jspdf-autotable": "^5.0.8",
++    "marked": "^18.0.14",
++    "dompurify": "^3.4.16"
+   },
+   "devDependencies": {
+     "@types/node": "^24.13.3",
+@@ -26,4 +30,4 @@
+     "typescript": "~6.0.2",
+     "vite": "^8.3.0"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/src/components/MarkdownEditor.tsx b/src/components/MarkdownEditor.tsx
+new file mode 100644
+index 0000000..41e84b0
+--- /dev/null
++++ b/src/components/MarkdownEditor.tsx
+@@ -0,0 +1,156 @@
++/**
++ * A small toolbar + textarea Markdown editor with a live Preview tab —
++ * ported from PNS's story editor (github.com/LearnDigitalAdmin/PNS,
++ * src/admin/MarkdownEditor.tsx) and restyled to MyChama's forest/gold
++ * theme instead of PNS's own CSS. Same toolbar-inserts-syntax-at-cursor
++ * approach: no rich-text/contentEditable library, so what's stored is
++ * always plain, portable Markdown (see lib/markdown.ts for how it's
++ * rendered, both here and in the exported PDF).
++ *
++ * Deliberately narrow — headings, quotes, lists, bold/italic, a divider.
++ * This is for "Any other business" in the minutes module, not a full
++ * document editor.
++ */
++import { useCallback, useRef, useState } from 'react';
++import { renderMarkdown } from '../lib/markdown';
++
++export const MAX_MARKDOWN_LENGTH = 8_000;
++
++interface MarkdownEditorProps {
++  value: string;
++  onChange: (v: string) => void;
++  rows?: number;
++  placeholder?: string;
++  disabled?: boolean;
++}
++
++type ToolbarAction =
++  | { kind: 'wrap'; before: string; after: string }
++  | { kind: 'linePrefix'; prefix: string }
++  | { kind: 'insert'; text: string };
++
++const TOOLBAR_BUTTONS: { label: string; title: string; action: ToolbarAction }[] = [
++  { label: 'B', title: 'Bold', action: { kind: 'wrap', before: '**', after: '**' } },
++  { label: 'I', title: 'Italic', action: { kind: 'wrap', before: '_', after: '_' } },
++  { label: 'H2', title: 'Heading', action: { kind: 'linePrefix', prefix: '## ' } },
++  { label: 'H3', title: 'Subheading', action: { kind: 'linePrefix', prefix: '### ' } },
++  { label: '\u275D', title: 'Quote', action: { kind: 'linePrefix', prefix: '> ' } },
++  { label: '\u2022', title: 'Bullet list', action: { kind: 'linePrefix', prefix: '- ' } },
++  { label: '1.', title: 'Numbered list', action: { kind: 'linePrefix', prefix: '1. ' } },
++  { label: '\u2015', title: 'Divider', action: { kind: 'insert', text: '\n\n---\n\n' } },
++];
++
++export function MarkdownEditor({ value, onChange, rows = 6, placeholder, disabled }: MarkdownEditorProps) {
++  const textareaRef = useRef<HTMLTextAreaElement>(null);
++  const [mode, setMode] = useState<'write' | 'preview'>('write');
++
++  const applyAction = useCallback(
++    (action: ToolbarAction) => {
++      const ta = textareaRef.current;
++      if (!ta) return;
++      const start = ta.selectionStart;
++      const end = ta.selectionEnd;
++      const before = value.slice(0, start);
++      const selected = value.slice(start, end);
++      const after = value.slice(end);
++
++      let next = value;
++      let cursorStart = start;
++      let cursorEnd = end;
++
++      if (action.kind === 'wrap') {
++        next = before + action.before + selected + action.after + after;
++        cursorStart = start + action.before.length;
++        cursorEnd = cursorStart + selected.length;
++      } else if (action.kind === 'linePrefix') {
++        const lineStart = before.lastIndexOf('\n') + 1;
++        next = value.slice(0, lineStart) + action.prefix + value.slice(lineStart);
++        cursorStart = start + action.prefix.length;
++        cursorEnd = end + action.prefix.length;
++      } else {
++        next = before + action.text + after;
++        cursorStart = cursorEnd = start + action.text.length;
++      }
++
++      if (next.length > MAX_MARKDOWN_LENGTH) return;
++      onChange(next);
++
++      requestAnimationFrame(() => {
++        requestAnimationFrame(() => {
++          ta.focus();
++          ta.setSelectionRange(cursorStart, cursorEnd);
++        });
++      });
++    },
++    [value, onChange]
++  );
++
++  const remaining = MAX_MARKDOWN_LENGTH - value.length;
++  const nearLimit = remaining < MAX_MARKDOWN_LENGTH * 0.05;
++
++  return (
++    <div className="rounded-lg border border-forest-100 overflow-hidden">
++      <div className="flex items-center justify-between gap-2 flex-wrap px-2 py-1.5 bg-forest-50 border-b border-forest-100">
++        <div className="flex gap-1 flex-wrap">
++          {TOOLBAR_BUTTONS.map((b) => (
++            <button
++              key={b.title}
++              type="button"
++              title={b.title}
++              onClick={() => applyAction(b.action)}
++              disabled={disabled || mode === 'preview'}
++              className="min-w-[26px] h-[26px] px-1 rounded-md text-xs font-semibold text-forest-700 hover:bg-forest-100 disabled:opacity-40 disabled:hover:bg-transparent"
++            >
++              {b.label}
++            </button>
++          ))}
++        </div>
++        <div className="flex gap-1 shrink-0">
++          <button
++            type="button"
++            onClick={() => setMode('write')}
++            className={`text-xs font-semibold px-2 py-1 rounded-md ${mode === 'write' ? 'bg-forest-700 text-white' : 'text-forest-700'}`}
++          >
++            Write
++          </button>
++          <button
++            type="button"
++            onClick={() => setMode('preview')}
++            className={`text-xs font-semibold px-2 py-1 rounded-md ${mode === 'preview' ? 'bg-forest-700 text-white' : 'text-forest-700'}`}
++          >
++            Preview
++          </button>
++        </div>
++      </div>
++
++      {mode === 'write' ? (
++        <textarea
++          ref={textareaRef}
++          rows={rows}
++          placeholder={placeholder}
++          value={value}
++          maxLength={MAX_MARKDOWN_LENGTH}
++          disabled={disabled}
++          onChange={(e) => onChange(e.target.value)}
++          className="w-full px-3 py-2 text-sm outline-none resize-y disabled:bg-forest-50/50"
++        />
++      ) : (
++        <div
++          className="md-preview px-3 py-2 text-sm min-h-[80px] max-h-[280px] overflow-y-auto"
++          dangerouslySetInnerHTML={{
++            __html: renderMarkdown(value) || '<p class="opacity-50">Nothing to preview yet…</p>',
++          }}
++        />
++      )}
++
++      <div className="flex justify-between px-3 py-1 bg-forest-50/50 border-t border-forest-100">
++        <span className="text-[11px] text-forest-900/50">Headings, quotes, lists, bold/italic — use the toolbar.</span>
++        <span className={`text-[11px] ${nearLimit ? 'text-brick-500' : 'text-forest-900/50'}`}>
++          {value.length.toLocaleString()} / {MAX_MARKDOWN_LENGTH.toLocaleString()}
++        </span>
++      </div>
++    </div>
++  );
++}
++
++export default MarkdownEditor;
+diff --git a/src/features/minutes/Minutes.tsx b/src/features/minutes/Minutes.tsx
+index c2c284d..d5546e1 100644
+--- a/src/features/minutes/Minutes.tsx
++++ b/src/features/minutes/Minutes.tsx
+@@ -2,6 +2,15 @@
+  * Minutes are entirely direct Firestore writes — firestore.rules lets the
+  * secretary or chair create/update, and only the chair delete. Works
+  * offline for free via Firestore's persistent local cache.
++ *
++ * PDF export is now fully client-side (see lib/minutesPdf.ts) — it works
++ * with no connection at all. The plan/quota gate below is also computed
++ * client-side, from data already synced locally, so there's no round trip
++ * just to find out whether an export is allowed. The quota itself
++ * (minutesExportsUsedThisMonth) stays server-owned on purpose — see
++ * firestore.rules — so a successful export still logs itself via the
++ * queueable recordMinutesExport callable, which never blocks the download:
++ * offline, it just queues and syncs automatically later.
+  */
+ 
+ import { useEffect, useState } from 'react';
+@@ -9,18 +18,32 @@ import { collection, deleteDoc, doc, onSnapshot, setDoc } from 'firebase/firesto
+ import { db } from '../../lib/firebase';
+ import { paths } from '../../lib/firestorePaths';
+ import { useChama } from '../../app/ChamaProvider';
+-import { todayISO } from '../../lib/dates';
+-import { generateStatement } from '../../lib/callables';
++import { useMembers, memberName } from '../../app/useMembers';
++import { todayISO, fmtDate } from '../../lib/dates';
++import { recordMinutesExport } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { PLANS } from '../../lib/constants';
+-import type { Minute } from '../../lib/types';
++import { renderMarkdown } from '../../lib/markdown';
++import { MarkdownEditor } from '../../components/MarkdownEditor';
++import type { ChamaMember, Minute } from '../../lib/types';
++
++function lines(text: string): string[] {
++  return text.split('\n').map((l) => l.trim()).filter(Boolean);
++}
++
++/** Renders one plain agenda/resolution line with inline bold/italic
++ *  support — same Markdown source the PDF export reads. */
++function InlineMd({ text }: { text: string }) {
++  return <span dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }} />;
++}
+ 
+ export default function Minutes() {
+   const { chama, chamaId, membership } = useChama();
++  const { members } = useMembers(chamaId);
+   const [minutes, setMinutes] = useState<Minute[]>([]);
+   const [showForm, setShowForm] = useState(false);
+-  const [exportingId, setExportingId] = useState<string | null>(null);
+-  const [exportError, setExportError] = useState<string | null>(null);
++  const [loggingId, setLoggingId] = useState<string | null>(null);
++  const [exportNote, setExportNote] = useState<string | null>(null);
+ 
+   useEffect(() => {
+     if (!chamaId) return;
+@@ -38,22 +61,54 @@ export default function Minutes() {
+     await deleteDoc(doc(db, `${paths.minutes(chamaId)}/${id}`));
+   }
+ 
+-  async function exportPdf(id: string) {
+-    if (!chamaId) return;
+-    setExportingId(id);
+-    setExportError(null);
++  async function exportPdf(m: Minute) {
++    if (!chamaId || !chama) return;
++    setLoggingId(m.id);
++    setExportNote(null);
++    try {
++      // Loaded on demand — jsPDF/autotable/marked have no reason to sit in
++      // everyone's initial bundle for a feature most visits never touch.
++      // Cached by the browser after the first export, so this is instant
++      // from then on, offline included.
++      const { downloadMinutesPdf } = await import('../../lib/minutesPdf');
++      downloadMinutesPdf({
++        chamaName: chama.name,
++        title: m.title,
++        date: m.date,
++        venue: m.venue,
++        chairPresent: m.chairPresent,
++        recordedByName: memberName(members, m.recordedBy),
++        presentNames: m.attendees,
++        // Older minutes (recorded before this patch) have no absentees
++        // snapshot — fall back to "current roster minus attendees" so they
++        // still export sensibly, though membership may have since changed.
++        absentNames: m.absentees ?? members.filter((mm) => !m.attendees.includes(mm.name)).map((mm) => mm.name),
++        agenda: m.agenda,
++        resolutions: m.resolutions,
++        aob: m.aob,
++        nextMeeting: m.nextMeeting,
++      });
++    } catch {
++      setExportNote("Couldn't load the PDF exporter — please try again once you're online.");
++      setLoggingId(null);
++      return;
++    }
++
+     try {
+-      const res = await generateStatement({ chamaId, minutesId: id, format: 'pdf' });
+-      window.open(res.url, '_blank');
++      await recordMinutesExport({ chamaId, minutesId: m.id });
+     } catch (e) {
+-      setExportError(describeCallError(e).message);
++      setExportNote(describeCallError(e).message);
+     } finally {
+-      setExportingId(null);
++      setLoggingId(null);
+     }
+   }
+ 
+   const canWrite = membership?.role === 'chair' || membership?.role === 'secretary';
+   const exportsAllowed = chama ? PLANS[chama.plan].exportsAllowed : false;
++  const quota = chama ? PLANS[chama.plan].minutesQuota : 0;
++  const used = chama?.minutesExportsUsedThisMonth ?? 0;
++  const remaining = quota === null ? null : Math.max(0, quota - used);
++  const overQuota = quota !== null && used >= quota;
+ 
+   return (
+     <div className="space-y-5">
+@@ -66,70 +121,129 @@ export default function Minutes() {
+         )}
+       </div>
+ 
++      {exportsAllowed && quota !== null && (
++        <p className="text-xs text-forest-900/50">
++          {remaining} of {quota} free export{quota === 1 ? '' : 's'} left this month (shared with statement exports in
++          Reports) — extra exports need a plan upgrade.
++        </p>
++      )}
++
+       {showForm && chamaId && canWrite && (
+-        <MinutesForm chamaId={chamaId} recordedBy={membership!.memberId} onDone={() => setShowForm(false)} />
++        <MinutesForm chamaId={chamaId} members={members} recordedBy={membership!.memberId} onDone={() => setShowForm(false)} />
+       )}
+ 
+       <div className="space-y-4">
+-        {minutes.map((m) => (
+-          <div key={m.id} className="card p-5">
+-            <div className="flex items-center justify-between">
+-              <h3 className="font-display font-semibold">{m.title}</h3>
+-              <span className="text-xs text-forest-900/50">{m.date}</span>
+-            </div>
+-            {m.venue && <p className="text-sm text-forest-900/60 mt-0.5">Venue: {m.venue}</p>}
+-            {m.attendees.length > 0 && <p className="text-sm text-forest-900/60">Attendees: {m.attendees.join(', ')}</p>}
+-            {m.agenda.length > 0 && (
+-              <div className="mt-3">
+-                <p className="text-xs font-semibold text-forest-900/60 uppercase tracking-wide">Agenda</p>
+-                <ul className="list-disc list-inside text-sm mt-1 space-y-0.5">
+-                  {m.agenda.map((a, i) => (
+-                    <li key={i}>{a}</li>
+-                  ))}
+-                </ul>
++        {minutes.map((m) => {
++          const absentees = m.absentees ?? [];
++          const total = m.attendees.length + absentees.length;
++          return (
++            <div key={m.id} className="card p-5">
++              <div className="flex items-center justify-between flex-wrap gap-1">
++                <h3 className="font-display font-semibold">{m.title}</h3>
++                <span className="text-xs text-forest-900/50">{fmtDate(m.date)}</span>
+               </div>
+-            )}
+-            {m.resolutions.length > 0 && (
+-              <div className="mt-3">
+-                <p className="text-xs font-semibold text-forest-900/60 uppercase tracking-wide">Resolutions</p>
+-                <ul className="list-disc list-inside text-sm mt-1 space-y-0.5">
+-                  {m.resolutions.map((r, i) => (
+-                    <li key={i}>{r}</li>
+-                  ))}
+-                </ul>
++              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-sm text-forest-900/60 mt-0.5">
++                {m.venue && <span>Venue: {m.venue}</span>}
++                <span>Chair {m.chairPresent === false ? 'absent' : 'present'}</span>
++                {total > 0 && (
++                  <span>
++                    {m.attendees.length} of {total} present
++                  </span>
++                )}
+               </div>
+-            )}
+-            {membership?.role === 'chair' && (
+-              <button className="text-sm font-semibold text-brick-500 mt-3" onClick={() => remove(m.id)}>
+-                Delete
+-              </button>
+-            )}
+-            {exportsAllowed && (
+-              <button className="text-sm font-semibold text-forest-700 mt-3 ml-4" onClick={() => exportPdf(m.id)} disabled={exportingId === m.id}>
+-                {exportingId === m.id ? 'Exporting…' : 'Export PDF'}
+-              </button>
+-            )}
+-          </div>
+-        ))}
++              {m.attendees.length > 0 && <p className="text-sm text-forest-900/60 mt-1">Present: {m.attendees.join(', ')}</p>}
++              {absentees.length > 0 && <p className="text-sm text-forest-900/40">Absent: {absentees.join(', ')}</p>}
++
++              {m.agenda.length > 0 && (
++                <div className="mt-3">
++                  <p className="text-xs font-semibold text-forest-900/60 uppercase tracking-wide">Agenda</p>
++                  <ul className="list-disc list-inside text-sm mt-1 space-y-0.5">
++                    {m.agenda.map((a, i) => (
++                      <li key={i}>
++                        <InlineMd text={a} />
++                      </li>
++                    ))}
++                  </ul>
++                </div>
++              )}
++              {m.resolutions.length > 0 && (
++                <div className="mt-3">
++                  <p className="text-xs font-semibold text-forest-900/60 uppercase tracking-wide">Resolutions</p>
++                  <ul className="list-disc list-inside text-sm mt-1 space-y-0.5">
++                    {m.resolutions.map((r, i) => (
++                      <li key={i}>
++                        <InlineMd text={r} />
++                      </li>
++                    ))}
++                  </ul>
++                </div>
++              )}
++              {m.aob && (
++                <div className="mt-3">
++                  <p className="text-xs font-semibold text-forest-900/60 uppercase tracking-wide">Any other business</p>
++                  <div className="md-preview text-sm mt-1" dangerouslySetInnerHTML={{ __html: renderMarkdown(m.aob) }} />
++                </div>
++              )}
++              {m.nextMeeting && <p className="text-sm text-forest-900/60 mt-2">Next meeting: {fmtDate(m.nextMeeting)}</p>}
++
++              <div className="flex items-center gap-4 mt-3">
++                {membership?.role === 'chair' && (
++                  <button className="text-sm font-semibold text-brick-500" onClick={() => remove(m.id)}>
++                    Delete
++                  </button>
++                )}
++                {exportsAllowed && (
++                  <button
++                    className="text-sm font-semibold text-forest-700 disabled:opacity-50"
++                    onClick={() => exportPdf(m)}
++                    disabled={overQuota || loggingId === m.id}
++                    title={overQuota ? 'Free exports used up this month — upgrade to export more.' : undefined}
++                  >
++                    {loggingId === m.id ? 'Exporting…' : overQuota ? 'Export PDF (upgrade needed)' : 'Export PDF'}
++                  </button>
++                )}
++              </div>
++            </div>
++          );
++        })}
+         {!minutes.length && <p className="text-forest-900/50">No minutes recorded yet.</p>}
+-        {exportError && <p className="text-sm text-brick-500 font-medium">{exportError}</p>}
++        {exportNote && <p className="text-sm text-forest-900/60 font-medium">{exportNote}</p>}
+       </div>
+     </div>
+   );
+ }
+ 
+-function MinutesForm({ chamaId, recordedBy, onDone }: { chamaId: string; recordedBy: string; onDone: () => void }) {
++function MinutesForm({
++  chamaId,
++  members,
++  recordedBy,
++  onDone,
++}: {
++  chamaId: string;
++  members: ChamaMember[];
++  recordedBy: string;
++  onDone: () => void;
++}) {
+   const [title, setTitle] = useState('');
+   const [date, setDate] = useState(todayISO());
+   const [venue, setVenue] = useState('');
+-  const [attendees, setAttendees] = useState('');
++  const [chairPresent, setChairPresent] = useState(true);
++  // Absent by exception: unset (not yet toggled) reads as present everywhere
++  // below, so a member who loads in a moment after this form mounts still
++  // defaults to present without needing an effect to backfill them.
++  const [present, setPresent] = useState<Record<string, boolean>>({});
+   const [agenda, setAgenda] = useState('');
+   const [resolutions, setResolutions] = useState('');
++  const [aob, setAob] = useState('');
++  const [nextMeeting, setNextMeeting] = useState('');
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
+-  function lines(text: string): string[] {
+-    return text.split('\n').map((l) => l.trim()).filter(Boolean);
++  const isPresent = (m: ChamaMember) => present[m.id] ?? true;
++  const presentCount = members.filter(isPresent).length;
++
++  function setAll(value: boolean) {
++    setPresent(value ? {} : Object.fromEntries(members.map((m) => [m.id, false])));
+   }
+ 
+   async function submit() {
+@@ -140,14 +254,20 @@ function MinutesForm({ chamaId, recordedBy, onDone }: { chamaId: string; recorde
+     }
+     setBusy(true);
+     try {
++      const attendees = members.filter(isPresent).map((m) => m.name);
++      const absentees = members.filter((m) => !isPresent(m)).map((m) => m.name);
+       const ref = doc(collection(db, paths.minutes(chamaId)));
+       await setDoc(ref, {
+         title: title.trim(),
+         date,
+         venue: venue.trim() || null,
+-        attendees: lines(attendees),
++        chairPresent,
++        attendees,
++        absentees,
+         agenda: lines(agenda),
+         resolutions: lines(resolutions),
++        aob: aob.trim() || null,
++        nextMeeting: nextMeeting || null,
+         recordedBy,
+         createdAt: Date.now(),
+       });
+@@ -160,32 +280,76 @@ function MinutesForm({ chamaId, recordedBy, onDone }: { chamaId: string; recorde
+   }
+ 
+   return (
+-    <div className="card p-5 max-w-md flex flex-col gap-3">
++    <div className="card p-5 max-w-2xl flex flex-col gap-3">
+       <h3 className="font-display font-semibold">Record minutes</h3>
+-      <label className="flex flex-col gap-1 text-sm font-medium">
+-        Title
+-        <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-      </label>
+-      <label className="flex flex-col gap-1 text-sm font-medium">
+-        Date
+-        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-      </label>
+-      <label className="flex flex-col gap-1 text-sm font-medium">
+-        Venue (optional)
+-        <input value={venue} onChange={(e) => setVenue(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-      </label>
+-      <label className="flex flex-col gap-1 text-sm font-medium">
+-        Attendees (one per line)
+-        <textarea value={attendees} onChange={(e) => setAttendees(e.target.value)} disabled={busy} rows={3} className="px-3 py-2 rounded-lg border border-forest-100" />
++      <div className="grid sm:grid-cols-2 gap-3">
++        <label className="flex flex-col gap-1 text-sm font-medium">
++          Title
++          <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        </label>
++        <label className="flex flex-col gap-1 text-sm font-medium">
++          Date
++          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        </label>
++        <label className="flex flex-col gap-1 text-sm font-medium">
++          Venue (optional)
++          <input value={venue} onChange={(e) => setVenue(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        </label>
++        <label className="flex flex-col gap-1 text-sm font-medium">
++          Next meeting (optional)
++          <input type="date" value={nextMeeting} onChange={(e) => setNextMeeting(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
++        </label>
++      </div>
++
++      <label className="flex items-center gap-2 text-sm font-medium">
++        <input type="checkbox" checked={chairPresent} onChange={(e) => setChairPresent(e.target.checked)} disabled={busy} className="accent-forest-700 w-4 h-4" />
++        Chair present
+       </label>
++
++      <div className="flex flex-col gap-1">
++        <div className="flex items-center justify-between">
++          <span className="text-sm font-medium">
++            Attendance — {presentCount} of {members.length} present
++          </span>
++          <div className="flex gap-3 text-xs font-semibold text-forest-700">
++            <button type="button" onClick={() => setAll(true)} disabled={busy}>
++              All present
++            </button>
++            <button type="button" onClick={() => setAll(false)} disabled={busy}>
++              All absent
++            </button>
++          </div>
++        </div>
++        <div className="grid sm:grid-cols-2 gap-1 max-h-48 overflow-y-auto border border-forest-100 rounded-lg p-2">
++          {members.map((m) => (
++            <label key={m.id} className="flex items-center gap-2 text-sm px-2 py-1 rounded-md hover:bg-forest-50">
++              <input
++                type="checkbox"
++                checked={isPresent(m)}
++                onChange={(e) => setPresent((p) => ({ ...p, [m.id]: e.target.checked }))}
++                disabled={busy}
++                className="accent-forest-700 w-4 h-4"
++              />
++              {m.name}
++            </label>
++          ))}
++          {!members.length && <p className="text-sm text-forest-900/50 px-2 py-1">No active members yet.</p>}
++        </div>
++      </div>
++
+       <label className="flex flex-col gap-1 text-sm font-medium">
+-        Agenda (one item per line)
++        Agenda (one item per line — **bold**/_italic_ supported)
+         <textarea value={agenda} onChange={(e) => setAgenda(e.target.value)} disabled={busy} rows={3} className="px-3 py-2 rounded-lg border border-forest-100" />
+       </label>
+       <label className="flex flex-col gap-1 text-sm font-medium">
+-        Resolutions (one per line)
++        Resolutions (one per line — **bold**/_italic_ supported)
+         <textarea value={resolutions} onChange={(e) => setResolutions(e.target.value)} disabled={busy} rows={3} className="px-3 py-2 rounded-lg border border-forest-100" />
+       </label>
++      <label className="flex flex-col gap-1 text-sm font-medium">
++        Any other business (optional)
++        <MarkdownEditor value={aob} onChange={setAob} disabled={busy} rows={5} placeholder="Headings, quotes, lists — whatever the discussion needs." />
++      </label>
++
+       <div className="flex gap-2">
+         <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full disabled:opacity-50">
+           {busy ? 'Saving…' : 'Save minutes'}
+diff --git a/src/index.css b/src/index.css
+index 503e90e..57d3ab1 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -85,6 +85,18 @@ input:focus, select:focus, textarea:focus {
+ .btn-gold:hover { background: var(--color-gold-500); }
+ .chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600; }
+ 
++/* Renders MarkdownEditor's Preview tab (components/MarkdownEditor.tsx) —
++   Tailwind's Preflight strips default h2/h3/ul/blockquote styling, so
++   dangerouslySetInnerHTML output needs it back explicitly. */
++.md-preview h2 { font-family: theme(--font-display); font-weight: 700; font-size: 1.05rem; margin: 0 0 .35rem; color: var(--color-forest-900); }
++.md-preview h3 { font-family: theme(--font-display); font-weight: 700; font-size: .95rem; margin: 0 0 .3rem; color: var(--color-forest-900); }
++.md-preview p { margin: 0 0 .6rem; }
++.md-preview ul, .md-preview ol { margin: 0 0 .6rem 1.1rem; }
++.md-preview li { margin-bottom: .2rem; }
++.md-preview blockquote { border-left: 2px solid var(--color-gold-400); padding-left: .6rem; margin: 0 0 .6rem; color: rgba(18, 33, 28, .7); }
++.md-preview hr { border: none; border-top: 1px solid var(--color-forest-100); margin: .6rem 0; }
++.md-preview a { color: var(--color-forest-700); text-decoration: underline; }
++
+ .nav-item.active { background: var(--color-forest-50); color: var(--color-forest-700); }
+ 
+ @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 39e0735..84eb1a1 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -363,12 +363,23 @@ export const upgradePlan = liveCallable<
+ 
+ /**
+  * Not queueable: generates and returns a document URL live.
+- * Either a date-ranged statement (from/to/format, memberId optional for a
+- * whole-chama statement) OR — a small, documented addition beyond the
+- * original contract, see TOUCH_BASE.md "Billing & statements" — a single
+- * minutes entry's PDF via minutesId, which ignores from/to/memberId.
++ * A date-ranged statement (from/to/format, memberId optional for a
++ * whole-chama statement).
+  */
+ export const generateStatement = liveCallable<
+-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string },
++  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; potId?: string },
+   { url: string }
+ >('generateStatement', 'Generating statement');
++
++/**
++ * Queueable: logs a minutes PDF export against the plan's shared export
++ * quota (minutesExportsUsedThisMonth — also consumed by generateStatement).
++ * The PDF itself is built and downloaded entirely client-side (see
++ * lib/minutesPdf.ts) before this is even called, so offline this simply
++ * queues and syncs later — it never blocks the download. Any member of the
++ * chama may call it; minutes are already readable by the whole chama.
++ */
++export const recordMinutesExport = callable<
++  { chamaId: string; minutesId: string },
++  { minutesExportsUsedThisMonth: number }
++>('recordMinutesExport', () => 'Logging minutes export');
+diff --git a/src/lib/markdown.ts b/src/lib/markdown.ts
+new file mode 100644
+index 0000000..8a83688
+--- /dev/null
++++ b/src/lib/markdown.ts
+@@ -0,0 +1,29 @@
++/**
++ * Converts editor-authored Markdown into sanitized HTML, safe to render via
++ * dangerouslySetInnerHTML. Same approach as PNS's src/lib/markdown.ts (see
++ * github.com/LearnDigitalAdmin/PNS) — kept intentionally small: this is for
++ * a "headings, quotes, bold, lists" minutes field, not a full document
++ * editor, so the allow-list below is deliberately narrow.
++ *
++ * This only feeds the in-app live preview. The PDF export (lib/minutesPdf.ts)
++ * does NOT go through HTML — it walks marked's token tree directly for full
++ * control over pagination, so the two stay in sync by construction (same
++ * `marked` parse, two different renderers) rather than by convention.
++ */
++
++import { marked } from 'marked';
++import DOMPurify from 'dompurify';
++
++marked.setOptions({
++  breaks: true, // a single newline becomes <br>, matching how people expect plain typing to behave
++  gfm: true,
++});
++
++export function renderMarkdown(md: string | undefined | null): string {
++  if (!md) return '';
++  const rawHtml = marked.parse(md, { async: false }) as string;
++  return DOMPurify.sanitize(rawHtml, {
++    ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'a', 'ul', 'ol', 'li', 'h2', 'h3', 'blockquote', 'hr'],
++    ALLOWED_ATTR: ['href', 'target', 'rel'],
++  });
++}
+diff --git a/src/lib/minutesPdf.ts b/src/lib/minutesPdf.ts
+new file mode 100644
+index 0000000..abd32e0
+--- /dev/null
++++ b/src/lib/minutesPdf.ts
+@@ -0,0 +1,394 @@
++/**
++ * Renders a chama's meeting minutes into a branded, multi-page PDF —
++ * entirely in the browser, with jsPDF + jspdf-autotable. No network call,
++ * no Cloud Function, no Storage upload: this replaces the old
++ * generateStatement({ minutesId, format: 'pdf' }) round trip (which could
++ * not work at all offline) with something that works the instant it's
++ * clicked, connected or not. See functions/mychama/billing.py — the old
++ * `_render_minutes_pdf` (plain ReportLab, no branding) is gone; the only
++ * server-side piece left is `recordMinutesExport`, which just logs the
++ * export against the plan's quota (queued automatically if offline, via
++ * callables.ts' `callable()` — it never blocks the download below).
++ *
++ * The "Any other business" field supports a small set of Markdown block
++ * types (##/### headings, > quotes, - / 1. lists, bold/italic, ---
++ * dividers) authored via components/MarkdownEditor.tsx. We walk `marked`'s
++ * token tree ourselves (rather than jsPDF's flaky html() plugin) so we get
++ * full control over word-wrapping and page breaks. Agenda and resolution
++ * lines stay plain one-per-line lists (unchanged data shape — string[] —
++ * so old minutes keep rendering correctly) but each line still gets
++ * inline bold/italic support, run through the same tokenizer.
++ *
++ * Brand fonts (Space Grotesk / Inter) aren't embedded — that would add a
++ * meaningful chunk of bundle size for a document nobody reads on-brand-font
++ * grounds. Helvetica (jsPDF's built-in default) in the app's actual colour
++ * palette reads just as clean and professional.
++ */
++
++import { jsPDF } from 'jspdf';
++import { autoTable } from 'jspdf-autotable';
++import { marked } from 'marked';
++import type { Token, Tokens } from 'marked';
++import { fmtDate } from './dates';
++
++export interface MinutesPdfInput {
++  chamaName: string;
++  title: string;
++  /** ISO date (YYYY-MM-DD). */
++  date: string;
++  venue?: string | null;
++  chairPresent?: boolean;
++  recordedByName: string;
++  /** Names of members ticked present, in roster order. */
++  presentNames: string[];
++  /** Names of active roster members NOT ticked present. */
++  absentNames: string[];
++  agenda: string[];
++  resolutions: string[];
++  /** Markdown — headings, quotes, lists, bold/italic, dividers. */
++  aob?: string | null;
++  /** ISO date (YYYY-MM-DD). */
++  nextMeeting?: string | null;
++}
++
++// -- Brand palette (1:1 with src/index.css's @theme tokens) — RGB tuples,
++// since that's the one Color form every jsPDF/autotable colour API accepts
++// without ambiguity. ------------------------------------------------------
++const FOREST_900: [number, number, number] = [18, 43, 32];
++const FOREST_700: [number, number, number] = [31, 77, 58];
++const FOREST_100: [number, number, number] = [216, 232, 220];
++const FOREST_50: [number, number, number] = [238, 245, 240];
++const GOLD_300: [number, number, number] = [237, 190, 92];
++const GOLD_400: [number, number, number] = [232, 163, 61];
++const GOLD_600: [number, number, number] = [181, 109, 22];
++const INK: [number, number, number] = [18, 33, 28];
++const INK_FADED: [number, number, number] = [110, 122, 116];
++const WHITE: [number, number, number] = [255, 255, 255];
++
++const MARGIN = 42;
++const PAGE1_CONTENT_TOP = 132;
++const CONT_CONTENT_TOP = 58;
++const FOOTER_ZONE = 34;
++
++type Style = { bold?: boolean; italic?: boolean };
++type Run = { text: string } & Style;
++
++/** Flattens marked's nested inline token tree into a flat run list carrying
++ *  only the bold/italic styling we render (links/code/etc. fall back to
++ *  plain text — minutes don't need clickable links). */
++function flattenInline(tokens: Token[] | undefined, style: Style = {}): Run[] {
++  const runs: Run[] = [];
++  for (const t of tokens ?? []) {
++    if (t.type === 'strong') {
++      runs.push(...flattenInline((t as Tokens.Strong).tokens, { ...style, bold: true }));
++    } else if (t.type === 'em') {
++      runs.push(...flattenInline((t as Tokens.Em).tokens, { ...style, italic: true }));
++    } else if ('tokens' in t && t.tokens) {
++      runs.push(...flattenInline(t.tokens as Token[], style));
++    } else if ('text' in t && typeof t.text === 'string') {
++      runs.push({ text: t.text, ...style });
++    }
++  }
++  return runs;
++}
++
++/** Parses one line of plain text for inline bold/italic markup only —
++ *  used for agenda/resolution lines, which stay one-per-line strings. */
++function inlineRunsForLine(line: string): Run[] {
++  const tokens = marked.lexer(line);
++  const first = tokens[0];
++  if (first && first.type === 'paragraph') {
++    return flattenInline((first as Tokens.Paragraph).tokens);
++  }
++  return [{ text: line }];
++}
++
++function fontStyleFor(s: Style): 'normal' | 'bold' | 'italic' | 'bolditalic' {
++  if (s.bold && s.italic) return 'bolditalic';
++  if (s.bold) return 'bold';
++  if (s.italic) return 'italic';
++  return 'normal';
++}
++
++/** Everything the block/inline renderers need, bundled so page-break
++ *  handling (which must insert a fresh page starting at CONT_CONTENT_TOP)
++ *  lives in one place. */
++interface Layout {
++  doc: jsPDF;
++  pageW: number;
++  pageH: number;
++  bottomLimit: number;
++}
++
++function ensureRoom(l: Layout, y: number): number {
++  if (y > l.bottomLimit) {
++    l.doc.addPage();
++    return CONT_CONTENT_TOP;
++  }
++  return y;
++}
++
++/** Draws word-wrapped, mixed bold/italic runs starting at (x, y), returning
++ *  the y position of the next free line. Wraps on word boundaries and
++ *  inserts new pages via `ensureRoom` mid-paragraph if needed. */
++function drawRuns(l: Layout, runs: Run[], x: number, y: number, maxWidth: number, size: number): number {
++  const { doc } = l;
++  doc.setFontSize(size);
++  const lineHeight = size * 1.4;
++  let cursorX = x;
++  let cursorY = ensureRoom(l, y);
++  for (const run of runs) {
++    const chunks = run.text.split(/(\s+)/).filter((c) => c !== '');
++    for (const chunk of chunks) {
++      doc.setFont('helvetica', fontStyleFor(run));
++      const isSpace = chunk.trim() === '';
++      const w = doc.getTextWidth(chunk);
++      if (!isSpace && cursorX + w > x + maxWidth) {
++        cursorX = x;
++        cursorY += lineHeight;
++        cursorY = ensureRoom(l, cursorY);
++      }
++      if (!isSpace) doc.text(chunk, cursorX, cursorY);
++      cursorX += w;
++    }
++  }
++  return cursorY + lineHeight;
++}
++
++function sectionHeading(l: Layout, label: string, x: number, y: number, width: number): number {
++  const { doc } = l;
++  let cursorY = ensureRoom(l, y + 14);
++  doc.setFont('helvetica', 'bold');
++  doc.setFontSize(9.5);
++  doc.setTextColor(...GOLD_600);
++  doc.text(label.toUpperCase(), x, cursorY);
++  doc.setDrawColor(...FOREST_100);
++  doc.setLineWidth(0.75);
++  doc.line(x, cursorY + 4, x + width, cursorY + 4);
++  return cursorY + 16;
++}
++
++/** Renders one Markdown block-token tree (headings, quotes, lists, hr,
++ *  paragraphs) — used for the "Any other business" field. */
++function renderBlocks(l: Layout, tokens: Token[], x: number, y: number, maxWidth: number): number {
++  const { doc } = l;
++  let cursorY = y;
++  for (const token of tokens) {
++    cursorY = ensureRoom(l, cursorY);
++    switch (token.type) {
++      case 'heading': {
++        const h = token as Tokens.Heading;
++        cursorY += 5;
++        doc.setTextColor(...FOREST_900);
++        cursorY = drawRuns(l, flattenInline(h.tokens, { bold: true }), x, cursorY, maxWidth, h.depth <= 2 ? 12 : 10.5);
++        break;
++      }
++      case 'paragraph': {
++        doc.setTextColor(...INK);
++        cursorY = drawRuns(l, flattenInline((token as Tokens.Paragraph).tokens), x, cursorY, maxWidth, 10);
++        break;
++      }
++      case 'blockquote': {
++        const startY = cursorY - 9;
++        doc.setTextColor(...INK_FADED);
++        cursorY = renderBlocks(l, (token as Tokens.Blockquote).tokens, x + 14, cursorY, maxWidth - 14);
++        doc.setDrawColor(...GOLD_400);
++        doc.setLineWidth(2);
++        doc.line(x, startY, x, Math.max(startY + 10, cursorY - 8));
++        break;
++      }
++      case 'list': {
++        const list = token as Tokens.List;
++        let n = typeof list.start === 'number' ? list.start : 1;
++        for (const item of list.items) {
++          cursorY = ensureRoom(l, cursorY);
++          doc.setFont('helvetica', 'normal');
++          doc.setFontSize(10);
++          doc.setTextColor(...GOLD_600);
++          doc.text(list.ordered ? `${n}.` : '\u2022', x, cursorY);
++          const first = item.tokens[0] as { tokens?: Token[] } | undefined;
++          const inner = first?.tokens ?? item.tokens;
++          doc.setTextColor(...INK);
++          cursorY = drawRuns(l, flattenInline(inner), x + 14, cursorY, maxWidth - 14, 10);
++          n++;
++        }
++        break;
++      }
++      case 'hr': {
++        cursorY += 4;
++        doc.setDrawColor(...FOREST_100);
++        doc.setLineWidth(0.75);
++        doc.line(x, cursorY, x + maxWidth, cursorY);
++        cursorY += 12;
++        break;
++      }
++      case 'space':
++        cursorY += 5;
++        break;
++      default:
++        break;
++    }
++  }
++  return cursorY;
++}
++
++function bulletedLines(l: Layout, lines: string[], x: number, y: number, maxWidth: number): number {
++  const { doc } = l;
++  let cursorY = y;
++  for (const line of lines) {
++    cursorY = ensureRoom(l, cursorY);
++    doc.setFont('helvetica', 'normal');
++    doc.setFontSize(10);
++    doc.setTextColor(...GOLD_600);
++    doc.text('\u2022', x, cursorY);
++    doc.setTextColor(...INK);
++    cursorY = drawRuns(l, inlineRunsForLine(line), x + 12, cursorY, maxWidth - 12, 10);
++  }
++  return cursorY;
++}
++
++export function downloadMinutesPdf(input: MinutesPdfInput): void {
++  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
++  const pageW = doc.internal.pageSize.getWidth();
++  const pageH = doc.internal.pageSize.getHeight();
++  const contentW = pageW - MARGIN * 2;
++  const l: Layout = { doc, pageW, pageH, bottomLimit: pageH - FOOTER_ZONE - 14 };
++
++  // -- Page 1 header band ---------------------------------------------
++  doc.setFillColor(...FOREST_700);
++  doc.rect(0, 0, pageW, PAGE1_CONTENT_TOP - 28, 'F');
++
++  doc.setFillColor(...FOREST_900);
++  doc.roundedRect(MARGIN, 20, 20, 20, 4, 4, 'F');
++  doc.setFont('helvetica', 'bold');
++  doc.setFontSize(11);
++  doc.setTextColor(...GOLD_300);
++  doc.text('M', MARGIN + 10, 34, { align: 'center' });
++  doc.setFontSize(10.5);
++  doc.setTextColor(...WHITE);
++  doc.text('MyChama · Meeting Minutes', MARGIN + 28, 34);
++
++  doc.setFontSize(17);
++  doc.setFont('helvetica', 'bold');
++  doc.setTextColor(...WHITE);
++  doc.text(input.chamaName, MARGIN, 62);
++
++  doc.setFontSize(12);
++  doc.setFont('helvetica', 'bold');
++  doc.text(input.title, MARGIN, 80);
++
++  const metaBits = [fmtDate(input.date)];
++  if (input.venue) metaBits.push(input.venue);
++  metaBits.push(input.chairPresent === false ? 'Chair absent' : 'Chair present');
++  doc.setFontSize(9);
++  doc.setFont('helvetica', 'normal');
++  doc.setTextColor(230, 236, 232);
++  doc.text(metaBits.join('   ·   '), MARGIN, 96);
++
++  // -- Attendance -------------------------------------------------------
++  let y = sectionHeading(l, 'Attendance', MARGIN, PAGE1_CONTENT_TOP, contentW);
++  const total = input.presentNames.length + input.absentNames.length;
++  doc.setFontSize(9.5);
++  doc.setFont('helvetica', 'normal');
++  doc.setTextColor(...INK_FADED);
++  doc.text(`${input.presentNames.length} of ${total} member${total === 1 ? '' : 's'} present`, MARGIN, y);
++  y += 10;
++
++  const rows: [string, string][] = [
++    ...input.presentNames.map((n): [string, string] => [n, 'Present']),
++    ...input.absentNames.map((n): [string, string] => [n, 'Absent']),
++  ];
++  if (rows.length === 0) rows.push(['—', 'No roster on file']);
++
++  autoTable(doc, {
++    startY: y,
++    margin: { left: MARGIN, right: MARGIN },
++    head: [['Member', 'Status']],
++    body: rows,
++    theme: 'plain',
++    styles: { fontSize: 9.5, cellPadding: { top: 5, bottom: 5, left: 6, right: 6 }, textColor: INK },
++    headStyles: { fillColor: FOREST_700, textColor: WHITE, fontStyle: 'bold' },
++    alternateRowStyles: { fillColor: FOREST_50 },
++    columnStyles: { 1: { cellWidth: 90 } },
++    didParseCell: (data) => {
++      if (data.section === 'body' && data.column.index === 1) {
++        data.cell.styles.textColor = data.cell.raw === 'Present' ? FOREST_700 : [150, 150, 150];
++        data.cell.styles.fontStyle = 'bold';
++      }
++    },
++  });
++
++  y = ((doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ?? y + 40) + 18;
++
++  // -- Agenda / Resolutions / AOB / Next meeting ------------------------
++  if (input.agenda.length > 0) {
++    y = sectionHeading(l, 'Agenda', MARGIN, y, contentW);
++    y = bulletedLines(l, input.agenda, MARGIN, y, contentW);
++    y += 8;
++  }
++  if (input.resolutions.length > 0) {
++    y = sectionHeading(l, 'Resolutions', MARGIN, y, contentW);
++    y = bulletedLines(l, input.resolutions, MARGIN, y, contentW);
++    y += 8;
++  }
++  if (input.aob && input.aob.trim()) {
++    y = sectionHeading(l, 'Any other business', MARGIN, y, contentW);
++    y = renderBlocks(l, marked.lexer(input.aob), MARGIN, y, contentW);
++    y += 8;
++  }
++  if (input.nextMeeting) {
++    y = ensureRoom(l, y + 10);
++    doc.setFont('helvetica', 'bold');
++    doc.setFontSize(10);
++    doc.setTextColor(...FOREST_900);
++    doc.text(`Next meeting: ${fmtDate(input.nextMeeting)}`, MARGIN, y);
++    y += 18;
++  }
++
++  y = ensureRoom(l, y + 12);
++  doc.setFont('helvetica', 'italic');
++  doc.setFontSize(9);
++  doc.setTextColor(...INK_FADED);
++  doc.text(`Recorded by ${input.recordedByName} · generated ${fmtDate(new Date().toISOString().slice(0, 10))}`, MARGIN, y);
++
++  // -- Second pass: watermark, continuation-page strip, footer on every
++  // page, regardless of whether it came from autoTable's own pagination
++  // or a page we added ourselves inside ensureRoom(). ------------------
++  const totalPages = doc.getNumberOfPages();
++  for (let p = 1; p <= totalPages; p++) {
++    doc.setPage(p);
++
++    doc.saveGraphicsState();
++    doc.setGState(doc.GState({ opacity: 0.05 }));
++    doc.setFont('helvetica', 'bold');
++    doc.setFontSize(64);
++    doc.setTextColor(...FOREST_700);
++    doc.text('MYCHAMA', pageW / 2, pageH / 2, { align: 'center', angle: 35 });
++    doc.restoreGraphicsState();
++
++    if (p > 1) {
++      doc.setFont('helvetica', 'bold');
++      doc.setFontSize(9);
++      doc.setTextColor(...FOREST_700);
++      doc.text(input.chamaName, MARGIN, 28);
++      doc.setFont('helvetica', 'normal');
++      doc.setTextColor(...INK_FADED);
++      doc.text(`Minutes — ${input.title}`, pageW - MARGIN, 28, { align: 'right' });
++      doc.setDrawColor(...FOREST_100);
++      doc.setLineWidth(0.75);
++      doc.line(MARGIN, 36, pageW - MARGIN, 36);
++    }
++
++    doc.setDrawColor(...FOREST_100);
++    doc.setLineWidth(0.75);
++    doc.line(MARGIN, pageH - FOOTER_ZONE, pageW - MARGIN, pageH - FOOTER_ZONE);
++    doc.setFont('helvetica', 'normal');
++    doc.setFontSize(8);
++    doc.setTextColor(...INK_FADED);
++    doc.text('chama.samuhia.co.ke', MARGIN, pageH - FOOTER_ZONE + 14);
++    doc.text(`Page ${p} of ${totalPages}`, pageW - MARGIN, pageH - FOOTER_ZONE + 14, { align: 'right' });
++  }
++
++  const slug = input.chamaName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
++  doc.save(`minutes-${slug}-${input.date}.pdf`);
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 33bf91e..a3115db 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -366,6 +366,9 @@ export interface Minute {
+   venue?: string;
+   chairPresent?: boolean;
+   attendees: string[];
++  /** Roster members ticked absent, snapshotted at recording time. Optional
++   *  — minutes recorded before this field existed simply omit it. */
++  absentees?: string[];
+   agenda: string[];
+   resolutions: string[];
+   aob?: string;

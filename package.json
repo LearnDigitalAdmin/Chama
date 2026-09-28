@@ -15,7 +15,11 @@
     "react-dom": "^19.2.8",
     "tailwindcss": "^4.3.3",
     "firebase": "^11.1.0",
-    "react-router-dom": "^7.1.1"
+    "react-router-dom": "^7.1.1",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "marked": "^18.0.14",
+    "dompurify": "^3.4.16"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

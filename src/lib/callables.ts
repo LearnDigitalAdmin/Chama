@@ -363,18 +363,29 @@ export const upgradePlan = liveCallable<
 
 /**
  * Not queueable: generates and returns a document URL live.
- * Either a date-ranged statement (from/to/format, memberId optional for a
+ * A date-ranged statement (from/to/format, memberId optional for a
  * whole-chama statement — PREMIUM as of the reports engine, see
- * REPORT_TYPES['cashflow'] in constants.ts) OR — a small, documented
- * addition beyond the original contract, see TOUCH_BASE.md "Billing &
- * statements" — a single minutes entry's PDF via minutesId, which ignores
- * from/to/memberId. `alacarteReference` is only needed on Starter/Basic,
- * to consume a purchase made with purchasePremiumReportAlaCarte first.
+ * REPORT_TYPES['cashflow'] in constants.ts). `alacarteReference` is only
+ * needed on Starter/Basic, to consume a purchase made with
+ * purchasePremiumReportAlaCarte first.
  */
 export const generateStatement = liveCallable<
-  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; minutesId?: string; potId?: string; period?: string; encrypt?: boolean; alacarteReference?: string },
+  { chamaId: string; memberId?: string; from?: string; to?: string; format: 'pdf' | 'csv'; potId?: string; period?: string; encrypt?: boolean; alacarteReference?: string },
   { url: string; encrypted: boolean; pinSentTo: number; charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
 >('generateStatement', 'Generating statement');
+
+/**
+ * Queueable: logs a minutes PDF export against the same shared export
+ * allowance generateStatement draws from (reports-engine credits).
+ * The PDF itself is built and downloaded entirely client-side (see
+ * lib/minutesPdf.ts) before this is even called, so offline this simply
+ * queues and syncs later — it never blocks the download. Any member of the
+ * chama may call it; minutes are already readable by the whole chama.
+ */
+export const recordMinutesExport = callable<
+  { chamaId: string; minutesId: string },
+  { charge: { source: string; creditsCharged?: number; walletAfter?: number; reference?: string } | null }
+>('recordMinutesExport', () => 'Logging minutes export');
 
 // ---------------------------------------------------------------------------
 // Reports engine (this patch) — Contribution Ledger, Arrears & Penalties,

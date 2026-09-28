@@ -3,15 +3,16 @@ Reports — Phase 4 extension (this patch).
 
 generateReport                — the four NEW report types (contribution
                                 ledger, arrears & penalties, P&L, balance
-                                sheet). Individual Member Statement,
+                                sheet). Individual Member Statement and
                                 Cashflow (the whole-chama case of the same
-                                statement) and Minutes export stay on the
-                                pre-existing generateStatement in
-                                billing.py, now updated to charge through
-                                the same shared/reports_engine credit
-                                accounting — see billing.py's module
-                                docstring for why the two callables
-                                co-exist instead of one being replaced.
+                                statement) stay on the pre-existing
+                                generateStatement in billing.py, now updated
+                                to charge through the same
+                                shared/reports_engine credit accounting.
+                                Minutes exports are logged by
+                                recordMinutesExport in billing.py (the PDF
+                                itself is built client-side) — see that
+                                module's docstring.
 
 purchaseReportCredits         — prepaid wallet top-up. Exactly the
                                 purchaseSmsCredits pattern (see
@@ -46,7 +47,7 @@ from shared.errors import bad_request, not_found, precondition, rate_limited, re
 from shared.idempotency import already_applied, record_result
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone
 from shared.roles import require_finance_admin
-from shared.secrets import PAYSTACK_SECRET_KEY
+from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
 
 REGION = "africa-south1"
 STATEMENT_URL_TTL = timedelta(hours=48)  # matches billing.py's STATEMENT_URL_TTL
@@ -59,7 +60,12 @@ def _db():
 NEW_REPORT_TYPES = ("contribution_ledger", "arrears_penalties", "profit_loss", "balance_sheet")
 
 
-@https_fn.on_call(region=REGION, secrets=[])
+# The HostPinnacle secrets MUST be declared here: engine.notify_pin reads
+# them at runtime to SMS the PDF's open-file PIN, and a Cloud Function only
+# receives the secrets listed in its decorator. Without them every PIN SMS
+# fails silently (notify_pin swallows send errors) and the admin is left
+# holding an encrypted PDF with no PIN.
+@https_fn.on_call(region=REGION, secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID])
 def generateReport(req: https_fn.CallableRequest) -> dict:
     uid = require_auth(req)
     data = req.data or {}
@@ -310,15 +316,20 @@ def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
     ts = now_ms()
     normalized_phone = normalize_phone(phone)
 
+    # Store the RESOLVED dates (date_from/date_to/as_of above), never the raw
+    # request values: the UI sends a preset ("last_quarter") with no from/to,
+    # so saving data.get("from") would freeze None and the paid-for report
+    # could not be generated (or, for a balance sheet, would silently fall
+    # back to today's date).
     db.document(paths.report_alacarte_purchase(chama_id, reference)).set({
         "chamaId": chama_id,
         "reportType": report_type,
         "format": fmt,
         "encrypt": REPORT_TYPES[report_type]["encryptDefault"],
         "memberId": data.get("memberId"),
-        "dateFrom": data.get("from"),
-        "dateTo": data.get("to"),
-        "asOf": data.get("asOf"),
+        "dateFrom": date_from,
+        "dateTo": date_to,
+        "asOf": as_of,
         "amountKes": float(amount_kes),
         "phone": normalized_phone,
         "status": "pending",

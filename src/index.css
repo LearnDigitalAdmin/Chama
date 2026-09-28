@@ -85,6 +85,18 @@ input:focus, select:focus, textarea:focus {
 .btn-gold:hover { background: var(--color-gold-500); }
 .chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; font-weight: 600; }
 
+/* Renders MarkdownEditor's Preview tab (components/MarkdownEditor.tsx) —
+   Tailwind's Preflight strips default h2/h3/ul/blockquote styling, so
+   dangerouslySetInnerHTML output needs it back explicitly. */
+.md-preview h2 { font-family: theme(--font-display); font-weight: 700; font-size: 1.05rem; margin: 0 0 .35rem; color: var(--color-forest-900); }
+.md-preview h3 { font-family: theme(--font-display); font-weight: 700; font-size: .95rem; margin: 0 0 .3rem; color: var(--color-forest-900); }
+.md-preview p { margin: 0 0 .6rem; }
+.md-preview ul, .md-preview ol { margin: 0 0 .6rem 1.1rem; }
+.md-preview li { margin-bottom: .2rem; }
+.md-preview blockquote { border-left: 2px solid var(--color-gold-400); padding-left: .6rem; margin: 0 0 .6rem; color: rgba(18, 33, 28, .7); }
+.md-preview hr { border: none; border-top: 1px solid var(--color-forest-100); margin: .6rem 0; }
+.md-preview a { color: var(--color-forest-700); text-decoration: underline; }
+
 .nav-item.active { background: var(--color-forest-50); color: var(--color-forest-700); }
 
 @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }

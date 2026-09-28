@@ -1,7 +1,7 @@
 """
 Billing, reports & exports — Phase 4.
 
-Three callables plus two scheduled sweeps:
+Four callables plus two scheduled sweeps:
 
   upgradePlan        — chair-only. Changing to a plan with price > 0 follows
                         the EXACT same pending-payment pattern as
@@ -24,8 +24,16 @@ Three callables plus two scheduled sweeps:
                         — the single append-only source of truth for every
                         financial event — for [from, to], as PDF or CSV,
                         uploads it to Cloud Storage and returns a signed URL.
-                        Enforces PLANS[plan].exportsAllowed and
-                        minutesQuota/minutesExportsUsedThisMonth.
+                        Charged through the reports engine (credits / à la
+                        carte) — see shared/reports_engine.py.
+
+  recordMinutesExport — any active member. Logs a minutes PDF export against
+                        the SAME shared quota/credits as generateStatement
+                        (reports_engine.spend_credits, report type 'minutes').
+                        Renders nothing — the minutes PDF is now built
+                        entirely client-side (src/lib/minutesPdf.ts) so it
+                        works offline; this just keeps the server-owned usage
+                        counter honest, queued automatically if offline.
 
   sweep_plan_expiry          — daily. Downgrades lapsed paid plans to Free
                                 and sends a renewal reminder a few days out.
@@ -309,43 +317,6 @@ def _render_pdf(chama_name: str, rows: list[dict], names: dict, scope_label: str
     return buf.getvalue()
 
 
-def _render_minutes_pdf(chama_name: str, minute: dict) -> bytes:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
-
-    styles = getSampleStyleSheet()
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
-    story = [
-        Paragraph(chama_name, styles["Title"]),
-        Paragraph(minute.get("title", "Meeting minutes"), styles["Heading2"]),
-        Paragraph(f"{minute.get('date', '')}" + (f" &middot; {minute.get('venue')}" if minute.get("venue") else ""), styles["Normal"]),
-        Spacer(1, 6 * mm),
-    ]
-
-    def section(title: str, items: list[str]):
-        if not items:
-            return
-        story.append(Paragraph(title, styles["Heading3"]))
-        story.append(ListFlowable([ListItem(Paragraph(i, styles["Normal"])) for i in items], bulletType="bullet"))
-        story.append(Spacer(1, 4 * mm))
-
-    section("Attendees", minute.get("attendees") or [])
-    section("Agenda", minute.get("agenda") or [])
-    section("Resolutions", minute.get("resolutions") or [])
-    if minute.get("aob"):
-        story.append(Paragraph("Any other business", styles["Heading3"]))
-        story.append(Paragraph(minute["aob"], styles["Normal"]))
-        story.append(Spacer(1, 4 * mm))
-    if minute.get("nextMeeting"):
-        story.append(Paragraph(f"Next meeting: {minute['nextMeeting']}", styles["Normal"]))
-
-    doc.build(story)
-    return buf.getvalue()
-
-
 def _upload_and_sign(chama_id: str, filename: str, content: bytes, content_type: str) -> str:
     # See TOUCH_BASE.md "Go-live checklist" — the Cloud Functions runtime
     # service account needs roles/iam.serviceAccountTokenCreator on itself
@@ -363,15 +334,19 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
     with no credit charge at all when a member pulls their OWN, on any
     plan including Free — see reports_engine's spend_credits docstring
     and TOUCH_BASE.md "Reports engine — member self-serve carve-out"),
-    minutes export ('minutes' — standard tier), or a whole-chama/pot
-    statement ('cashflow' — PREMIUM tier as of this patch: Growth/Max
-    monthly allowance, or Starter/Basic via a paid alacarteReference from
-    purchasePremiumReportAlaCarte — see functions/mychama/reports.py).
+    or a whole-chama/pot statement ('cashflow' — PREMIUM tier as of the
+    reports engine: Growth/Max monthly allowance, or Starter/Basic via a
+    paid alacarteReference from purchasePremiumReportAlaCarte — see
+    functions/mychama/reports.py).
+
+    Minutes are NOT rendered here any more: the minutes PDF is built
+    entirely client-side (src/lib/minutesPdf.ts) and the export is logged
+    through recordMinutesExport below.
 
     Encryption: member_statement is always encrypted (PII); cashflow is
     optional (`data.get('encrypt')`, default off — chamas routinely share
-    an unencrypted whole-chama cashflow to the group); minutes is never
-    encrypted. See functions/shared/constants.py REPORT_TYPES.
+    an unencrypted whole-chama cashflow to the group). See
+    functions/shared/constants.py REPORT_TYPES.
     """
     uid = require_auth(req)
     data = req.data or {}
@@ -380,7 +355,6 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
     date_from = data.get("from")
     date_to = data.get("to")
     fmt = data.get("format")
-    minutes_id = data.get("minutesId")  # minimal, documented addition — see TOUCH_BASE.md
     pot_id = data.get("potId")  # optional — scopes the statement to one MGR pot, see mychama/mgr.py
     encrypt_requested = data.get("encrypt")
     alacarte_reference = data.get("alacarteReference")  # Starter/Basic consuming a paid whole-chama purchase
@@ -388,7 +362,7 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
 
     if not chama_id or fmt not in ("pdf", "csv"):
         raise bad_request("chamaId and a valid format ('pdf' or 'csv') are required.")
-    if not minutes_id and not period_preset and (not date_from or not date_to):
+    if not period_preset and (not date_from or not date_to):
         raise bad_request("A period (or from and to dates) is required.")
 
     db = _db()
@@ -406,17 +380,12 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
     chama = chama_snap.to_dict()
     chama_name = chama.get("name", "MyChama")
 
-    if not minutes_id and period_preset:
+    if period_preset:
         date_from, date_to = reports_engine.resolve_range(
             period_preset, date_from, date_to, chama.get("fiscalYearStartMonth", 1)
         )
 
-    if minutes_id:
-        report_key = "minutes"
-    elif member_id:
-        report_key = "member_statement"
-    else:
-        report_key = "cashflow"
+    report_key = "member_statement" if member_id else "cashflow"
 
     is_self_service = bool(member_id) and member_id == membership.member_id
 
@@ -447,31 +416,23 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
         pin = reports_engine.generate_pin() if encrypt else None
         encrypt_enc = reports_engine.build_encryption(pin) if pin else None
 
-        if minutes_id:
-            minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
-            if not minute_snap.exists:
-                raise not_found("Minutes not found.")
-            content = _render_minutes_pdf(chama_name, minute_snap.to_dict())
-            filename = f"minutes-{minutes_id}-{now_ms()}.pdf"
-            content_type = "application/pdf"
+        names = _member_name_map(db, chama_id)
+        pot_label = None
+        if pot_id:
+            pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
+            if not pot_snap.exists:
+                raise not_found("Merry-go-round pot not found.")
+            pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
+        base_label = names.get(member_id, "Member") if member_id else "Whole chama"
+        scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
+        rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
+        if fmt == "csv":
+            content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
+            content_type = "text/csv"
         else:
-            names = _member_name_map(db, chama_id)
-            pot_label = None
-            if pot_id:
-                pot_snap = db.document(paths.mgr_pot(chama_id, pot_id)).get()
-                if not pot_snap.exists:
-                    raise not_found("Merry-go-round pot not found.")
-                pot_label = pot_snap.to_dict().get("name", "Merry-go-round")
-            base_label = names.get(member_id, "Member") if member_id else "Whole chama"
-            scope_label = f"{pot_label} — {base_label}" if pot_label else base_label
-            rows = _fetch_transactions(db, chama_id, member_id, date_from, date_to, pot_id)
-            if fmt == "csv":
-                content = _render_csv(chama_name, rows, names, scope_label, date_from, date_to)
-                content_type = "text/csv"
-            else:
-                content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to, encrypt_enc)
-                content_type = "application/pdf"
-            filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
+            content = _render_pdf(chama_name, rows, names, scope_label, date_from, date_to, encrypt_enc)
+            content_type = "application/pdf"
+        filename = f"statement-{pot_id or member_id or 'chama'}-{date_from}-to-{date_to}-{_token(6)}.{fmt}"
 
         url = _upload_and_sign(chama_id, filename, content, content_type)
     except Exception:
@@ -489,6 +450,67 @@ def generateStatement(req: https_fn.CallableRequest) -> dict:
 def membership_phone(db, chama_id: str, member_id: str) -> str | None:
     snap = db.document(paths.member(chama_id, member_id)).get()
     return (snap.to_dict() or {}).get("phoneNormalized") if snap.exists else None
+
+
+# --------------------------------------------------------------------- #
+# recordMinutesExport
+# --------------------------------------------------------------------- #
+
+@https_fn.on_call(region=REGION)
+def recordMinutesExport(req: https_fn.CallableRequest) -> dict:
+    """
+    Logs a minutes PDF export against the SAME shared quota/credits as
+    generateStatement (reports_engine.spend_credits, report type 'minutes').
+    The legacy per-plan minutesQuota is retired — plan gating and monthly
+    allowance now live entirely in the reports engine.
+
+    The PDF itself is rendered and downloaded entirely client-side (see
+    src/lib/minutesPdf.ts) — there is nothing for this function to render
+    or upload. It exists only so the server-owned usage counters (see
+    firestore.rules) stay an honest count. Called through callables.ts'
+    queueable `callable()` wrapper, so offline it queues and replays here
+    later rather than blocking the download.
+
+    Any active member may call this — minutes are already readable by the
+    whole chama (see firestore.rules), unlike a whole-chama statement, so
+    this intentionally doesn't require the finance-admin role.
+
+    No counter is touched here directly: spend_credits already updates the
+    reports-engine counters (and keeps the LEGACY minutesExportsUsedThisMonth
+    in lockstep for standard-tier reports), so bumping it again here would
+    double-count.
+    """
+    uid = require_auth(req)
+    data = req.data or {}
+    chama_id = data.get("chamaId")
+    minutes_id = data.get("minutesId")
+    if not chama_id or not minutes_id:
+        raise bad_request("chamaId and minutesId are required.")
+
+    db = _db()
+    require_membership(db, uid, chama_id)
+
+    dedup = already_applied(db, chama_id, data.get("clientRequestId"))
+    if dedup is not None:
+        return dedup
+
+    minute_snap = db.document(f"{paths.minutes(chama_id)}/{minutes_id}").get()
+    if not minute_snap.exists:
+        raise not_found("Minutes not found.")
+
+    chama_ref = db.document(paths.chama(chama_id))
+    chama_snap = chama_ref.get()
+    if not chama_snap.exists:
+        raise not_found("Chama not found.")
+    chama = chama_snap.to_dict()
+
+    # Plan gating / credit spend — raises a precondition error if the plan
+    # or monthly allowance doesn't cover another minutes export.
+    charge_info = reports_engine.spend_credits(db, chama_ref, chama, "minutes")
+
+    result = {"charge": charge_info}
+    record_result(db, chama_id, data.get("clientRequestId"), result)
+    return result
 
 
 # --------------------------------------------------------------------- #

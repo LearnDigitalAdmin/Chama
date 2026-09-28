@@ -77,6 +77,7 @@ from mychama.sms import (  # noqa: E402,F401
 from mychama.billing import (  # noqa: E402,F401
     upgradePlan,
     generateStatement,
+    recordMinutesExport,
     sweep_plan_expiry,
     reset_monthly_export_quota,
 )

@@ -407,6 +407,9 @@ export interface Minute {
   venue?: string;
   chairPresent?: boolean;
   attendees: string[];
+  /** Roster members ticked absent, snapshotted at recording time. Optional
+   *  — minutes recorded before this field existed simply omit it. */
+  absentees?: string[];
   agenda: string[];
   resolutions: string[];
   aob?: string;
