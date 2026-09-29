@@ -333,8 +333,12 @@ export interface PaymentIntent {
   installmentNo?: number;
   potId?: string;
   potPeriod?: number;
+  /** MGR only: settles this open arrear instead of the pot's current period. */
+  arrearId?: string;
   splitCode: string;
   paystackMessage?: string;
+  /** Set when the PAY webhook couldn't apply this to its target and credited the member instead. */
+  applyNote?: string;
   createdAt: number;
   updatedAt: number;
   expiresAt: number;

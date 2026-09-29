@@ -359,8 +359,18 @@ class PaymentIntent(TypedDict):
     installmentNo: NotRequired[Optional[int]]
     potId: NotRequired[Optional[str]]
     potPeriod: NotRequired[Optional[int]]
+    # MGR only: when set, this payment settles this open arrear instead of
+    # the pot's current period (see mychama/mgr.py's MgrArrear). Written by
+    # the WhatsApp bot; applied by the PAY repo's webhook.
+    arrearId: NotRequired[Optional[str]]
     splitCode: str
     paystackMessage: NotRequired[str]
+    # Set by the PAY webhook when a payment couldn't be applied to its
+    # intended target and was credited to the member instead (target
+    # missing/closed, already settled, period rolled over, etc.) — surfaced
+    # to finance admins so a "successful" payment that became credit is
+    # never silently indistinguishable from one that hit its target.
+    applyNote: NotRequired[str]
     createdAt: int
     updatedAt: int
     expiresAt: int

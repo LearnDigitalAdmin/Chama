@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import io
 import secrets as pysecrets
+import urllib.request
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -336,13 +337,45 @@ def admin_pin_recipients(db, chama_id: str) -> list[str]:
     return [m["phoneNormalized"] for m in admins if m.get("role") in ("chair", "treasurer") and m.get("phoneNormalized")]
 
 
+def get_service_account_email() -> str | None:
+    """
+    Fetches the runtime service account email from the GCP Metadata Server.
+    Only reachable from inside GCP compute (Cloud Functions/Cloud Run/GCE) —
+    fails closed (returns None) anywhere else, e.g. local emulation, so
+    upload_and_sign's fallback there is to let the client library try its
+    own default signing behavior. 2s timeout so a signing call never hangs
+    if metadata is unexpectedly unreachable.
+    """
+    try:
+        url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email"
+        req = urllib.request.Request(url)
+        req.add_header("Metadata-Flavor", "Google")
+        with urllib.request.urlopen(req, timeout=2) as response:
+            return response.read().decode("utf-8")
+    except Exception:
+        return None
+
+
 def upload_and_sign(chama_id: str, filename: str, content: bytes, content_type: str, ttl) -> str:
     bucket = storage.bucket(REGION_STORAGE_BUCKET)
     blob = bucket.blob(f"statements/{chama_id}/{filename}")
     blob.upload_from_string(content, content_type=content_type)
-    return blob.generate_signed_url(version="v4", expiration=ttl, method="GET")
 
+    import google.auth
+    from google.auth.transport import requests as gauth_requests
 
+    credentials, _ = google.auth.default()
+    credentials.refresh(gauth_requests.Request())
+
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=ttl,
+        method="GET",
+        service_account_email=credentials.service_account_email,
+        access_token=credentials.token,
+    )
+
+    
 # --------------------------------------------------------------------- #
 # Shared small helpers used by more than one builder below.
 # --------------------------------------------------------------------- #

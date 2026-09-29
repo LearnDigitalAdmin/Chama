@@ -1,0 +1,40 @@
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 9c27fc7..71289d6 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -359,8 +359,18 @@ class PaymentIntent(TypedDict):
+     installmentNo: NotRequired[Optional[int]]
+     potId: NotRequired[Optional[str]]
+     potPeriod: NotRequired[Optional[int]]
++    # MGR only: when set, this payment settles this open arrear instead of
++    # the pot's current period (see mychama/mgr.py's MgrArrear). Written by
++    # the WhatsApp bot; applied by the PAY repo's webhook.
++    arrearId: NotRequired[Optional[str]]
+     splitCode: str
+     paystackMessage: NotRequired[str]
++    # Set by the PAY webhook when a payment couldn't be applied to its
++    # intended target and was credited to the member instead (target
++    # missing/closed, already settled, period rolled over, etc.) — surfaced
++    # to finance admins so a "successful" payment that became credit is
++    # never silently indistinguishable from one that hit its target.
++    applyNote: NotRequired[str]
+     createdAt: int
+     updatedAt: int
+     expiresAt: int
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 06e37c6..8c99d0b 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -333,8 +333,12 @@ export interface PaymentIntent {
+   installmentNo?: number;
+   potId?: string;
+   potPeriod?: number;
++  /** MGR only: settles this open arrear instead of the pot's current period. */
++  arrearId?: string;
+   splitCode: string;
+   paystackMessage?: string;
++  /** Set when the PAY webhook couldn't apply this to its target and credited the member instead. */
++  applyNote?: string;
+   createdAt: number;
+   updatedAt: number;
+   expiresAt: number;
