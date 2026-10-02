@@ -7,6 +7,8 @@ import { useChama } from './ChamaProvider';
 import { NAV, BOTTOM_NAV } from './navConfig';
 import { NavIcons } from './NavIcons';
 import { SyncPill, OfflineBanner } from './SyncPill';
+import BrandMark from '../brand/BrandMark';
+import InstallButton from '../pwa/InstallButton';
 
 export default function AppShell() {
   const { user } = useAuth();
@@ -30,9 +32,7 @@ export default function AppShell() {
       {/* Desktop sidebar */}
       <aside className="hidden md:flex w-60 shrink-0 border-r border-forest-100 bg-white flex-col min-h-0">
         <div className="h-16 flex items-center gap-2 px-5 border-b border-forest-100">
-          <div className="w-7 h-7 rounded-md bg-forest-700 flex items-center justify-center text-gold-300 font-display font-bold text-sm">
-            M
-          </div>
+          <BrandMark size={28} />
           <span className="font-display font-semibold text-ink">MyChama</span>
         </div>
 
@@ -86,6 +86,7 @@ export default function AppShell() {
             {chama && <p className="text-xs text-forest-900/50 truncate">{chama.name}</p>}
           </div>
           <div className="flex items-center gap-2 md:gap-3 shrink-0">
+            <InstallButton />
             <div className="md:hidden">
               <SyncPill />
             </div>

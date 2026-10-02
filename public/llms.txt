@@ -1,0 +1,22 @@
+# MyChama
+
+> MyChama is chama (Kenyan savings and investment group) management software by Samuhia: one offline-ready, installable web app for members, contributions, loans, merry-go-round rotations, M-Pesa and Paystack collections, bulk SMS, meeting minutes and financial reports. Free plan available; paid plans priced in KES per month.
+
+MyChama does not hold chama funds — online payments are processed by Paystack and settle to the chama's own account. The public site is a single landing page; the signed-in app lives under /app and is private.
+
+## Key pages
+
+- [Home — overview, features and how it works](https://chama.samuhia.co.ke/): what MyChama does and who it is for
+- [Pricing](https://chama.samuhia.co.ke/#pricing): plans from Free to Max, in KES per month
+- [FAQ](https://chama.samuhia.co.ke/#faq): safety of funds, offline use, loans, merry-go-round, reports, SMS
+- [Get the app](https://chama.samuhia.co.ke/#get-the-app): install on Android, iPhone or desktop — no app store needed
+
+## Machine-readable detail
+
+- [Full product brief for LLMs](https://chama.samuhia.co.ke/llms-full.txt): features, current pricing, every FAQ answer, and notes for AI assistants (generated from the live site content)
+- [Sitemap](https://chama.samuhia.co.ke/sitemap.xml)
+
+## Optional
+
+- [Sign in](https://chama.samuhia.co.ke/signin): for existing chama members and officials
+- [Create a chama](https://chama.samuhia.co.ke/create-chama): start a new chama on the Free plan

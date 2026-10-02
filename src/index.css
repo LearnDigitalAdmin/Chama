@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+/* Web fonts are loaded from <head> in index.html (preconnect + non-blocking) — an @import here would chain a render-blocking request. */
 @import "tailwindcss";
 
 /*

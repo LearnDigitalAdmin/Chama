@@ -1,0 +1,12 @@
+{
+  "key": "mychama",
+  "name": "MyChama",
+  "descriptor": "GROUP FINANCE",
+  "primary": "#0E5C4A",
+  "accent": "#D9993A",
+  "darkPrimary": "#0E5C4A",
+  "tile": "#0E5C4A",
+  "themeColor": "#0E5C4A",
+  "backgroundColor": "#0E5C4A",
+  "source": "samuhia-site-logo-studio.html"
+}

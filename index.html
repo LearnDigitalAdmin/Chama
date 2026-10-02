@@ -1,14 +1,91 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>MyChama — Run your chama without the group-admin headache</title>
-<meta name="description" content="MyChama is the operations platform for Kenyan chamas: members, contributions, loans, M-Pesa/Paystack collections, bulk SMS, and meeting minutes.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌿</text></svg>">
-</head>
-<body>
-<div id="root"></div>
-<script type="module" src="/src/main.tsx"></script>
-</body>
+<!doctype html>
+<html lang="en-KE">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- Primary SEO (per-route values are updated at runtime by src/seo/RouteSeo.tsx) -->
+    <title>MyChama — Chama Management App for Kenya | Contributions, Loans, Merry-Go-Round</title>
+    <meta name="description" content="Run your chama from one offline-ready app: members, contributions, loans, merry-go-round rotations, M-Pesa &amp; Paystack collections, bulk SMS and minutes. Free plan available." />
+    <meta name="keywords" content="chama app Kenya, chama management software, chama contributions tracker, merry-go-round app, table banking app, chama loans calculator, M-Pesa chama, chama SMS reminders, chama minutes, MyChama, Samuhia" />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+    <meta name="author" content="Samuhia" />
+    <link rel="canonical" href="https://chama.samuhia.co.ke/" />
+    <link rel="alternate" hreflang="en-KE" href="https://chama.samuhia.co.ke/" />
+    <link rel="alternate" hreflang="x-default" href="https://chama.samuhia.co.ke/" />
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="LLM-readable site summary" />
+    <link rel="sitemap" type="application/xml" href="/sitemap.xml" />
+
+    <!-- Open Graph / social -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MyChama" />
+    <meta property="og:locale" content="en_KE" />
+    <meta property="og:title" content="MyChama — Chama Management App for Kenya" />
+    <meta property="og:description" content="Members, contributions, loans, merry-go-round, M-Pesa &amp; Paystack collections, bulk SMS and minutes — offline-ready and installable on your phone." />
+    <meta property="og:url" content="https://chama.samuhia.co.ke/" />
+    <meta property="og:image" content="https://chama.samuhia.co.ke/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="MyChama — chama management app by Samuhia" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="MyChama — Chama Management App for Kenya" />
+    <meta name="twitter:description" content="Members, contributions, loans, merry-go-round, M-Pesa &amp; Paystack collections, bulk SMS and minutes — offline-ready and installable." />
+    <meta name="twitter:image" content="https://chama.samuhia.co.ke/og-image.png" />
+    <meta name="twitter:image:alt" content="MyChama — chama management app by Samuhia" />
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="application-name" content="MyChama" />
+    <meta name="theme-color" content="#0E5C4A" />
+    <meta name="color-scheme" content="light" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="MyChama" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta name="msapplication-TileColor" content="#0E5C4A" />
+    <meta name="msapplication-TileImage" content="/icons/icon-144x144.png" />
+
+    <!-- Icons (generated from the SAMUHIA Logo Studio: tools/brand) -->
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16x16.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-640-1136.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-750-1334.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-828-1792.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1125-2436.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1170-2532.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1179-2556.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1206-2622.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1242-2208.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1242-2688.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 420px) and (device-height: 912px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1260-2736.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1284-2778.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1290-2796.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="/icons/apple-splash-1320-2868.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 744px) and (device-height: 1133px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1488-2266.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 768px) and (device-height: 1024px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1536-2048.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 810px) and (device-height: 1080px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1620-2160.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1640-2360.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 834px) and (device-height: 1112px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1668-2224.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 834px) and (device-height: 1194px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-1668-2388.png" />
+    <link rel="apple-touch-startup-image" media="screen and (device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="/icons/apple-splash-2048-2732.png" />
+
+    <!-- Fonts: preconnect + non-blocking stylesheet (was a render-blocking @import in index.css) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" media="print" onload="this.media='all'" />
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" /></noscript>
+
+    <!-- Structured data: generated at build time by tools/vite-plugin-pwa-seo.ts from src/marketing/content.ts -->
+    <!--seo:jsonld-->
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Crawler/LLM-readable copy for clients that don't run JavaScript. Generated from the same content. -->
+    <!--seo:noscript-->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

@@ -1,0 +1,30 @@
+{
+  "id": "/",
+  "name": "MyChama — Chama Management",
+  "short_name": "MyChama",
+  "description": "Run your chama from one offline-ready app: members, contributions, loans, merry-go-round, M-Pesa & Paystack collections, SMS and minutes.",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "theme_color": "#0E5C4A",
+  "background_color": "#0E5C4A",
+  "lang": "en-KE",
+  "dir": "ltr",
+  "categories": ["finance", "business", "productivity"],
+  "prefer_related_applications": false,
+  "launch_handler": { "client_mode": ["navigate-existing", "auto"] },
+  "icons": [
+    { "src": "/icons/icon-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/manifest-icon-192.maskable.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/manifest-icon-512.maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Contributions", "short_name": "Contribute", "url": "/app/contributions?source=shortcut", "icons": [{ "src": "/icons/icon-96x96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Loans", "short_name": "Loans", "url": "/app/loans?source=shortcut", "icons": [{ "src": "/icons/icon-96x96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Merry-go-round", "short_name": "MGR", "url": "/app/mgr?source=shortcut", "icons": [{ "src": "/icons/icon-96x96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Minutes", "short_name": "Minutes", "url": "/app/minutes?source=shortcut", "icons": [{ "src": "/icons/icon-96x96.png", "sizes": "96x96", "type": "image/png" }] }
+  ]
+}

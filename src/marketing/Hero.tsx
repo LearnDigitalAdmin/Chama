@@ -10,22 +10,10 @@
  */
 
 import { Link } from 'react-router-dom';
-
-const FEATURES: { title: string; body: string; badge?: string }[] = [
-  { title: 'Members management', body: 'Profiles, ID/KYC details, join dates and standing — searchable from any admin\u2019s phone.' },
-  { title: 'Contributions', body: 'Set the cycle and amount once. Collect by Paystack or record cash in two taps — every member\u2019s ledger updates itself.' },
-  {
-    title: 'Merry-go-round rotations',
-    body: 'Daily, weekly or monthly table-banking pots with a fair lottery draw, live collection tracking, and members who miss payments automatically pushed to the back of the queue.',
-    badge: 'New',
-  },
-  { title: 'Loans, flat or reducing', body: 'Run flat-rate and reducing-balance products side by side. Schedules, arrears and payoffs calculate themselves.' },
-  { title: 'Bulk SMS to your members', body: 'One-way announcements and reminders, sent from SAMUHIA — no app required on their end to receive them.' },
-  { title: 'Paystack payments & auto-settlement', body: 'Collections and disbursements move through Paystack, with settlements to your chama account on a schedule you set.' },
-  { title: 'Minutes writer', body: 'Type the agenda and resolutions — MyChama formats and exports proper meeting minutes as a PDF.' },
-  { title: 'Works with no signal', body: 'Meetings often happen where the network doesn\u2019t reach. MyChama keeps working and syncs everything once you\u2019re back online.' },
-  { title: 'Three officials, one record', body: 'Chair, treasurer and secretary each get the right permissions — nobody\u2019s overwriting anybody\u2019s update.' },
-];
+import BrandMark from '../brand/BrandMark';
+import InstallButton from '../pwa/InstallButton';
+import { FEATURES, SEO_COPY } from './content';
+import { FaqSection, GetTheApp, HowItWorks, PricingSection } from './Sections';
 
 export default function Hero() {
   return (
@@ -33,12 +21,17 @@ export default function Hero() {
       <header className="sticky top-0 z-40 bg-paper/90 backdrop-blur border-b border-forest-100">
         <div className="max-w-6xl mx-auto px-5 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-forest-700 flex items-center justify-center text-gold-300 font-display font-bold text-base">
-              M
-            </div>
+            <BrandMark size={32} />
             <span className="font-display font-semibold text-lg tracking-tight">MyChama</span>
           </div>
+          <nav aria-label="Primary" className="hidden lg:flex items-center gap-6 text-sm font-medium text-forest-900/70">
+            <a href="#features" className="hover:text-forest-700">Features</a>
+            <a href="#pricing" className="hover:text-forest-700">Pricing</a>
+            <a href="#faq" className="hover:text-forest-700">FAQ</a>
+            <a href="#get-the-app" className="hover:text-forest-700">Get the app</a>
+          </nav>
           <div className="flex items-center gap-2">
+            <InstallButton />
             <Link to="/signin" className="hidden sm:inline-block text-sm font-semibold text-forest-800 px-3 py-2 hover:text-forest-600">
               Log in
             </Link>
@@ -58,7 +51,7 @@ export default function Hero() {
           <div className="fade-up">
             <p className="text-forest-600 font-semibold text-sm mb-4">Built for chamas in Kenya</p>
             <h1 className="font-display text-4xl md:text-[2.75rem] leading-[1.08] font-semibold text-ink">
-              Run your chama without turning it into someone's part-time job.
+              {SEO_COPY.h1}
             </h1>
             <p className="mt-5 text-[17px] leading-relaxed text-forest-900/80 max-w-lg">
               MyChama gives your treasurer, chair and secretary one shared, offline-ready app for members,
@@ -146,9 +139,9 @@ export default function Hero() {
         </section>
 
         {/* FEATURES */}
-        <section className="max-w-6xl mx-auto px-5 py-20">
+        <section id="features" aria-labelledby="features-h" className="max-w-6xl mx-auto px-5 py-20">
           <div className="max-w-lg mb-12">
-            <h2 className="font-display text-3xl font-semibold text-ink">Everything your officials juggle today, in one app.</h2>
+            <h2 id="features-h" className="font-display text-3xl font-semibold text-ink">Everything your officials juggle today, in one app.</h2>
             <p className="mt-3 text-forest-900/70">
               Not a spreadsheet with a login page. MyChama enforces your chama's own rules automatically, so
               contributions and loans stay consistent even when three different people are updating them from three
@@ -165,6 +158,11 @@ export default function Hero() {
             ))}
           </div>
         </section>
+
+        <HowItWorks />
+        <PricingSection />
+        <FaqSection />
+        <GetTheApp />
 
         {/* CTA */}
         <section className="bg-forest-700 text-white">
@@ -185,8 +183,14 @@ export default function Hero() {
       </main>
 
       <footer className="border-t border-forest-100 py-8">
-        <div className="max-w-6xl mx-auto px-5 text-xs text-forest-900/50 flex items-center justify-between">
+        <div className="max-w-6xl mx-auto px-5 text-xs text-forest-900/50 flex flex-wrap items-center justify-between gap-3">
           <span>© {new Date().getFullYear()} MyChama</span>
+          <nav aria-label="Footer" className="flex gap-4">
+            <a href="#features" className="hover:text-forest-700">Features</a>
+            <a href="#pricing" className="hover:text-forest-700">Pricing</a>
+            <a href="#faq" className="hover:text-forest-700">FAQ</a>
+            <Link to="/signin" className="hover:text-forest-700">Sign in</Link>
+          </nav>
           <span>By Samuhia</span>
         </div>
       </footer>

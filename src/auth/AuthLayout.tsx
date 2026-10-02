@@ -1,14 +1,17 @@
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
+import BrandMark from '../brand/BrandMark';
+import InstallButton from '../pwa/InstallButton';
 
 export default function AuthLayout({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) {
   return (
     <div className="min-h-screen bg-paper flex flex-col">
       <header className="h-16 flex items-center px-5 border-b border-forest-100 bg-paper/90 backdrop-blur">
         <Link to="/" className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-forest-700 flex items-center justify-center text-gold-300 font-display font-bold">M</div>
+          <BrandMark size={32} />
           <span className="font-display font-semibold text-lg tracking-tight text-ink">MyChama</span>
         </Link>
+        <InstallButton className="ml-auto" />
       </header>
       <main className="flex-1 flex items-center justify-center px-5 py-10">
         <div className="w-full max-w-sm card shadow-card p-7">

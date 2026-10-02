@@ -25,15 +25,24 @@ import Settings from './features/settings/Settings';
 import Messages from './features/messages/Messages';
 import Hero from './marketing/Hero';
 import { useAuth } from './auth/AuthProvider';
+import PWAPrompts from './pwa/PWAPrompts';
+import { pwaManager } from './pwa/pwaManager';
+import RouteSeo from './seo/RouteSeo';
 
 function Root() {
   const { user, authReady } = useAuth();
   if (!authReady) return null;
-  return user ? <Home /> : <Hero />;
+  if (user) return <Home />;
+  // Launched from the home-screen icon while signed out: skip the marketing page, go straight to sign-in.
+  if (pwaManager.isStandalone()) return <Navigate to="/signin" replace />;
+  return <Hero />;
 }
 
 export default function App() {
   return (
+    <>
+      <RouteSeo />
+      <PWAPrompts />
     <Routes>
       <Route path="/" element={<Root />} />
       <Route path="/signin" element={<SignInLanding />} />
@@ -86,5 +95,6 @@ export default function App() {
 
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    </>
   );
 }

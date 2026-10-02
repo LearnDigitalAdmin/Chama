@@ -1,0 +1,18 @@
+{
+  "name": "samuhia-brand-tool",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Turns the SAMUHIA Logo Studio HTML into every favicon, PWA icon, splash screen and OG image a product site needs.",
+  "scripts": {
+    "brand:mychama": "node apply-brand.mjs --brand mychama",
+    "brand:myregister": "node apply-brand.mjs --brand myregister",
+    "brand:list": "node apply-brand.mjs --list"
+  },
+  "dependencies": {
+    "sharp": "^0.34.0"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}

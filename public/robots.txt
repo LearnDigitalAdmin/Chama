@@ -1,0 +1,28 @@
+# MyChama — https://chama.samuhia.co.ke
+# Public marketing page is open to search engines AND AI crawlers.
+# Private app routes are also protected with an X-Robots-Tag header (firebase.json).
+# To opt out of AI training/answer crawlers, remove the "AI crawlers" group below.
+
+User-agent: *
+Allow: /
+Disallow: /app/
+Disallow: /claim/
+
+# AI crawlers
+User-agent: GPTBot
+User-agent: OAI-SearchBot
+User-agent: ChatGPT-User
+User-agent: ClaudeBot
+User-agent: Claude-SearchBot
+User-agent: Claude-User
+User-agent: PerplexityBot
+User-agent: Perplexity-User
+User-agent: Google-Extended
+User-agent: Applebot-Extended
+User-agent: CCBot
+User-agent: Amazonbot
+Allow: /
+Disallow: /app/
+Disallow: /claim/
+
+Sitemap: https://chama.samuhia.co.ke/sitemap.xml
