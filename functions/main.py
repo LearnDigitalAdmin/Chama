@@ -26,6 +26,7 @@ from mychama.identity import (  # noqa: E402,F401
     removeMemberPermanently,
 )
 from mychama.triggers import on_member_write  # noqa: E402,F401
+from mychama.id_key import on_member_id_key  # noqa: E402,F401
 
 # --- Phase 2: Core Chama Operations ----------------------------------------
 from mychama.contributions import (  # noqa: E402,F401

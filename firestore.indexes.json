@@ -548,6 +548,20 @@
       "indexes": []
     },
     {
+      "collectionGroup": "members",
+      "fieldPath": "idKey",
+      "indexes": [
+        {
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION"
+        },
+        {
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION_GROUP"
+        }
+      ]
+    },
+    {
       "collectionGroup": "loans",
       "fieldPath": "schedule",
       "indexes": []

@@ -191,3 +191,8 @@ introduced by this global package:
   `smsTopUps` / `planBilling` / `reportCreditTopUps` /
   `reportAlacartePurchases` collections
 - `userChamas/{uid}/memberships/{chamaId}` sync trigger
+
+## 8. Cross-product identity key — `members.idKey`
+
+The PAY payments hub links a signed-in landlord/tenant to their chama memberships by National ID / passport number. The raw `members.idNumber` is index-exempt and must stay that way, so every member document also carries `idKey = HMAC_SHA256_hex(MYCHAMA_ID_PEPPER, "id:" + normalise(idNumber))` (normalise = uppercase, strip every non-alphanumeric). It is written only by the `on_member_id_key` trigger (`functions/mychama/id_key.py`), so every writer — the app, the WhatsApp bot, console edits — is covered. The pepper secret `MYCHAMA_ID_PEPPER` must hold the **same value** in this project and in PAY; rotating it means re-running `tools/backfill_id_key.py --apply`. Existing members are backfilled with that script (dry-run by default). Test vectors shared with PAY: `functions/tests/test_id_key.py`.
+

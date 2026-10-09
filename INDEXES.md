@@ -79,6 +79,8 @@
   - uid is looked up across chamas when linking an app account to existing memberships.
 - **`members.idNumber`** — exempted from indexing
   - Never indexed: the full National ID is written and read by document key only. Dropping its index removes it from every range scan and shrinks write cost.
+- **`members.idKey`** — ascending / collection, ascending / collection_group
+  - A keyed HMAC fingerprint of the normalised ID number (see `functions/shared/id_key.py`), maintained by the `on_member_id_key` trigger. It exists so the PAY payments hub can find a person's memberships by ID without indexing the raw `idNumber`. Equality lookups only.
 - **`loans.schedule`** — exempted from indexing
   - Loan schedules are large arrays read and written whole; indexing them would add an index entry per instalment field on every write for no query benefit.
 - **`loans.purpose`** — exempted from indexing

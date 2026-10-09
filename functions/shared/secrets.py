@@ -11,6 +11,7 @@ ONCE here and imported everywhere else. Set these with:
     firebase functions:secrets:set MYCHAMA_HP_SMS_PASSWORD
     firebase functions:secrets:set MYCHAMA_HP_SMS_APIKEY
     firebase functions:secrets:set MYCHAMA_HP_SMS_SENDERID
+    firebase functions:secrets:set MYCHAMA_ID_PEPPER      # HMAC pepper for members.idKey — MUST equal PAY's value
 """
 
 from __future__ import annotations
@@ -22,3 +23,4 @@ HP_USERID = SecretParam("MYCHAMA_HP_SMS_USERID")
 HP_PASSWORD = SecretParam("MYCHAMA_HP_SMS_PASSWORD")
 HP_APIKEY = SecretParam("MYCHAMA_HP_SMS_APIKEY")
 HP_SENDER_ID = SecretParam("MYCHAMA_HP_SMS_SENDERID")
+ID_PEPPER = SecretParam("MYCHAMA_ID_PEPPER")

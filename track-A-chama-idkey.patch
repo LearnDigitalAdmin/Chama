@@ -1,0 +1,290 @@
+diff --git a/INDEXES.md b/INDEXES.md
+index 73a58bc..f187746 100644
+--- a/INDEXES.md
++++ b/INDEXES.md
+@@ -79,6 +79,8 @@
+   - uid is looked up across chamas when linking an app account to existing memberships.
+ - **`members.idNumber`** — exempted from indexing
+   - Never indexed: the full National ID is written and read by document key only. Dropping its index removes it from every range scan and shrinks write cost.
++- **`members.idKey`** — ascending / collection, ascending / collection_group
++  - A keyed HMAC fingerprint of the normalised ID number (see `functions/shared/id_key.py`), maintained by the `on_member_id_key` trigger. It exists so the PAY payments hub can find a person's memberships by ID without indexing the raw `idNumber`. Equality lookups only.
+ - **`loans.schedule`** — exempted from indexing
+   - Loan schedules are large arrays read and written whole; indexing them would add an index entry per instalment field on every write for no query benefit.
+ - **`loans.purpose`** — exempted from indexing
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index b773539..13f27d9 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -191,3 +191,8 @@ introduced by this global package:
+   `smsTopUps` / `planBilling` / `reportCreditTopUps` /
+   `reportAlacartePurchases` collections
+ - `userChamas/{uid}/memberships/{chamaId}` sync trigger
++
++## 8. Cross-product identity key — `members.idKey`
++
++The PAY payments hub links a signed-in landlord/tenant to their chama memberships by National ID / passport number. The raw `members.idNumber` is index-exempt and must stay that way, so every member document also carries `idKey = HMAC_SHA256_hex(MYCHAMA_ID_PEPPER, "id:" + normalise(idNumber))` (normalise = uppercase, strip every non-alphanumeric). It is written only by the `on_member_id_key` trigger (`functions/mychama/id_key.py`), so every writer — the app, the WhatsApp bot, console edits — is covered. The pepper secret `MYCHAMA_ID_PEPPER` must hold the **same value** in this project and in PAY; rotating it means re-running `tools/backfill_id_key.py --apply`. Existing members are backfilled with that script (dry-run by default). Test vectors shared with PAY: `functions/tests/test_id_key.py`.
++
+diff --git a/firestore.indexes.json b/firestore.indexes.json
+index 9aba414..5f9da33 100644
+--- a/firestore.indexes.json
++++ b/firestore.indexes.json
+@@ -547,6 +547,20 @@
+       "fieldPath": "idNumber",
+       "indexes": []
+     },
++    {
++      "collectionGroup": "members",
++      "fieldPath": "idKey",
++      "indexes": [
++        {
++          "order": "ASCENDING",
++          "queryScope": "COLLECTION"
++        },
++        {
++          "order": "ASCENDING",
++          "queryScope": "COLLECTION_GROUP"
++        }
++      ]
++    },
+     {
+       "collectionGroup": "loans",
+       "fieldPath": "schedule",
+diff --git a/functions/main.py b/functions/main.py
+index d9c3b77..4ed8225 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -26,6 +26,7 @@ from mychama.identity import (  # noqa: E402,F401
+     removeMemberPermanently,
+ )
+ from mychama.triggers import on_member_write  # noqa: E402,F401
++from mychama.id_key import on_member_id_key  # noqa: E402,F401
+ 
+ # --- Phase 2: Core Chama Operations ----------------------------------------
+ from mychama.contributions import (  # noqa: E402,F401
+diff --git a/functions/mychama/id_key.py b/functions/mychama/id_key.py
+new file mode 100644
+index 0000000..57e6b65
+--- /dev/null
++++ b/functions/mychama/id_key.py
+@@ -0,0 +1,40 @@
++"""
++on_member_id_key — keeps members.idKey (see shared/id_key.py) in step with
++members.idNumber. A dedicated trigger rather than call-site changes because
++more than one writer creates members (the app's callables, the WhatsApp bot,
++manual console edits) and every one of them must end up keyed.
++
++Loop-safe: it only writes when the computed key differs from the stored one,
++so the write it makes re-triggers it exactly once and that second run is a
++no-op. It never logs the ID number or the key.
++"""
++
++from __future__ import annotations
++
++from firebase_functions import firestore_fn
++from firebase_admin import firestore
++
++from shared import firestore_paths as paths
++from shared.id_key import compute_id_key
++from shared.secrets import ID_PEPPER
++
++REGION = "africa-south1"
++
++
++@firestore_fn.on_document_written(
++    document=f"{paths.MC.CHAMAS}/{{chamaId}}/{paths.MC.MEMBERS}/{{memberId}}",
++    region=REGION,
++    secrets=[ID_PEPPER],
++)
++def on_member_id_key(event: firestore_fn.Event[firestore_fn.Change]) -> None:
++    after = event.data.after
++    if after is None or not after.exists:
++        return  # deleted — nothing to key
++
++    data = after.to_dict() or {}
++    want = compute_id_key(data.get("idNumber") or "", ID_PEPPER.value)
++    have = data.get("idKey") or ""
++    if want == have:
++        return
++
++    after.reference.update({"idKey": want if want else firestore.DELETE_FIELD})
+diff --git a/functions/shared/id_key.py b/functions/shared/id_key.py
+new file mode 100644
+index 0000000..f7458ba
+--- /dev/null
++++ b/functions/shared/id_key.py
+@@ -0,0 +1,35 @@
++"""
++members.idKey — a keyed, normalised fingerprint of a member's National ID /
++passport number, so another product (the PAY payments hub) can find a person's
++chama memberships WITHOUT the raw ID ever being indexed or sent around.
++
++Why it exists: members.idNumber is deliberately index-exempt (see INDEXES.md),
++so "find every member with this ID" is impossible on the raw field. idKey is a
++separate, indexed field.
++
++    idKey = HMAC_SHA256_hex(pepper, "id:" + normalize_id_number(idNumber))
++
++CROSS-REPO CONTRACT — must stay byte-for-byte identical to PAY's
++functions/src/mychama/config.ts (normalizeIdNumber / computeIdKey). The shared
++test vectors live in functions/tests/test_id_key.py and in PAY's
++docs/mychama/track-A-notes.md; change one, change both.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import re
++
++
++def normalize_id_number(raw: str) -> str:
++    """Uppercase and drop every non-alphanumeric: '12 345-678' -> '12345678'."""
++    return re.sub(r"[^A-Z0-9]", "", (raw or "").upper())
++
++
++def compute_id_key(raw_id_number: str, pepper: str) -> str:
++    """Hex HMAC-SHA256 of the normalised ID, or '' when there is nothing to key."""
++    normalized = normalize_id_number(raw_id_number)
++    if not normalized or not pepper:
++        return ""
++    return hmac.new(pepper.encode("utf-8"), f"id:{normalized}".encode("utf-8"), hashlib.sha256).hexdigest()
+diff --git a/functions/shared/secrets.py b/functions/shared/secrets.py
+index d9cf22c..ef3911a 100644
+--- a/functions/shared/secrets.py
++++ b/functions/shared/secrets.py
+@@ -11,6 +11,7 @@ ONCE here and imported everywhere else. Set these with:
+     firebase functions:secrets:set MYCHAMA_HP_SMS_PASSWORD
+     firebase functions:secrets:set MYCHAMA_HP_SMS_APIKEY
+     firebase functions:secrets:set MYCHAMA_HP_SMS_SENDERID
++    firebase functions:secrets:set MYCHAMA_ID_PEPPER      # HMAC pepper for members.idKey — MUST equal PAY's value
+ """
+ 
+ from __future__ import annotations
+@@ -22,3 +23,4 @@ HP_USERID = SecretParam("MYCHAMA_HP_SMS_USERID")
+ HP_PASSWORD = SecretParam("MYCHAMA_HP_SMS_PASSWORD")
+ HP_APIKEY = SecretParam("MYCHAMA_HP_SMS_APIKEY")
+ HP_SENDER_ID = SecretParam("MYCHAMA_HP_SMS_SENDERID")
++ID_PEPPER = SecretParam("MYCHAMA_ID_PEPPER")
+diff --git a/functions/tests/test_id_key.py b/functions/tests/test_id_key.py
+new file mode 100644
+index 0000000..ece7ba0
+--- /dev/null
++++ b/functions/tests/test_id_key.py
+@@ -0,0 +1,40 @@
++"""
++Checks for shared/id_key.py. The vectors below are the CROSS-LANGUAGE contract:
++PAY's functions/src/mychama/config.ts (computeIdKey) must produce the same hex
++for the same pepper — PAY's docs/mychama/track-A-notes.md lists the same set.
++
++Run:  python functions/tests/test_id_key.py   (exit code 1 on failure)
++"""
++import os, sys
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from shared.id_key import compute_id_key, normalize_id_number
++
++PEPPER = "test-pepper-123"
++VECTORS = [
++    ("12345678",    "12345678", "5f2b4873088e9d4ee7cb39de1b6f4723ba83bed014d882f445fc4b1e4a487d92"),
++    ("12 345-678",  "12345678", "5f2b4873088e9d4ee7cb39de1b6f4723ba83bed014d882f445fc4b1e4a487d92"),
++    ("a1234567",    "A1234567", "cc0d2069f3bb9ab2a64e6766739737d4c8cb6352e158ee4eebbc14cf8a342fdc"),
++    (" 0012.3456 ", "00123456", "d3286373afc9a2dde04e1ed56437c3088b820d5d2d2bab9c48459139b5a8b896"),
++    ("K-1234 567",  "K1234567", "8a11729bb5c2011f3ac0d43820ee9fc3995e567c5d8614ca7c154910af94ae21"),
++    ("",            "",         ""),
++    ("!!!",         "",         ""),
++]
++
++failures = []
++for raw, norm, key in VECTORS:
++    if normalize_id_number(raw) != norm:
++        failures.append(f"normalize {raw!r}: got {normalize_id_number(raw)!r}, want {norm!r}")
++    if compute_id_key(raw, PEPPER) != key:
++        failures.append(f"key {raw!r}: mismatch")
++
++if compute_id_key("12345678", "") != "":
++    failures.append("empty pepper must yield empty key")
++if compute_id_key("12345678", "other-pepper") == compute_id_key("12345678", PEPPER):
++    failures.append("different peppers must yield different keys")
++
++if failures:
++    print("FAIL")
++    for f in failures:
++        print(" -", f)
++    sys.exit(1)
++print(f"OK — {len(VECTORS)} vectors, pepper-sensitivity and empty-input cases pass")
+diff --git a/tools/backfill_id_key.py b/tools/backfill_id_key.py
+new file mode 100755
+index 0000000..7386f42
+--- /dev/null
++++ b/tools/backfill_id_key.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""
++One-off, idempotent backfill of members.idKey for members that existed before
++the on_member_id_key trigger was deployed.
++
++    export GOOGLE_CLOUD_PROJECT=mychama1          # runs with Application Default Credentials
++    export MYCHAMA_ID_PEPPER='<same value as the Secret Manager secret>'
++    python tools/backfill_id_key.py            # DRY RUN (default): counts only
++    python tools/backfill_id_key.py --apply    # writes, in batches
++
++Safe to re-run: members whose idKey already matches are skipped. Never prints
++ID numbers or keys — only counts.
++"""
++import argparse
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "functions"))
++
++import firebase_admin  # noqa: E402
++from firebase_admin import firestore  # noqa: E402
++
++from shared.id_key import compute_id_key  # noqa: E402
++
++BATCH = 400
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--apply", action="store_true", help="actually write (default is a dry run)")
++    args = ap.parse_args()
++
++    pepper = os.environ.get("MYCHAMA_ID_PEPPER", "")
++    if not pepper:
++        print("MYCHAMA_ID_PEPPER is not set", file=sys.stderr)
++        return 2
++
++    firebase_admin.initialize_app()
++    db = firestore.client()
++
++    seen = need = no_id = 0
++    batch = db.batch()
++    pending = 0
++    for snap in db.collection_group("members").stream():
++        seen += 1
++        data = snap.to_dict() or {}
++        want = compute_id_key(data.get("idNumber") or "", pepper)
++        have = data.get("idKey") or ""
++        if not want and not have:
++            no_id += 1
++            continue
++        if want == have:
++            continue
++        need += 1
++        if args.apply:
++            batch.update(snap.reference, {"idKey": want if want else firestore.DELETE_FIELD})
++            pending += 1
++            if pending >= BATCH:
++                batch.commit()
++                batch = db.batch()
++                pending = 0
++    if args.apply and pending:
++        batch.commit()
++
++    mode = "APPLIED" if args.apply else "DRY RUN"
++    print(f"[{mode}] members seen={seen} needing idKey={need} without an ID={no_id}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
