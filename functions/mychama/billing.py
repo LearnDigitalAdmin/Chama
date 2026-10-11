@@ -62,6 +62,7 @@ from firebase_functions import https_fn, scheduler_fn
 from shared import firestore_paths as paths
 from shared import ids
 from shared import paystack
+from mychama import desk_commission
 from shared import reports_engine
 from shared.constants import MC, PLAN_ORDER, PLANS, REPORT_TYPES
 from shared.dates import now_ms, today_iso, add_days_iso
@@ -164,6 +165,9 @@ def upgradePlan(req: https_fn.CallableRequest) -> dict:
     normalized_phone = normalize_phone(phone)
     amount = float(target_price)
 
+    # Desk commission (W2-A): built BEFORE the pending doc is written so a Paystack failure leaves nothing behind.
+    prepared = desk_commission.prepare_split(db, PAYSTACK_SECRET_KEY.value, chama, desk_commission.KIND_SUBSCRIPTION, amount)
+
     db.document(paths.plan_billing_doc(chama_id, reference)).set({
         "chamaId": chama_id,
         "fromPlan": current_plan,
@@ -174,6 +178,7 @@ def upgradePlan(req: https_fn.CallableRequest) -> dict:
         "requestedBy": uid,
         "createdAt": ts,
         "expiresAt": ts + 30 * 60 * 1000,
+        **({"deskCommission": prepared.desk_commission} if prepared else {}),
     })
 
     try:
@@ -185,6 +190,7 @@ def upgradePlan(req: https_fn.CallableRequest) -> dict:
             provider=detect_provider(phone),
             reference=reference,
             metadata={"chargeType": "mychama_plan_upgrade", "targetProject": "mychama1", "chamaId": chama_id, "toPlan": target_plan},
+            split_code=prepared.split_code if prepared else None,
         )
     except Exception as exc:  # noqa: BLE001
         db.document(paths.plan_billing_doc(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})

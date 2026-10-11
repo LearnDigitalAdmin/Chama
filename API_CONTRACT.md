@@ -301,3 +301,44 @@ Request:  { chamaId: string; memberId?: string; from: string; to: string; format
 Response: { url: string }
 Errors:   failed-precondition (exports not allowed on this plan, or quota exhausted)
 ```
+
+---
+
+## Samuhia Desk (W2-A)
+
+Access is one-way: desk reaches MyChama; MyChama never calls desk. Contract: desk's `functions-desk/src/contract.ts` (v4).
+
+### `publicCode`
+Every chama has `publicCode` (`SMC-0001`, ≥ 4 digits, grows past 99999) from the atomic counter
+`deskCounters/chamaPublicCode`; `publicCodes/{code}` reserves it (create-only) and resolves it to the chama id.
+Document ids are unchanged. New chamas get it in `createChama`; existing ones via `tools/backfill_public_codes.py`.
+
+### `addSupportAgent` / `removeSupportAgent` / `listSupportAgents`
+Caller: chair or treasurer. `agentCode` must match `^COG-\d{4,}$` (MyChama cannot verify a code exists in desk).
+Stored as `supportAgents.<COG-####> = { addedAt, addedBy }`; at most 5 desks. `COG-0000` is always present, listed
+`locked: true`, and rejected by add/remove.
+
+```ts
+addSupportAgent:    { chamaId; agentCode } -> { ok: true; added: boolean }   // added=false: already connected
+removeSupportAgent: { chamaId; agentCode } -> { ok: true }
+listSupportAgents:  { chamaId } -> { agents: { agentCode; name; addedAt; locked }[]; maxDesks: 5 }
+```
+
+### `createDeskRequest` / `listDeskRequests`
+Caller: any official. `createDeskRequest { chamaId, category, subject, message, alsoTopDesk, deskCode?, clientRequestId? }`
+writes an `OutboxSupportItem` (`status: "new"`) into this project's `desk_requests` (limit 5 per chama per Kenyan day,
+`resource-exhausted` beyond). Targets: the chosen connected desk, else the first connected non-top desk, else `["COG-0000"]`;
+`COG-0000` is added when `alsoTopDesk`. `listDeskRequests { chamaId }` returns the chama's items with the `deskStatus` and
+`responses` desk writes back.
+
+### `deskdelegate` (private HTTPS, POST only)
+`DelegateRequest -> DelegateResponse`. Cloud Run invoker is private; the desk runtime service account is the only invoker.
+Actions: `entity_info`, `validate_records`, `commit_records`, `schedule_sms`, `send_sms_now` (`dryRun`), `run_report`
+(four engine reports, link ≤ 15 min), `export_data` (`members`). The agent must be in `supportAgents` or be `COG-0000`.
+Effectful actions are idempotent by `requestId` (`chamas/{id}/deskDelegateLog`); every action writes `chamas/{id}/deskAudit`.
+Business refusals are HTTP 200 `{ ok:false, error:{code,message} }`.
+
+### Commissions
+Plan billing (`MCP-`), report credits (`MCX-`/`MCR-`) and SMS credits (`MCS-`) for a chama with `deskOwner.subaccountCode`
+carry a Paystack percentage split (`all-proportional`) from `shared/desk_split.py`; the intent stores
+`deskCommission: { agentCode, sharePct, rule }` for PAY's MyChama webhook. Contributions, loans and MGR never carry one.

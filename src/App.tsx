@@ -22,6 +22,7 @@ import Communication from './features/communication/Communication';
 import Billing from './features/billing/Billing';
 import Reports from './features/reports/Reports';
 import Settings from './features/settings/Settings';
+import DeskRequests from './features/desk/DeskRequests';
 import Messages from './features/messages/Messages';
 import Hero from './marketing/Hero';
 import { useAuth } from './auth/AuthProvider';
@@ -90,6 +91,7 @@ export default function App() {
         <Route path="reports" element={<Reports />} />
         <Route path="billing" element={<Billing />} />
         <Route path="settings" element={<Settings />} />
+        <Route path="desk-requests" element={<DeskRequests />} />
         <Route path="messages" element={<Messages />} />
       </Route>
 

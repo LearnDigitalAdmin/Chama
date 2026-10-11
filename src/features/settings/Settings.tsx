@@ -7,6 +7,7 @@ import { useChama } from '../../app/ChamaProvider';
 import { useMembers } from '../../app/useMembers';
 import Profile from '../profile/Profile';
 import { PLANS } from '../../lib/constants';
+import SupportAgents from './SupportAgents';
 
 export default function Settings() {
   const { membership } = useChama();
@@ -135,6 +136,10 @@ function AdminSettings() {
             <p>
               <span className="text-forest-900/50">Plan:</span> {PLANS[chama.plan].name}
             </p>
+            <p>
+              <span className="text-forest-900/50">Chama code:</span>{' '}
+              {chama.publicCode ? <span className="font-mono font-semibold">{chama.publicCode}</span> : <span className="text-forest-900/50">Being assigned</span>}
+            </p>
           </div>
         )}
       </div>
@@ -156,6 +161,8 @@ function AdminSettings() {
           ))}
         </div>
       </div>
+
+      {canManage && <SupportAgents chamaId={chamaId} />}
 
       <div className="card p-6">
         <p className="font-display font-semibold mb-3">More settings</p>

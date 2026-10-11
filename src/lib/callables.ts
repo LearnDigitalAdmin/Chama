@@ -429,3 +429,63 @@ export const purchasePremiumReportAlaCarte = liveCallable<
   },
   { reference: string; amountKes: number }
 >('purchasePremiumReportAlaCarte', 'Starting one-off report payment');
+
+// ---------------------------------------------------------------------------
+// Samuhia Desk — support agents and desk requests (functions/mychama/desk_support.py)
+// ---------------------------------------------------------------------------
+
+export interface SupportAgentRow {
+  agentCode: string;
+  name: string;
+  addedAt: number;
+  /** COG-0000 (the company desk): always present, cannot be added or removed. */
+  locked: boolean;
+}
+
+export type DeskRequestCategory = 'setup' | 'import' | 'sms' | 'payments' | 'reports' | 'account' | 'other';
+
+export interface DeskRequestRow {
+  id: string;
+  category: DeskRequestCategory;
+  subject: string;
+  message: string;
+  targetDeskCodes: string[];
+  /** new = waiting to be picked up, pulled = desk has it, rejected = desk could not read it. */
+  outboxStatus: 'new' | 'pulled' | 'rejected';
+  /** Written back by the desk. */
+  deskStatus?: 'new' | 'open' | 'answered' | 'closed';
+  responses: { at: number; byDeskCode: string; text: string }[];
+  error?: string;
+  createdAt: number;
+}
+
+/** Not queueable: the treasurer is waiting to see the desk connected. */
+export const addSupportAgent = liveCallable<{ chamaId: string; agentCode: string }, { ok: true; added: boolean }>(
+  'addSupportAgent',
+  'Connecting a support desk'
+);
+export const removeSupportAgent = liveCallable<{ chamaId: string; agentCode: string }, { ok: true }>(
+  'removeSupportAgent',
+  'Removing a support desk'
+);
+export const listSupportAgents = liveCallable<{ chamaId: string }, { agents: SupportAgentRow[]; maxDesks: number }>(
+  'listSupportAgents',
+  'Loading support desks'
+);
+/** Not queueable: the person needs to know the request really reached the outbox. clientRequestId makes a retry safe. */
+export const createDeskRequest = liveCallable<
+  {
+    chamaId: string;
+    category: DeskRequestCategory;
+    subject: string;
+    message: string;
+    alsoTopDesk: boolean;
+    deskCode?: string;
+    clientRequestId: string;
+  },
+  { id: string; targetDeskCodes: string[] }
+>('createDeskRequest', 'Sending your request');
+export const listDeskRequests = liveCallable<{ chamaId: string }, { requests: DeskRequestRow[] }>(
+  'listDeskRequests',
+  'Loading desk requests'
+);

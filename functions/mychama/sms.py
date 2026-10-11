@@ -18,6 +18,7 @@ from firebase_admin import firestore
 from shared import firestore_paths as paths
 from shared import ids
 from shared import paystack
+from mychama import desk_commission
 from shared.constants import MC, SECURITY
 from shared.dates import now_ms
 from shared.errors import bad_request, not_found, rate_limited, require_auth
@@ -91,18 +92,6 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
         )
         raise bad_request("chamaId, audience, and message are required.")
 
-    content_error = validate_sms_content(message)
-    if content_error:
-        logging.warning("sendSmsCampaign: content validation failed chamaId=%s error=%s", chama_id, content_error)
-        raise bad_request(content_error)
-
-    segments = count_sms_segments(message)
-    if segments is None:
-        logging.warning("sendSmsCampaign: message too long chamaId=%s len=%d", chama_id, len(message))
-        raise bad_request(
-            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
-        )
-
     db = _db()
     require_official(db, uid, chama_id)
     logging.info("sendSmsCampaign: uid=%s confirmed official for chamaId=%s", uid, chama_id)
@@ -115,49 +104,63 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
         )
         return dedup
 
-    chama_ref = db.document(paths.chama(chama_id))
-    chama_snap = chama_ref.get()
+    chama_snap = db.document(paths.chama(chama_id)).get()
     if not chama_snap.exists:
         logging.warning("sendSmsCampaign: chama not found chamaId=%s", chama_id)
         raise not_found("Chama not found.")
-    chama = chama_snap.to_dict()
-    logging.info("sendSmsCampaign: chamaId=%s segments=%d", chama_id, segments)
 
-    recipients = _recipients(db, chama_id, audience, data.get("memberIds"))
-    pre_filter_count = len(recipients)
+    result = send_campaign(db, chama_id, chama_snap.to_dict(), audience, message, data.get("memberIds"), sent_by=uid)
+    logging.info("sendSmsCampaign: complete result=%s", result)
+    record_result(db, chama_id, data.get("clientRequestId"), result)
+    return result
+
+
+def plan_campaign(db, chama_id: str, chama: dict, audience: str, message: str, member_ids: list[str] | None) -> dict:
+    """
+    The rules for one campaign, shared by sendSmsCampaign and desk's schedule_sms/send_sms_now: content and
+    segment validation, recipient resolution + opt-in/phone filter, 1 credit per segment per recipient.
+    Returns {"recipients", "segments", "cost", "credits"}. Raises HttpsError on a rule failure.
+    """
+    content_error = validate_sms_content(message)
+    if content_error:
+        raise bad_request(content_error)
+    segments = count_sms_segments(message)
+    if segments is None:
+        raise bad_request(
+            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
+        )
+    recipients = _recipients(db, chama_id, audience, member_ids)
     recipients = [m for m in recipients if m.get("phoneNormalized") and m.get("whatsappOptIn", True) is not False]
-    logging.info(
-        "sendSmsCampaign: recipients raw=%d after phone/optIn filter=%d",
-        pre_filter_count, len(recipients),
-    )
-    if not recipients:
-        logging.warning(
-            "sendSmsCampaign: no eligible recipients after filtering chamaId=%s audience=%s",
-            chama_id, audience,
-        )
-        return {"sent": 0, "creditsUsed": 0}
+    # 1 credit per SMS segment per recipient — flat across every plan tier. PLANS[plan].smsRate is the KES
+    # price per credit at top-up time and must not be multiplied in here.
+    return {
+        "recipients": recipients,
+        "segments": segments,
+        "cost": segments * len(recipients),
+        "credits": chama.get("smsCredits", 0),
+    }
 
-    # 1 credit per SMS segment per recipient — flat across every plan tier.
-    # PLANS[plan].smsRate is the KES price paid per credit at top-up time;
-    # it must not be multiplied in here (that was the bug: it made a send
-    # cost 0.9/0.7/0.5 credits instead of a whole credit per segment).
-    cost = segments * len(recipients)
-    credits = chama.get("smsCredits", 0)
-    logging.info(
-        "sendSmsCampaign: cost=%s available credits=%s recipients=%d segments=%d",
-        cost, credits, len(recipients), segments,
-    )
+
+def send_campaign(
+    db, chama_id: str, chama: dict, audience: str, message: str, member_ids: list[str] | None, *, sent_by: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Sends (or, with dry_run, only counts) one campaign through MyChama's own credits and HostPinnacle path.
+    Must be called from a function that declares the HP_* secrets. Returns
+    {"sent", "creditsUsed", "recipients", "creditsRemaining"}; the callable adds nothing to it.
+    """
+    plan = plan_campaign(db, chama_id, chama, audience, message, member_ids)
+    recipients, segments, cost, credits = plan["recipients"], plan["segments"], plan["cost"], plan["credits"]
+    if not recipients:
+        return {"sent": 0, "creditsUsed": 0, "recipients": 0, "creditsRemaining": credits}
+    if dry_run:  # a quote: count only, never charge or send, and never fail on a low balance
+        return {"sent": 0, "creditsUsed": 0, "recipients": len(recipients), "creditsRemaining": credits, "wouldUse": cost}
     if credits < cost:
-        logging.warning(
-            "sendSmsCampaign: insufficient credits chamaId=%s need=%s have=%s",
-            chama_id, cost, credits,
-        )
         raise rate_limited(f"Not enough SMS credits — this send needs {cost}, you have {credits}. Top up first.")
 
     sent = 0
     failed = 0
-    ts = now_ms()
-    logging.info("sendSmsCampaign: entering send loop, %d recipients", len(recipients))
     for member in recipients:
         phone = member.get("phoneNormalized")
         try:
@@ -170,38 +173,31 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
                 message=message,
             )
             sent += 1
-            logging.info("sendSmsCampaign: sent OK memberId=%s phone=%s", member.get("id"), phone)
         except Exception as e:  # noqa: BLE001 — one failed send must not abort the whole campaign
             failed += 1
             logging.error(
-                "sendSmsCampaign: send FAILED memberId=%s phone=%s error=%s: %s",
-                member.get("id"), phone, type(e).__name__, e,
+                "send_campaign: send FAILED memberId=%s phone=%s error=%s: %s", member.get("id"), phone, type(e).__name__, e,
             )
-            continue
-
-    logging.info("sendSmsCampaign: send loop done sent=%d failed=%d", sent, failed)
+    logging.info("send_campaign: chamaId=%s sent=%d failed=%d", chama_id, sent, failed)
 
     actual_cost = segments * sent
-    chama_ref.update({"smsCredits": credits - actual_cost, "updatedAt": ts})
+    ts = now_ms()
+    chama_ref = db.document(paths.chama(chama_id))
+    # Decrement atomically: the balance read above may be stale if another send ran meanwhile.
+    chama_ref.update({"smsCredits": firestore.Increment(-actual_cost), "updatedAt": ts})
     db.collection(paths.sms_log(chama_id)).document().set({
         "audience": audience,
         "message": message,
-        # The member IDs this campaign was addressed to (regardless of
-        # individual SMS delivery success) — this is what the in-app
-        # Messages inbox (Phase 4) filters on, so a member sees a message
-        # here even if their SMS itself failed to deliver.
+        # The member IDs this campaign was addressed to (regardless of individual SMS delivery success) —
+        # the in-app Messages inbox filters on this.
         "recipientIds": [m["id"] for m in recipients],
         "recipientCount": len(recipients),
         "sentCount": sent,
         "creditsUsed": actual_cost,
-        "sentBy": uid,
+        "sentBy": sent_by,
         "createdAt": ts,
     })
-
-    result = {"sent": sent, "creditsUsed": actual_cost}
-    logging.info("sendSmsCampaign: complete result=%s", result)
-    record_result(db, chama_id, data.get("clientRequestId"), result)
-    return result
+    return {"sent": sent, "creditsUsed": actual_cost, "recipients": len(recipients), "creditsRemaining": credits - actual_cost}
 
 
 @https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
@@ -230,6 +226,14 @@ def purchaseSmsCredits(req: https_fn.CallableRequest) -> dict:
     ts = now_ms()
     normalized_phone = normalize_phone(phone)
 
+    # Desk commission (W2-A): SMS = 40% of margin; prepared before the pending doc so a failure leaves nothing behind.
+    chama_snap = db.document(paths.chama(chama_id)).get()
+    if not chama_snap.exists:
+        raise not_found("Chama not found.")
+    prepared = desk_commission.prepare_split(
+        db, PAYSTACK_SECRET_KEY.value, chama_snap.to_dict() or {}, desk_commission.KIND_SMS, float(amount_kes)
+    )
+
     db.document(paths.sms_topup(chama_id, reference)).set({
         "chamaId": chama_id,
         "amountKes": float(amount_kes),
@@ -237,6 +241,7 @@ def purchaseSmsCredits(req: https_fn.CallableRequest) -> dict:
         "status": "pending",
         "createdAt": ts,
         "expiresAt": ts + SECURITY["PAYMENT_INTENT_TTL_SECONDS"] * 1000,
+        **({"deskCommission": prepared.desk_commission} if prepared else {}),
     })
 
     try:
@@ -248,6 +253,7 @@ def purchaseSmsCredits(req: https_fn.CallableRequest) -> dict:
             provider=detect_provider(phone),
             reference=reference,
             metadata={"chargeType": "mychama_sms_topup", "targetProject": "mychama1", "chamaId": chama_id},
+            split_code=prepared.split_code if prepared else None,
         )
     except Exception as exc:  # noqa: BLE001
         db.document(paths.sms_topup(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})

@@ -14,6 +14,14 @@ function Icon(props: SVGProps<SVGSVGElement> & { d: string }) {
 
 export const NavIcons: Record<string, (props: SVGProps<SVGSVGElement>) => JSX.Element> = {
   dashboard: (p) => <Icon d="M3 13h8V3H3v10Zm10 8h8V3h-8v18ZM3 21h8v-6H3v6Z" {...p} />,
+  desk: (p) => (
+    <svg {...base} {...p}>
+      <path d="M4 14v-2a8 8 0 0 1 16 0v2" />
+      <rect x="2.5" y="13" width="4" height="6" rx="1.5" />
+      <rect x="17.5" y="13" width="4" height="6" rx="1.5" />
+      <path d="M19.5 19c0 1.5-1.8 2.5-5 2.5" />
+    </svg>
+  ),
   members: (p) => (
     <svg {...base} {...p}>
       <circle cx="9" cy="8" r="3.2" />

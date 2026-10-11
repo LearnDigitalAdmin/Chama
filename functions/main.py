@@ -91,3 +91,13 @@ from mychama.reports import (  # noqa: E402,F401
     purchaseReportCredits,
     purchasePremiumReportAlaCarte,
 )
+
+# --- Samuhia Desk (W2-A): support agents, desk requests, the private deskdelegate function. ---
+from mychama.desk_support import (  # noqa: E402,F401
+    addSupportAgent,
+    removeSupportAgent,
+    listSupportAgents,
+    createDeskRequest,
+    listDeskRequests,
+)
+from mychama.desk_delegate import deskdelegate  # noqa: E402,F401

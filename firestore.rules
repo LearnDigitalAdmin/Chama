@@ -126,7 +126,10 @@ service cloud.firestore {
                              'smsCredits', 'minutesExportsUsedThisMonth',
                              'standardReportsUsedThisMonth', 'premiumReportsUsedThisMonth',
                              'premiumAlacarteUsedThisMonth', 'reportCreditsBalance',
-                             'status', 'createdAt', 'openingBalance'
+                             'status', 'createdAt', 'openingBalance',
+                             // Samuhia Desk (W2-A): server-owned. A client must never set its own public code,
+                             // pick its commission owner, or grant a desk access to the chama.
+                             'publicCode', 'deskOwner', 'supportAgents'
                            ])
                       ) || (
                         // The treasurer alone corrects the chama's opening
@@ -502,6 +505,13 @@ service cloud.firestore {
       match /invites/{inviteId} {
         allow read, write: if false;
       }
+
+      // Samuhia Desk (W2-A) — all server-only. deskDelegateLog = idempotency for deskdelegate, deskAudit = one row per
+      // desk action, deskRequestLimits = the 5-requests-a-day counter. Customers see their requests through
+      // listDeskRequests, never by reading these directly.
+      match /deskDelegateLog/{requestId} { allow read, write: if false; }
+      match /deskAudit/{auditId}         { allow read, write: if false; }
+      match /deskRequestLimits/{day}     { allow read, write: if false; }
     }
 
     // ---------------------------------------------------------------- //
@@ -509,6 +519,20 @@ service cloud.firestore {
     // Contains failed-authentication traces, so read access would itself be
     // an information leak.
     // ---------------------------------------------------------------- //
+
+    // ---------------------------------------------------------------- //
+    // Samuhia Desk (W2-A) — top-level collections, server only in both directions.
+    //   desk_requests       the OUTBOX desk pulls from (written by createDeskRequest; desk writes deskStatus/responses back)
+    //   desk_public_config  rates desk publishes for commission splits (written by desk's Admin SDK only)
+    //   publicCodes / deskCounters / deskSplitCodes   SMC code reservations, the code counter, cached Paystack split codes
+    // Customers can never write deskOwner, desk_public_config, deskCommission or outbox items: privileges live in code.
+    // ---------------------------------------------------------------- //
+
+    match /desk_requests/{id}        { allow read, write: if false; }
+    match /desk_public_config/{id}   { allow read, write: if false; }
+    match /publicCodes/{code}        { allow read, write: if false; }
+    match /deskCounters/{id}         { allow read, write: if false; }
+    match /deskSplitCodes/{id}       { allow read, write: if false; }
 
     match /whatsappAuditLog/{logId} {
       allow read, write: if false;

@@ -40,6 +40,7 @@ from firebase_functions import https_fn
 from shared import firestore_paths as paths
 from shared import ids
 from shared import paystack
+from mychama import desk_commission
 from shared import reports_engine as engine
 from shared.constants import PLANS, REPORT_TYPES, ReportTier, SECURITY
 from shared.dates import now_ms
@@ -91,6 +92,24 @@ def generateReport(req: https_fn.CallableRequest) -> dict:
     if dedup is not None:
         return dedup
 
+    result = generate_report_core(
+        db, chama_id, report_type=report_type, fmt=fmt, period_preset=period_preset, date_from=date_from,
+        date_to=date_to, as_of=as_of, encrypt_requested=encrypt_requested, alacarte_reference=alacarte_reference,
+    )
+    record_result(db, chama_id, data.get("clientRequestId"), result)
+    return result
+
+
+def generate_report_core(
+    db, chama_id: str, *, report_type: str, fmt: str, period_preset, date_from, date_to, as_of,
+    encrypt_requested, alacarte_reference, url_ttl=STATEMENT_URL_TTL,
+) -> dict:
+    """
+    One report, charged through the credit engine (monthly pool -> wallet, or a paid à la carte purchase),
+    rendered, uploaded and signed for `url_ttl`. Shared by generateReport and desk's run_report so the credit
+    and period rules exist once. Caller has already authorised the actor and checked report_type/fmt.
+    Must run in a function that declares the HP_* secrets (the PIN SMS).
+    """
     chama_ref = db.document(paths.chama(chama_id))
     chama_snap = chama_ref.get()
     if not chama_snap.exists:
@@ -170,7 +189,7 @@ def generateReport(req: https_fn.CallableRequest) -> dict:
             content_type = "application/pdf"
 
         filename = f"report-{report_type}-{chama_id}-{now_ms()}.{fmt}"
-        url = engine.upload_and_sign(chama_id, filename, content, content_type, STATEMENT_URL_TTL)
+        url = engine.upload_and_sign(chama_id, filename, content, content_type, url_ttl)
     except Exception:
         engine.refund_charge(db, chama_id, chama_ref, report_type, charge_info)
         raise
@@ -181,9 +200,7 @@ def generateReport(req: https_fn.CallableRequest) -> dict:
         # so the PIN always goes to the admins, never a self-service case.
         pin_sent_to = engine.notify_pin(db, chama, pin, spec["label"], engine.admin_pin_recipients(db, chama_id))
 
-    result = {"url": url, "encrypted": bool(pin), "pinSentTo": len(pin_sent_to), "charge": charge_info}
-    record_result(db, chama_id, data.get("clientRequestId"), result)
-    return result
+    return {"url": url, "encrypted": bool(pin), "pinSentTo": len(pin_sent_to), "charge": charge_info}
 
 
 @https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
@@ -215,6 +232,14 @@ def purchaseReportCredits(req: https_fn.CallableRequest) -> dict:
     ts = now_ms()
     normalized_phone = normalize_phone(phone)
 
+    # Desk commission (W2-A): report share by rank; prepared before the pending doc so a failure leaves nothing behind.
+    chama_snap = db.document(paths.chama(chama_id)).get()
+    if not chama_snap.exists:
+        raise not_found("Chama not found.")
+    prepared = desk_commission.prepare_split(
+        db, PAYSTACK_SECRET_KEY.value, chama_snap.to_dict() or {}, desk_commission.KIND_REPORT, float(amount_kes)
+    )
+
     db.document(paths.report_credit_topup(chama_id, reference)).set({
         "chamaId": chama_id,
         "credits": credits,
@@ -223,6 +248,7 @@ def purchaseReportCredits(req: https_fn.CallableRequest) -> dict:
         "status": "pending",
         "createdAt": ts,
         "expiresAt": ts + SECURITY["PAYMENT_INTENT_TTL_SECONDS"] * 1000,
+        **({"deskCommission": prepared.desk_commission} if prepared else {}),
     })
 
     try:
@@ -234,6 +260,7 @@ def purchaseReportCredits(req: https_fn.CallableRequest) -> dict:
             provider=detect_provider(phone),
             reference=reference,
             metadata={"chargeType": "mychama_report_credit_topup", "targetProject": "mychama1", "chamaId": chama_id, "credits": credits},
+            split_code=prepared.split_code if prepared else None,
         )
     except Exception as exc:  # noqa: BLE001
         db.document(paths.report_credit_topup(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})
@@ -296,6 +323,11 @@ def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
     elif spec["periodMode"] == "as_of":
         as_of = engine.resolve_as_of(period_preset, as_of)
 
+    # Desk commission (W2-A): prepared BEFORE the monthly cap slot is reserved, so a Paystack failure
+    # here leaves nothing to roll back.
+    amount_kes = premium_alacarte_price_kes(report_type)
+    prepared = desk_commission.prepare_split(db, PAYSTACK_SECRET_KEY.value, chama, desk_commission.KIND_REPORT, float(amount_kes))
+
     @firestore.transactional
     def _reserve(transaction: firestore.Transaction) -> int:
         snap = chama_ref.get(transaction=transaction)
@@ -311,7 +343,6 @@ def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
 
     _reserve(db.transaction())
 
-    amount_kes = premium_alacarte_price_kes(report_type)
     reference = ids.build_report_alacarte_reference(chama_id)
     ts = now_ms()
     normalized_phone = normalize_phone(phone)
@@ -335,6 +366,7 @@ def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
         "status": "pending",
         "createdAt": ts,
         "expiresAt": ts + SECURITY["PAYMENT_INTENT_TTL_SECONDS"] * 1000,
+        **({"deskCommission": prepared.desk_commission} if prepared else {}),
     })
 
     try:
@@ -346,6 +378,7 @@ def purchasePremiumReportAlaCarte(req: https_fn.CallableRequest) -> dict:
             provider=detect_provider(phone),
             reference=reference,
             metadata={"chargeType": "mychama_report_alacarte", "targetProject": "mychama1", "chamaId": chama_id, "reportType": report_type},
+            split_code=prepared.split_code if prepared else None,
         )
     except Exception as exc:  # noqa: BLE001
         db.document(paths.report_alacarte_purchase(chama_id, reference)).update({"status": "failed", "updatedAt": now_ms()})

@@ -19,6 +19,10 @@ export interface Chama {
   id: string;
   name: string;
   motto?: string;
+  /** SMC-0001 … — what a desk agent types to find this chama. Server-assigned (functions/shared/desk_codes.py). */
+  publicCode?: string;
+  /** Connected support desks, keyed by COG-#### (COG-0000, the company desk, is implicit and not stored). Server-written. */
+  supportAgents?: Record<string, { addedAt: number; addedBy: string }>;
   plan: ChamaPlan;
   planExpiry?: string;
   autoRenew?: boolean;

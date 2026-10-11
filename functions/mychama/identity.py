@@ -19,6 +19,7 @@ from firebase_admin import firestore
 from shared import firestore_paths as paths
 from shared import ids
 from shared.constants import PLANS
+from shared.desk_codes import assign_public_code
 from shared.dates import now_ms, today_iso
 from shared.errors import bad_request, denied, not_found, precondition, rate_limited, require_auth
 from shared.idempotency import already_applied, record_result
@@ -37,13 +38,22 @@ def _db():
     return firestore.client()
 
 
+def member_field_errors(name: str, phone: str, id_number: str) -> list[tuple[str, str]]:
+    """The member field rules as (field, reason) pairs — one place, used by _new_member_doc and desk's import validation."""
+    errors: list[tuple[str, str]] = []
+    if not isinstance(name, str) or not name.strip():
+        errors.append(("name", "Name is required."))
+    if not isinstance(phone, str) or not is_valid_kenyan_phone(phone):
+        errors.append(("phone", "Enter a valid Kenyan phone number (07xx/01xx or +254...)."))
+    if not isinstance(id_number, str) or len(id_number.strip()) < 4:
+        errors.append(("idNumber", "A valid ID number is required."))
+    return errors
+
+
 def _new_member_doc(*, name: str, phone: str, id_number: str, role: str, uid: str | None) -> dict:
-    if not name or not name.strip():
-        raise bad_request("Name is required.")
-    if not is_valid_kenyan_phone(phone):
-        raise bad_request("Enter a valid Kenyan phone number (07xx/01xx or +254...).")
-    if not id_number or len(id_number.strip()) < 4:
-        raise bad_request("A valid ID number is required.")
+    field_errors = member_field_errors(name, phone, id_number)
+    if field_errors:
+        raise bad_request(field_errors[0][1])
 
     id_last4, id_masked = mask_id_number(id_number)
     initial, avatar_color = initials_and_color(name)
@@ -69,6 +79,41 @@ def _new_member_doc(*, name: str, phone: str, id_number: str, role: str, uid: st
         "createdAt": ts,
         "updatedAt": ts,
     }
+
+
+def ensure_member_capacity(db, chama_id: str, plan: str, *, adding: int) -> int:
+    """
+    The plan's active-member limit (ALL active members, admins included). Raises rate_limited if adding
+    `adding` more would exceed it; returns the current active count. Shared by addMember/addAdmin and by
+    desk's commit_records (functions/mychama/desk_delegate.py) so the rule exists in exactly one place.
+    """
+    limit = PLANS.get(plan, PLANS["free"])["memberLimit"]
+    active = len(list(db.collection(paths.members(chama_id)).where("status", "==", "active").stream()))
+    if active + adding > limit:
+        raise rate_limited(
+            f"This chama's {plan} plan allows up to {limit} active members. Upgrade the plan to add more."
+        )
+    return active
+
+
+def stage_member(db, batch, chama_id: str, *, role: str, name: str, phone: str, id_number: str, created_by: str) -> tuple[str, str]:
+    """Validates and stages a member document plus its pending invite on `batch`; returns (memberId, inviteId)."""
+    member_ref = db.collection(paths.members(chama_id)).document()
+    member_doc = _new_member_doc(name=name, phone=phone, id_number=id_number, role=role, uid=None)
+    invite_ref = db.collection(paths.invites(chama_id)).document()
+    ts = now_ms()
+    batch.set(member_ref, member_doc)
+    batch.set(invite_ref, {
+        "chamaId": chama_id,
+        "memberId": member_ref.id,
+        "phone": normalize_phone(phone),
+        "role": role,
+        "status": "pending",
+        "createdBy": created_by,
+        "createdAt": ts,
+        "expiresAt": ts + INVITE_TTL_MS,
+    })
+    return member_ref.id, invite_ref.id
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +165,8 @@ def createChama(req: https_fn.CallableRequest) -> dict:
 
     @firestore.transactional
     def _txn(transaction: firestore.Transaction):
+        # Reads first (Firestore rule): allocate the chama's public code (SMC-0001 …) from the atomic counter.
+        public_code = assign_public_code(transaction, db, chama_ref)
         member_doc = _new_member_doc(
             name=admin_name or token.get("name") or name,
             phone=admin_phone,
@@ -129,6 +176,7 @@ def createChama(req: https_fn.CallableRequest) -> dict:
         )
         transaction.set(chama_ref, {
             "name": name,
+            "publicCode": public_code,
             "motto": motto,
             "plan": "free",
             "contributionAmount": float(contribution_amount),
@@ -198,16 +246,7 @@ def _add_person(req: https_fn.CallableRequest, *, forced_role: str | None) -> di
     chama = chama_snap.to_dict()
 
     plan = chama.get("plan", "free")
-    limit = PLANS.get(plan, PLANS["free"])["memberLimit"]
-    existing = list(
-        db.collection(paths.members(chama_id))
-        .where("status", "==", "active")
-        .stream()
-    )
-    if len(existing) >= limit:
-        raise rate_limited(
-            f"This chama's {plan} plan allows up to {limit} active members. Upgrade the plan to add more."
-        )
+    ensure_member_capacity(db, chama_id, plan, adding=1)
 
     dupe = list(
         db.collection(paths.members(chama_id))
@@ -218,26 +257,10 @@ def _add_person(req: https_fn.CallableRequest, *, forced_role: str | None) -> di
     if dupe:
         raise https_fn.HttpsError("already-exists", "This phone number is already a member of this chama.")
 
-    member_ref = db.collection(paths.members(chama_id)).document()
-    member_id = member_ref.id
-    member_doc = _new_member_doc(name=name, phone=phone, id_number=id_number, role=role, uid=None)
-
-    invite_ref = db.collection(paths.invites(chama_id)).document()
-    invite_id = invite_ref.id
-    ts = now_ms()
-
     batch = db.batch()
-    batch.set(member_ref, member_doc)
-    batch.set(invite_ref, {
-        "chamaId": chama_id,
-        "memberId": member_id,
-        "phone": normalized,
-        "role": role,
-        "status": "pending",
-        "createdBy": caller.member_id,
-        "createdAt": ts,
-        "expiresAt": ts + INVITE_TTL_MS,
-    })
+    member_id, invite_id = stage_member(
+        db, batch, chama_id, role=role, name=name, phone=phone, id_number=id_number, created_by=caller.member_id,
+    )
     batch.commit()
 
     result = {"memberId": member_id, "inviteId": invite_id}

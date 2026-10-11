@@ -26,6 +26,7 @@ const ADMIN_ITEMS: Record<string, NavItem> = {
   minutes: { id: 'minutes', label: 'Minutes', path: '/app/minutes', icon: 'minutes' },
   reports: { id: 'reports', label: 'Exports', path: '/app/reports', icon: 'reports' },
   billing: { id: 'billing', label: 'Plan & Billing', path: '/app/billing', icon: 'billing' },
+  desk: { id: 'desk', label: 'Desk requests', path: '/app/desk-requests', icon: 'desk' },
   settings: { id: 'settings', label: 'Settings', path: '/app/settings', icon: 'settings' },
 };
 
@@ -43,16 +44,16 @@ export const NAV: Record<MemberRole, NavItem[]> = {
   chair: [
     ADMIN_ITEMS.dashboard, ADMIN_ITEMS.members, ADMIN_ITEMS.contributions, ADMIN_ITEMS.merrygoround,
     ADMIN_ITEMS.loans, ADMIN_ITEMS.payments, ADMIN_ITEMS.communication, ADMIN_ITEMS.minutes,
-    ADMIN_ITEMS.reports, ADMIN_ITEMS.billing, ADMIN_ITEMS.settings,
+    ADMIN_ITEMS.reports, ADMIN_ITEMS.billing, ADMIN_ITEMS.desk, ADMIN_ITEMS.settings,
   ],
   treasurer: [
     ADMIN_ITEMS.dashboard, ADMIN_ITEMS.members, ADMIN_ITEMS.contributions, ADMIN_ITEMS.merrygoround,
     ADMIN_ITEMS.loans, ADMIN_ITEMS.payments, ADMIN_ITEMS.communication, ADMIN_ITEMS.minutes,
-    ADMIN_ITEMS.reports, ADMIN_ITEMS.settings,
+    ADMIN_ITEMS.reports, ADMIN_ITEMS.desk, ADMIN_ITEMS.settings,
   ],
   secretary: [
     ADMIN_ITEMS.dashboard, ADMIN_ITEMS.members, ADMIN_ITEMS.contributions, ADMIN_ITEMS.merrygoround,
-    ADMIN_ITEMS.loans, ADMIN_ITEMS.communication, ADMIN_ITEMS.minutes, ADMIN_ITEMS.reports, ADMIN_ITEMS.settings,
+    ADMIN_ITEMS.loans, ADMIN_ITEMS.communication, ADMIN_ITEMS.minutes, ADMIN_ITEMS.reports, ADMIN_ITEMS.desk, ADMIN_ITEMS.settings,
   ],
   member: [
     MEMBER_ITEMS.dashboard, MEMBER_ITEMS.mycontributions, MEMBER_ITEMS.mymgr, MEMBER_ITEMS.myloans,

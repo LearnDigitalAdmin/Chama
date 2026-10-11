@@ -511,6 +511,20 @@
           "order": "ASCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "desk_requests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "chamaId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": [

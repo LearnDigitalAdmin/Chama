@@ -36,9 +36,12 @@ def charge_mobile_money(
     provider: str,
     reference: str,
     metadata: dict,
+    split_code: str | None = None,
 ) -> dict:
     """
-    Initiates an STK push. Returns Paystack's response body — the caller
+    Initiates an STK push. `split_code` (a Paystack percentage split in THIS account, see
+    create_commission_split) is attached when a desk commission applies — the same mechanism PAY's
+    chargeCustomer uses. Returns Paystack's response body — the caller
     stores its `data.status`/`data.display_text` on the paymentIntent for
     troubleshooting, but must NOT treat this response as confirmation of
     payment: only the PAY repo's webhook (on charge.success) does that.
@@ -51,6 +54,8 @@ def charge_mobile_money(
         "reference": reference,
         "metadata": metadata,
     }
+    if split_code:
+        payload["split_code"] = split_code
     resp = requests.post(f"{PAYSTACK_API_BASE}/charge", json=payload, headers=_headers(secret_key), timeout=20)
     resp.raise_for_status()
     return resp.json()
@@ -109,5 +114,24 @@ def resolve_account_number(*, secret_key: str, account_number: str, bank_code: s
         headers=_headers(secret_key),
         timeout=20,
     )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_commission_split(*, secret_key: str, name: str, subaccount_code: str, share_pct: float) -> dict:
+    """
+    A desk commission split: ONE subaccount (the desk agent's, in MyChama's own Paystack account) gets
+    `share_pct` of (gross - Paystack's real fee); the remainder stays with MyChama's account.
+    bearer_type "all-proportional" makes Paystack deduct its fee proportionally — the model PAY's
+    getOrCreateSplitCode uses (functions/src/index.ts) and the desk kernel documents.
+    """
+    payload = {
+        "name": name,
+        "type": "percentage",
+        "currency": "KES",
+        "subaccounts": [{"subaccount": subaccount_code, "share": share_pct}],
+        "bearer_type": "all-proportional",
+    }
+    resp = requests.post(f"{PAYSTACK_API_BASE}/split", json=payload, headers=_headers(secret_key), timeout=20)
     resp.raise_for_status()
     return resp.json()
