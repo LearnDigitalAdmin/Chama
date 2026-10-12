@@ -34,6 +34,7 @@ from typing import Any, Callable
 
 from firebase_admin import firestore
 from firebase_functions import https_fn
+from google.api_core import exceptions as gexc
 
 from mychama import identity, reports, sms
 from shared import firestore_paths as paths
@@ -43,7 +44,7 @@ from shared.dates import now_ms
 from shared.desk_codes import TOP_DESK_CODE, normalize_agent_code, normalize_public_code, resolve_chama_id
 from shared.errors import bad_request, precondition
 from shared.phone import normalize_phone
-from shared.secrets import HP_APIKEY, HP_PASSWORD, HP_SENDER_ID, HP_USERID
+from shared.secrets import HP_APIKEY, HP_PASSWORD, HP_SENDER_ID, HP_USERID, ID_PEPPER
 
 REGION = "africa-south1"
 
@@ -203,18 +204,25 @@ def _as_text(v: Any) -> str:
 
 def validate_rows(db, chama_id: str, chama: dict, rows: Any) -> tuple[list[dict], list[dict]]:
     """
-    Member import validation: the app's own field rules (identity.member_field_errors), duplicate phones inside
-    the file and against existing members, and the plan's member limit. Returns (valid_rows, errors).
+    Member import validation: the app's own field rules (identity.member_field_errors), duplicate phones and
+    duplicate ID numbers inside the file and against existing members (removed members don't hold their ID),
+    and the plan's member limit. Returns (valid_rows, errors).
     """
     if not isinstance(rows, list) or not rows:
         raise bad_request("rows must be a non-empty list.")
     if len(rows) > MAX_ROWS:
         raise bad_request(f"At most {MAX_ROWS} rows per request.")
-    existing = {
-        (d.to_dict() or {}).get("phoneNormalized")
-        for d in db.collection(paths.members(chama_id)).stream()
-    }
+    existing: set = set()
+    existing_id_keys: set[str] = set()
+    for d in db.collection(paths.members(chama_id)).stream():
+        m = d.to_dict() or {}
+        existing.add(m.get("phoneNormalized"))
+        if m.get("status") != "removed":
+            held = m.get("idKey") or identity.try_id_key(m.get("idNumber") or "")
+            if held:
+                existing_id_keys.add(held)
     seen: set[str] = set()
+    seen_id_keys: set[str] = set()
     valid: list[dict] = []
     errors: list[dict] = []
     for i, raw in enumerate(rows, start=1):
@@ -235,7 +243,15 @@ def validate_rows(db, chama_id: str, chama: dict, rows: Any) -> tuple[list[dict]
         if norm in seen:
             errors.append({"row": i, "field": "phone", "reason": "This phone number appears more than once in the file."})
             continue
+        id_key = identity.id_key_for(id_number)
+        if id_key in existing_id_keys:
+            errors.append({"row": i, "field": "idNumber", "reason": identity.DUPLICATE_ID_MESSAGE})
+            continue
+        if id_key in seen_id_keys:
+            errors.append({"row": i, "field": "idNumber", "reason": "This ID number appears more than once in the file."})
+            continue
         seen.add(norm)
+        seen_id_keys.add(id_key)
         valid.append({"name": name, "phone": phone, "idNumber": id_number})
     plan = chama.get("plan", "free")
     limit = PLANS.get(plan, PLANS["free"])["memberLimit"]
@@ -265,13 +281,24 @@ def act_commit_records(db, chama_id: str, chama: dict, req: dict) -> dict:
         return {"created": 0, "skipped": len(rows), "errors": errors}
     identity.ensure_member_capacity(db, chama_id, chama.get("plan", "free"), adding=len(valid))
     created_by = f"desk:{req['agentCode']}"
-    for start in range(0, len(valid), 200):          # 2 documents per member, 500 writes per batch
+    created = 0
+    for start in range(0, len(valid), 160):          # 3 documents per member (member, invite, ID lock), 500 writes per batch
+        chunk = valid[start:start + 160]
         batch = db.batch()
-        for r in valid[start:start + 200]:
+        for r in chunk:
             identity.stage_member(db, batch, chama_id, role="member", name=r["name"], phone=r["phone"],
                                   id_number=r["idNumber"], created_by=created_by)
-        batch.commit()
-    return {"created": len(valid), "skipped": len(rows) - len(valid), "errors": errors}
+        try:
+            batch.commit()
+        except gexc.AlreadyExists:
+            # Someone registered one of these ID numbers after validation: the whole batch is refused, nothing
+            # from it is written. Report it and stop; the caller can validate again and resend the rest.
+            errors.append({"row": 0, "field": "idNumber", "reason": (
+                "An ID number in this batch was registered while the import ran, so the batch was not saved. "
+                "Validate again and resend the remaining rows.")})
+            break
+        created += len(chunk)
+    return {"created": created, "skipped": len(rows) - created, "errors": errors}
 
 
 def _parse_first_run(at: Any, now: int) -> int:
@@ -436,7 +463,7 @@ def handle(db, body: Any) -> tuple[int, dict]:
     return refusal.http, {"ok": False, "error": {"code": refusal.code, "message": refusal.message}}
 
 
-@https_fn.on_request(region=REGION, invoker="private", secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID], timeout_sec=300, memory=512)
+@https_fn.on_request(region=REGION, invoker="private", secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID, ID_PEPPER], timeout_sec=300, memory=512)
 def deskdelegate(request) -> Any:
     """POST only. Private: Cloud Run IAM admits only desk's service account."""
     from flask import jsonify

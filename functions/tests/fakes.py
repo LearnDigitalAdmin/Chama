@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from firebase_admin import firestore as real_fs
+from google.api_core import exceptions as gexc
 
 _SENT = real_fs.DELETE_FIELD
 
@@ -24,6 +25,19 @@ def _split_path(path: str) -> list[str]:
             buf += ch
     parts.append(buf)
     return parts
+
+
+def _match(x, op, v) -> bool:
+    """Evaluates ONLY the operator asked for (a dict of all of them would raise on e.g. `None in "abc"`)."""
+    if op == "==":
+        return x == v
+    if op == "<=":
+        return x is not None and x <= v
+    if op == "in":
+        return x in v
+    if op == "array_contains":
+        return isinstance(x, list) and v in x
+    raise NotImplementedError(f"fake Firestore does not support the {op!r} operator")
 
 
 class Snap:
@@ -53,6 +67,16 @@ class Ref:
 
     def set(self, data: dict, merge: bool = False) -> None:
         import copy
+        if merge and self.path in self.db.store:
+            self.db.store[self.path].update(copy.deepcopy(data))
+        else:
+            self.db.store[self.path] = copy.deepcopy(data)
+
+    def create(self, data: dict) -> None:
+        """Like Firestore's create(): fails when the document already exists."""
+        import copy
+        if self.path in self.db.store:
+            raise gexc.AlreadyExists(f"document already exists: {self.path}")
         self.db.store[self.path] = copy.deepcopy(data)
 
     def update(self, changes: dict) -> None:
@@ -96,8 +120,7 @@ class Query:
                 continue
             ok = True
             for f, op, v in self.filters:
-                x = data.get(f)
-                ok &= {"==": x == v, "<=": x is not None and x <= v, "in": x in v}[op]
+                ok &= _match(data.get(f), op, v)
             if ok:
                 out.append(Snap(Ref(self.db, path), data))
         if self.order:
@@ -117,23 +140,58 @@ class Coll(Query):
 
 
 class Batch:
+    """Atomic: if any create() hits an existing document, NOTHING in the batch is applied (like Firestore)."""
+
     def __init__(self):
         self.ops: list = []
 
-    def set(self, ref, data):
-        self.ops.append((ref, data))
+    def set(self, ref, data, merge=False):
+        self.ops.append(("set", ref, data, merge))
+
+    def create(self, ref, data):
+        self.ops.append(("create", ref, data, False))
+
+    def update(self, ref, changes):
+        self.ops.append(("update", ref, changes, False))
+
+    def delete(self, ref):
+        self.ops.append(("delete", ref, None, False))
 
     def commit(self):
-        for ref, data in self.ops:
-            ref.set(data)
+        created: set[str] = set()
+        for op, ref, _data, _merge in self.ops:
+            if op == "create":
+                if ref.path in self.db_store(ref) or ref.path in created:
+                    raise gexc.AlreadyExists(f"document already exists: {ref.path}")
+                created.add(ref.path)
+        for op, ref, data, merge in self.ops:
+            if op == "set":
+                ref.set(data, merge=merge)
+            elif op == "create":
+                ref.create(data)
+            elif op == "update":
+                ref.update(data)
+            elif op == "delete":
+                ref.delete()
+        self.ops = []
+
+    @staticmethod
+    def db_store(ref):
+        return ref.db.store
 
 
 class Txn:
-    def set(self, ref, data):
-        ref.set(data)
+    def set(self, ref, data, merge=False):
+        ref.set(data, merge=merge)
+
+    def create(self, ref, data):
+        ref.create(data)
 
     def update(self, ref, changes):
         ref.update(changes)
+
+    def delete(self, ref):
+        ref.delete()
 
 
 class FakeDB:

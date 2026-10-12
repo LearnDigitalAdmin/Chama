@@ -21,6 +21,20 @@ def member(chama_id: str, member_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.MEMBERS}/{member_id}"
 
 
+# Per-chama ID-number uniqueness locks: one document per member ID, keyed by the idKey HMAC
+# (shared/id_key.py). Created atomically with the member, so a chama can never hold two members
+# with the same ID number. Server-only (firestore.rules denies every client access).
+MEMBER_ID_KEYS = "memberIdKeys"
+
+
+def member_id_keys(chama_id: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MEMBER_ID_KEYS}"
+
+
+def member_id_key(chama_id: str, id_key: str) -> str:
+    return f"{MC.CHAMAS}/{chama_id}/{MEMBER_ID_KEYS}/{id_key}"
+
+
 def loan_products(chama_id: str) -> str:
     return f"{MC.CHAMAS}/{chama_id}/{MC.LOAN_PRODUCTS}"
 

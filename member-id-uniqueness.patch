@@ -1,0 +1,1011 @@
+diff --git a/firestore.rules b/firestore.rules
+index d74d18e..8faa705 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -158,11 +158,10 @@ service cloud.firestore {
+                     || (isMember(chamaId) && !('idNumber' in resource.data))
+                     || isSelf(chamaId, memberId);
+ 
+-        allow create: if isFinanceAdmin(chamaId)
+-                      && request.resource.data.totalContributed == 0
+-                      && request.resource.data.creditBalance == 0
+-                      && request.resource.data.status in ['active', 'inactive']
+-                      && request.resource.data.role in ['chair', 'treasurer', 'secretary', 'member'];
++        // Members are created only by the addMember / addAdmin / createChama callables and the Desk import.
++        // They take the chama's ID-number lock (memberIdKeys) in the same write, which is what guarantees
++        // two members can never share an ID — a client write cannot take that lock, so none is accepted.
++        allow create: if false;
+ 
+         // Balances are derived from the ledger — a client may never set them.
+         // 'removed' is a terminal status reachable only through
+@@ -171,8 +170,13 @@ service cloud.firestore {
+         // direct write can never skip them.
+         allow update: if (
+                         isFinanceAdmin(chamaId)
+-                        && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt'])
++                        && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt',
++                                      // ID fields are bound to the chama's ID-number lock (memberIdKeys):
++                                      // changing one here would bypass the one-ID-one-member guarantee.
++                                      'idNumber', 'idKey', 'idLast4', 'nationalIdMasked'])
+                         && request.resource.data.status in ['active', 'inactive', 'suspended']
++                        // 'removed' is terminal: its ID has been released for someone else.
++                        && resource.data.status != 'removed'
+                       ) || (
+                         // A member maintains their own contact details only.
+                         isSelf(chamaId, memberId)
+@@ -196,6 +200,12 @@ service cloud.firestore {
+         allow delete: if false;
+       }
+ 
++      // ID-number uniqueness locks (one per member ID, keyed by the idKey HMAC). Server-only: the document
++      // ids are keyed fingerprints of national IDs, so nothing here is ever readable or writable by a client.
++      match /memberIdKeys/{idKey} {
++        allow read, write: if false;
++      }
++
+       // -------------------------------------------------------------- //
+       // loanProducts
+       // -------------------------------------------------------------- //
+diff --git a/functions/mychama/desk_delegate.py b/functions/mychama/desk_delegate.py
+index e662dd7..8fa16ac 100644
+--- a/functions/mychama/desk_delegate.py
++++ b/functions/mychama/desk_delegate.py
+@@ -34,6 +34,7 @@ from typing import Any, Callable
+ 
+ from firebase_admin import firestore
+ from firebase_functions import https_fn
++from google.api_core import exceptions as gexc
+ 
+ from mychama import identity, reports, sms
+ from shared import firestore_paths as paths
+@@ -43,7 +44,7 @@ from shared.dates import now_ms
+ from shared.desk_codes import TOP_DESK_CODE, normalize_agent_code, normalize_public_code, resolve_chama_id
+ from shared.errors import bad_request, precondition
+ from shared.phone import normalize_phone
+-from shared.secrets import HP_APIKEY, HP_PASSWORD, HP_SENDER_ID, HP_USERID
++from shared.secrets import HP_APIKEY, HP_PASSWORD, HP_SENDER_ID, HP_USERID, ID_PEPPER
+ 
+ REGION = "africa-south1"
+ 
+@@ -203,18 +204,25 @@ def _as_text(v: Any) -> str:
+ 
+ def validate_rows(db, chama_id: str, chama: dict, rows: Any) -> tuple[list[dict], list[dict]]:
+     """
+-    Member import validation: the app's own field rules (identity.member_field_errors), duplicate phones inside
+-    the file and against existing members, and the plan's member limit. Returns (valid_rows, errors).
++    Member import validation: the app's own field rules (identity.member_field_errors), duplicate phones and
++    duplicate ID numbers inside the file and against existing members (removed members don't hold their ID),
++    and the plan's member limit. Returns (valid_rows, errors).
+     """
+     if not isinstance(rows, list) or not rows:
+         raise bad_request("rows must be a non-empty list.")
+     if len(rows) > MAX_ROWS:
+         raise bad_request(f"At most {MAX_ROWS} rows per request.")
+-    existing = {
+-        (d.to_dict() or {}).get("phoneNormalized")
+-        for d in db.collection(paths.members(chama_id)).stream()
+-    }
++    existing: set = set()
++    existing_id_keys: set[str] = set()
++    for d in db.collection(paths.members(chama_id)).stream():
++        m = d.to_dict() or {}
++        existing.add(m.get("phoneNormalized"))
++        if m.get("status") != "removed":
++            held = m.get("idKey") or identity.try_id_key(m.get("idNumber") or "")
++            if held:
++                existing_id_keys.add(held)
+     seen: set[str] = set()
++    seen_id_keys: set[str] = set()
+     valid: list[dict] = []
+     errors: list[dict] = []
+     for i, raw in enumerate(rows, start=1):
+@@ -235,7 +243,15 @@ def validate_rows(db, chama_id: str, chama: dict, rows: Any) -> tuple[list[dict]
+         if norm in seen:
+             errors.append({"row": i, "field": "phone", "reason": "This phone number appears more than once in the file."})
+             continue
++        id_key = identity.id_key_for(id_number)
++        if id_key in existing_id_keys:
++            errors.append({"row": i, "field": "idNumber", "reason": identity.DUPLICATE_ID_MESSAGE})
++            continue
++        if id_key in seen_id_keys:
++            errors.append({"row": i, "field": "idNumber", "reason": "This ID number appears more than once in the file."})
++            continue
+         seen.add(norm)
++        seen_id_keys.add(id_key)
+         valid.append({"name": name, "phone": phone, "idNumber": id_number})
+     plan = chama.get("plan", "free")
+     limit = PLANS.get(plan, PLANS["free"])["memberLimit"]
+@@ -265,13 +281,24 @@ def act_commit_records(db, chama_id: str, chama: dict, req: dict) -> dict:
+         return {"created": 0, "skipped": len(rows), "errors": errors}
+     identity.ensure_member_capacity(db, chama_id, chama.get("plan", "free"), adding=len(valid))
+     created_by = f"desk:{req['agentCode']}"
+-    for start in range(0, len(valid), 200):          # 2 documents per member, 500 writes per batch
++    created = 0
++    for start in range(0, len(valid), 160):          # 3 documents per member (member, invite, ID lock), 500 writes per batch
++        chunk = valid[start:start + 160]
+         batch = db.batch()
+-        for r in valid[start:start + 200]:
++        for r in chunk:
+             identity.stage_member(db, batch, chama_id, role="member", name=r["name"], phone=r["phone"],
+                                   id_number=r["idNumber"], created_by=created_by)
+-        batch.commit()
+-    return {"created": len(valid), "skipped": len(rows) - len(valid), "errors": errors}
++        try:
++            batch.commit()
++        except gexc.AlreadyExists:
++            # Someone registered one of these ID numbers after validation: the whole batch is refused, nothing
++            # from it is written. Report it and stop; the caller can validate again and resend the rest.
++            errors.append({"row": 0, "field": "idNumber", "reason": (
++                "An ID number in this batch was registered while the import ran, so the batch was not saved. "
++                "Validate again and resend the remaining rows.")})
++            break
++        created += len(chunk)
++    return {"created": created, "skipped": len(rows) - created, "errors": errors}
+ 
+ 
+ def _parse_first_run(at: Any, now: int) -> int:
+@@ -436,7 +463,7 @@ def handle(db, body: Any) -> tuple[int, dict]:
+     return refusal.http, {"ok": False, "error": {"code": refusal.code, "message": refusal.message}}
+ 
+ 
+-@https_fn.on_request(region=REGION, invoker="private", secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID], timeout_sec=300, memory=512)
++@https_fn.on_request(region=REGION, invoker="private", secrets=[HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID, ID_PEPPER], timeout_sec=300, memory=512)
+ def deskdelegate(request) -> Any:
+     """POST only. Private: Cloud Run IAM admits only desk's service account."""
+     from flask import jsonify
+diff --git a/functions/mychama/identity.py b/functions/mychama/identity.py
+index 35948d0..e743175 100644
+--- a/functions/mychama/identity.py
++++ b/functions/mychama/identity.py
+@@ -15,17 +15,20 @@ from __future__ import annotations
+ 
+ from firebase_functions import https_fn, options
+ from firebase_admin import firestore
++from google.api_core import exceptions as gexc
+ 
+ from shared import firestore_paths as paths
+ from shared import ids
+ from shared.constants import PLANS
+ from shared.desk_codes import assign_public_code
+ from shared.dates import now_ms, today_iso
+-from shared.errors import bad_request, denied, not_found, precondition, rate_limited, require_auth
++from shared.errors import ErrorCode, bad_request, denied, not_found, precondition, rate_limited, require_auth
++from shared.id_key import compute_id_key
+ from shared.idempotency import already_applied, record_result
+ from shared.masking import initials_and_color, mask_id_number
+ from shared.phone import is_valid_kenyan_phone, normalize_phone
+ from shared.roles import require_finance_admin, require_membership
++from shared.secrets import ID_PEPPER
+ 
+ REGION = "africa-south1"
+ 
+@@ -38,6 +41,93 @@ def _db():
+     return firestore.client()
+ 
+ 
++# ---------------------------------------------------------------------------
++# One ID number, one member — per chama.
++#
++# Every member carries `idKey` (shared/id_key.py). A lock document at
++# chamas/{chamaId}/memberIdKeys/{idKey} is created in the SAME batch/transaction as the member with
++# create(), which fails if the lock exists — so two members can never share an ID, even under
++# concurrent requests. Scope: every member that is not 'removed' (active, inactive and suspended all
++# hold their ID); permanently removing a member releases it. The PAY<->MyChama link relies on this:
++# two members with one ID in a chama are deliberately never linked.
++# ---------------------------------------------------------------------------
++
++DUPLICATE_ID_MESSAGE = "A member with this ID number is already in this chama."
++DUPLICATE_ID_SELF_MESSAGE = (
++    "That ID number is already registered to another member of this chama. "
++    "Check the number, or ask your chama's admin."
++)
++
++
++def try_id_key(id_number: str) -> str:
++    """The idKey for an ID number, or '' when there is nothing to key or no pepper is bound. Never raises."""
++    return compute_id_key(id_number or "", ID_PEPPER.value)
++
++
++def id_key_for(id_number: str) -> str:
++    """
++    The idKey for an ID number — also the document id of the member's uniqueness lock. Fails CLOSED: without
++    the pepper the lock would be meaningless, so refuse the write instead of creating an unprotected member.
++    """
++    if not ID_PEPPER.value:
++        raise https_fn.HttpsError(
++            ErrorCode.INTERNAL, "Member ID checks are unavailable right now. Please try again shortly."
++        )
++    key = try_id_key(id_number)
++    if not key:
++        raise bad_request("A valid ID number is required.")
++    return key
++
++
++def id_lock_ref(db, chama_id: str, id_key: str):
++    return db.document(paths.member_id_key(chama_id, id_key))
++
++
++def _lock_doc(member_id: str) -> dict:
++    return {"memberId": member_id, "createdAt": now_ms()}
++
++
++def reap_orphan_id_lock(db, chama_id: str, id_key: str) -> None:
++    """
++    Frees a lock nobody holds any more: its member doc is gone (console delete), is 'removed', or no longer
++    carries this ID (console edit). Without this one stray lock would block that ID in the chama forever.
++    """
++    lock = id_lock_ref(db, chama_id, id_key).get()
++    if not lock.exists:
++        return
++    holder_id = (lock.to_dict() or {}).get("memberId")
++    holder = db.document(paths.member(chama_id, holder_id)).get() if holder_id else None
++    data = holder.to_dict() if holder is not None and holder.exists else None
++    if data is None or data.get("status") == "removed" or try_id_key(data.get("idNumber") or "") != id_key:
++        lock.reference.delete()
++
++
++def find_id_holder(db, chama_id: str, id_key: str, *, exclude_member_id: str | None = None):
++    """(memberId, data) of a non-removed member already holding this ID, or None. Friendly pre-check only —
++    the lock's create() is what actually guarantees uniqueness."""
++    for snap in db.collection(paths.members(chama_id)).where("idKey", "==", id_key).limit(5).stream():
++        if snap.id == exclude_member_id:
++            continue
++        data = snap.to_dict() or {}
++        if data.get("status") == "removed":
++            continue
++        return snap.id, data
++    return None
++
++
++def _duplicate_for_admin(holder: dict) -> https_fn.HttpsError:
++    """Admins already see the roster, so name the existing member and point at the right fix."""
++    name = (holder.get("name") or "A member").strip()
++    status = holder.get("status") or "active"
++    if status != "active":
++        return https_fn.HttpsError(
++            ErrorCode.ALREADY_EXISTS,
++            f"{name} already has this ID number in this chama (currently {status}). "
++            "Reactivate them instead of adding them again.",
++        )
++    return https_fn.HttpsError(ErrorCode.ALREADY_EXISTS, f"{name} already has this ID number in this chama.")
++
++
+ def member_field_errors(name: str, phone: str, id_number: str) -> list[tuple[str, str]]:
+     """The member field rules as (field, reason) pairs — one place, used by _new_member_doc and desk's import validation."""
+     errors: list[tuple[str, str]] = []
+@@ -55,6 +145,7 @@ def _new_member_doc(*, name: str, phone: str, id_number: str, role: str, uid: st
+     if field_errors:
+         raise bad_request(field_errors[0][1])
+ 
++    id_key = id_key_for(id_number)
+     id_last4, id_masked = mask_id_number(id_number)
+     initial, avatar_color = initials_and_color(name)
+     ts = now_ms()
+@@ -67,6 +158,7 @@ def _new_member_doc(*, name: str, phone: str, id_number: str, role: str, uid: st
+         "role": role,
+         "isAdmin": role in FINANCE_ADMIN_ROLES or role == "secretary",
+         "idNumber": id_number.strip(),
++        "idKey": id_key,
+         "idLast4": id_last4,
+         "nationalIdMasked": id_masked,
+         "joinDate": today_iso(),
+@@ -97,12 +189,18 @@ def ensure_member_capacity(db, chama_id: str, plan: str, *, adding: int) -> int:
+ 
+ 
+ def stage_member(db, batch, chama_id: str, *, role: str, name: str, phone: str, id_number: str, created_by: str) -> tuple[str, str]:
+-    """Validates and stages a member document plus its pending invite on `batch`; returns (memberId, inviteId)."""
++    """
++    Validates and stages a member document, its pending invite and the member's ID lock on `batch`; returns
++    (memberId, inviteId). Commit the batch inside try/except gexc.AlreadyExists: that is the signal that the
++    ID number is already taken in this chama (the whole batch is then rejected, nothing is written).
++    """
+     member_ref = db.collection(paths.members(chama_id)).document()
+     member_doc = _new_member_doc(name=name, phone=phone, id_number=id_number, role=role, uid=None)
++    reap_orphan_id_lock(db, chama_id, member_doc["idKey"])
+     invite_ref = db.collection(paths.invites(chama_id)).document()
+     ts = now_ms()
+     batch.set(member_ref, member_doc)
++    batch.create(id_lock_ref(db, chama_id, member_doc["idKey"]), _lock_doc(member_ref.id))
+     batch.set(invite_ref, {
+         "chamaId": chama_id,
+         "memberId": member_ref.id,
+@@ -120,7 +218,7 @@ def stage_member(db, batch, chama_id: str, *, role: str, name: str, phone: str,
+ # createChama
+ # ---------------------------------------------------------------------------
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[ID_PEPPER])
+ def createChama(req: https_fn.CallableRequest) -> dict:
+     uid = require_auth(req)
+     token = req.auth.token or {}
+@@ -198,6 +296,7 @@ def createChama(req: https_fn.CallableRequest) -> dict:
+             "updatedAt": ts,
+         })
+         transaction.set(member_ref, member_doc)
++        transaction.create(id_lock_ref(db, chama_id, member_doc["idKey"]), _lock_doc(member_id))
+         transaction.set(membership_ref, {
+             "chamaId": chama_id,
+             "chamaName": name,
+@@ -257,18 +356,29 @@ def _add_person(req: https_fn.CallableRequest, *, forced_role: str | None) -> di
+     if dupe:
+         raise https_fn.HttpsError("already-exists", "This phone number is already a member of this chama.")
+ 
++    field_errors = member_field_errors(name, phone, id_number)
++    if field_errors:
++        raise bad_request(field_errors[0][1])
++    holder = find_id_holder(db, chama_id, id_key_for(id_number))
++    if holder:
++        raise _duplicate_for_admin(holder[1])
++
+     batch = db.batch()
+     member_id, invite_id = stage_member(
+         db, batch, chama_id, role=role, name=name, phone=phone, id_number=id_number, created_by=caller.member_id,
+     )
+-    batch.commit()
++    try:
++        batch.commit()
++    except gexc.AlreadyExists:
++        # Lost a race (or the member's idKey hadn't been written yet): the lock is the source of truth.
++        raise https_fn.HttpsError(ErrorCode.ALREADY_EXISTS, DUPLICATE_ID_MESSAGE) from None
+ 
+     result = {"memberId": member_id, "inviteId": invite_id}
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+     return result
+ 
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[ID_PEPPER])
+ def addAdmin(req: https_fn.CallableRequest) -> dict:
+     role = (req.data or {}).get("role")
+     if role not in ("chair", "treasurer", "secretary"):
+@@ -276,7 +386,7 @@ def addAdmin(req: https_fn.CallableRequest) -> dict:
+     return _add_person(req, forced_role=role)
+ 
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[ID_PEPPER])
+ def addMember(req: https_fn.CallableRequest) -> dict:
+     return _add_person(req, forced_role="member")
+ 
+@@ -429,7 +539,7 @@ def claimMyInvites(req: https_fn.CallableRequest) -> dict:
+ # member record(s) that phone number matches.
+ # ---------------------------------------------------------------------------
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[ID_PEPPER])
+ def completeProfile(req: https_fn.CallableRequest) -> dict:
+     uid = require_auth(req)
+     data = req.data or {}
+@@ -440,6 +550,11 @@ def completeProfile(req: https_fn.CallableRequest) -> dict:
+     if not is_valid_kenyan_phone(phone):
+         raise bad_request("Enter a valid Kenyan phone number (07xx/01xx or +254...).")
+     normalized = normalize_phone(phone)
++    new_id_key = None
++    if id_number:
++        if not isinstance(id_number, str):
++            raise bad_request("A valid ID number is required.")
++        new_id_key = id_key_for(id_number)
+ 
+     db = _db()
+ 
+@@ -468,14 +583,30 @@ def completeProfile(req: https_fn.CallableRequest) -> dict:
+         member = snap.to_dict()
+         member_ref = snap.reference
+         update = {"uid": uid, "updatedAt": ts}
++        batch = db.batch()
+         if id_number:
+             id_last4, id_masked = mask_id_number(id_number)
+-            update.update({"idNumber": id_number.strip(), "idLast4": id_last4, "nationalIdMasked": id_masked})
++            update.update({
++                "idNumber": id_number.strip(), "idKey": new_id_key,
++                "idLast4": id_last4, "nationalIdMasked": id_masked,
++            })
++            old_key = member.get("idKey") or try_id_key(member.get("idNumber") or "")
++            if old_key != new_id_key:
++                # The ID is changing: take the new lock (refused if another member holds it) and release the
++                # old one, atomically with the profile update below. The error is deliberately generic — the
++                # caller is a member, not an admin, and must not learn who else is on the roster.
++                reap_orphan_id_lock(db, c_id, new_id_key)
++                if find_id_holder(db, c_id, new_id_key, exclude_member_id=member_ref.id):
++                    raise https_fn.HttpsError(ErrorCode.ALREADY_EXISTS, DUPLICATE_ID_SELF_MESSAGE)
++                batch.create(id_lock_ref(db, c_id, new_id_key), _lock_doc(member_ref.id))
++                if old_key:
++                    old_lock = id_lock_ref(db, c_id, old_key).get()
++                    if old_lock.exists and (old_lock.to_dict() or {}).get("memberId") == member_ref.id:
++                        batch.delete(old_lock.reference)
+ 
+         chama_snap = db.document(paths.chama(c_id)).get()
+         chama_name = chama_snap.to_dict().get("name", "") if chama_snap.exists else ""
+ 
+-        batch = db.batch()
+         batch.update(member_ref, update)
+         batch.set(db.document(paths.user_chama_membership(uid, c_id)), {
+             "chamaId": c_id,
+@@ -485,7 +616,10 @@ def completeProfile(req: https_fn.CallableRequest) -> dict:
+             "status": member.get("status", "active"),
+             "updatedAt": ts,
+         })
+-        batch.commit()
++        try:
++            batch.commit()
++        except gexc.AlreadyExists:
++            raise https_fn.HttpsError(ErrorCode.ALREADY_EXISTS, DUPLICATE_ID_SELF_MESSAGE) from None
+         claimed_member_id = claimed_member_id or member_ref.id
+ 
+     return {"memberId": claimed_member_id}
+@@ -516,6 +650,8 @@ def updateMember(req: https_fn.CallableRequest) -> dict:
+     if not target_snap.exists:
+         raise not_found("Member not found.")
+     target = target_snap.to_dict()
++    if target.get("status") == "removed":
++        raise precondition("This member was permanently removed and can't be edited.")
+ 
+     is_self = target.get("uid") == uid
+     if caller.is_finance_admin:
+@@ -592,7 +728,7 @@ OPEN_LOAN_STATUSES = ("pending_approval", "awaiting_treasurer", "approved", "act
+ OPEN_POT_STATUSES = ("draft", "active")
+ 
+ 
+-@https_fn.on_call(region=REGION)
++@https_fn.on_call(region=REGION, secrets=[ID_PEPPER])
+ def removeMemberPermanently(req: https_fn.CallableRequest) -> dict:
+     uid = require_auth(req)
+     data = req.data or {}
+@@ -646,16 +782,27 @@ def removeMemberPermanently(req: https_fn.CallableRequest) -> dict:
+         )
+ 
+     ts = now_ms()
+-    member_ref.update({"status": "removed", "removedAt": ts, "removedBy": uid, "updatedAt": ts})
++    batch = db.batch()
++    batch.update(member_ref, {"status": "removed", "removedAt": ts, "removedBy": uid, "updatedAt": ts})
+ 
+     # Same membership-index sync updateMember does for a role/status change —
+     # so a removed member's session immediately reflects they're out, rather
+     # than waiting on the on_member_write trigger.
+     if member.get("uid"):
+-        db.document(paths.user_chama_membership(member["uid"], chama_id)).set(
+-            {"status": "removed", "updatedAt": ts}, merge=True
++        batch.set(
++            db.document(paths.user_chama_membership(member["uid"], chama_id)),
++            {"status": "removed", "updatedAt": ts},
++            merge=True,
+         )
+ 
++    # Release the member's ID so the number can be registered again (a removed member is terminal).
++    held_key = member.get("idKey") or try_id_key(member.get("idNumber") or "")
++    if held_key:
++        lock = id_lock_ref(db, chama_id, held_key).get()
++        if lock.exists and (lock.to_dict() or {}).get("memberId") == member_id:
++            batch.delete(lock.reference)
++    batch.commit()
++
+     result = {"ok": True}
+     record_result(db, chama_id, data.get("clientRequestId"), result)
+     return result
+diff --git a/functions/shared/firestore_paths.py b/functions/shared/firestore_paths.py
+index effc808..6bdf86e 100644
+--- a/functions/shared/firestore_paths.py
++++ b/functions/shared/firestore_paths.py
+@@ -21,6 +21,20 @@ def member(chama_id: str, member_id: str) -> str:
+     return f"{MC.CHAMAS}/{chama_id}/{MC.MEMBERS}/{member_id}"
+ 
+ 
++# Per-chama ID-number uniqueness locks: one document per member ID, keyed by the idKey HMAC
++# (shared/id_key.py). Created atomically with the member, so a chama can never hold two members
++# with the same ID number. Server-only (firestore.rules denies every client access).
++MEMBER_ID_KEYS = "memberIdKeys"
++
++
++def member_id_keys(chama_id: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MEMBER_ID_KEYS}"
++
++
++def member_id_key(chama_id: str, id_key: str) -> str:
++    return f"{MC.CHAMAS}/{chama_id}/{MEMBER_ID_KEYS}/{id_key}"
++
++
+ def loan_products(chama_id: str) -> str:
+     return f"{MC.CHAMAS}/{chama_id}/{MC.LOAN_PRODUCTS}"
+ 
+diff --git a/functions/tests/conftest.py b/functions/tests/conftest.py
+index 7bb5cab..6ccf0a5 100644
+--- a/functions/tests/conftest.py
++++ b/functions/tests/conftest.py
+@@ -5,6 +5,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
++@pytest.fixture(autouse=True)
++def _id_pepper(monkeypatch):
++    """Member writes derive an ID-uniqueness lock from the pepper and refuse to run without one."""
++    import types
++    from mychama import identity
++    monkeypatch.setattr(identity, "ID_PEPPER", types.SimpleNamespace(value="test-pepper-123"))
++
++
+ @pytest.fixture(autouse=True)
+ def _plain_transactions(monkeypatch):
+     """The fake DB applies writes immediately, so @firestore.transactional becomes a pass-through."""
+diff --git a/functions/tests/fakes.py b/functions/tests/fakes.py
+index 8dbafeb..c84a7ac 100644
+--- a/functions/tests/fakes.py
++++ b/functions/tests/fakes.py
+@@ -8,6 +8,7 @@ import re
+ from typing import Any
+ 
+ from firebase_admin import firestore as real_fs
++from google.api_core import exceptions as gexc
+ 
+ _SENT = real_fs.DELETE_FIELD
+ 
+@@ -26,6 +27,19 @@ def _split_path(path: str) -> list[str]:
+     return parts
+ 
+ 
++def _match(x, op, v) -> bool:
++    """Evaluates ONLY the operator asked for (a dict of all of them would raise on e.g. `None in "abc"`)."""
++    if op == "==":
++        return x == v
++    if op == "<=":
++        return x is not None and x <= v
++    if op == "in":
++        return x in v
++    if op == "array_contains":
++        return isinstance(x, list) and v in x
++    raise NotImplementedError(f"fake Firestore does not support the {op!r} operator")
++
++
+ class Snap:
+     def __init__(self, ref: "Ref", data: dict | None):
+         self.reference, self.id, self._d = ref, ref.id, data
+@@ -53,6 +67,16 @@ class Ref:
+ 
+     def set(self, data: dict, merge: bool = False) -> None:
+         import copy
++        if merge and self.path in self.db.store:
++            self.db.store[self.path].update(copy.deepcopy(data))
++        else:
++            self.db.store[self.path] = copy.deepcopy(data)
++
++    def create(self, data: dict) -> None:
++        """Like Firestore's create(): fails when the document already exists."""
++        import copy
++        if self.path in self.db.store:
++            raise gexc.AlreadyExists(f"document already exists: {self.path}")
+         self.db.store[self.path] = copy.deepcopy(data)
+ 
+     def update(self, changes: dict) -> None:
+@@ -96,8 +120,7 @@ class Query:
+                 continue
+             ok = True
+             for f, op, v in self.filters:
+-                x = data.get(f)
+-                ok &= {"==": x == v, "<=": x is not None and x <= v, "in": x in v}[op]
++                ok &= _match(data.get(f), op, v)
+             if ok:
+                 out.append(Snap(Ref(self.db, path), data))
+         if self.order:
+@@ -117,24 +140,59 @@ class Coll(Query):
+ 
+ 
+ class Batch:
++    """Atomic: if any create() hits an existing document, NOTHING in the batch is applied (like Firestore)."""
++
+     def __init__(self):
+         self.ops: list = []
+ 
+-    def set(self, ref, data):
+-        self.ops.append((ref, data))
++    def set(self, ref, data, merge=False):
++        self.ops.append(("set", ref, data, merge))
++
++    def create(self, ref, data):
++        self.ops.append(("create", ref, data, False))
++
++    def update(self, ref, changes):
++        self.ops.append(("update", ref, changes, False))
++
++    def delete(self, ref):
++        self.ops.append(("delete", ref, None, False))
+ 
+     def commit(self):
+-        for ref, data in self.ops:
+-            ref.set(data)
++        created: set[str] = set()
++        for op, ref, _data, _merge in self.ops:
++            if op == "create":
++                if ref.path in self.db_store(ref) or ref.path in created:
++                    raise gexc.AlreadyExists(f"document already exists: {ref.path}")
++                created.add(ref.path)
++        for op, ref, data, merge in self.ops:
++            if op == "set":
++                ref.set(data, merge=merge)
++            elif op == "create":
++                ref.create(data)
++            elif op == "update":
++                ref.update(data)
++            elif op == "delete":
++                ref.delete()
++        self.ops = []
++
++    @staticmethod
++    def db_store(ref):
++        return ref.db.store
+ 
+ 
+ class Txn:
+-    def set(self, ref, data):
+-        ref.set(data)
++    def set(self, ref, data, merge=False):
++        ref.set(data, merge=merge)
++
++    def create(self, ref, data):
++        ref.create(data)
+ 
+     def update(self, ref, changes):
+         ref.update(changes)
+ 
++    def delete(self, ref):
++        ref.delete()
++
+ 
+ class FakeDB:
+     def __init__(self, store: dict[str, dict] | None = None):
+diff --git a/functions/tests/test_member_id_uniqueness.py b/functions/tests/test_member_id_uniqueness.py
+new file mode 100644
+index 0000000..2e65e8e
+--- /dev/null
++++ b/functions/tests/test_member_id_uniqueness.py
+@@ -0,0 +1,237 @@
++"""
++One ID number, one member — per chama. Covers the lock registry (chamas/{id}/memberIdKeys/{idKey}) end to end
++through every writer: addMember/addAdmin, createChama, completeProfile, removeMemberPermanently, updateMember
++and the Desk import. The fake DB makes batch.create() atomic and AlreadyExists-raising like Firestore does.
++"""
++import inspect
++import types
++
++import pytest
++from firebase_functions import https_fn
++
++from fakes import FakeDB
++from mychama import desk_delegate as dd
++from mychama import identity
++from shared import firestore_paths as paths
++from shared.id_key import compute_id_key
++
++PEPPER = "test-pepper-123"          # same value conftest.py binds as ID_PEPPER
++
++
++def key(raw):
++    return compute_id_key(raw, PEPPER)
++
++
++def unwrap(fn):
++    return inspect.unwrap(fn)
++
++
++def req(data, uid="u1", token=None):
++    return types.SimpleNamespace(auth=types.SimpleNamespace(uid=uid, token=token or {}), data=data)
++
++
++def lock_path(chama_id, raw):
++    return paths.member_id_key(chama_id, key(raw))
++
++
++def locks(db):
++    return [k for k in db.store if "/memberIdKeys/" in k]
++
++
++def members(db, chama_id="c1"):
++    return [k for k in db.store if k.startswith(f"chamas/{chama_id}/members/")]
++
++
++@pytest.fixture
++def db(monkeypatch):
++    d = FakeDB({
++        "chamas/c1": {"name": "Umoja", "plan": "starter", "status": "active"},
++        "chamas/c1/members/chair": {
++            "name": "Chair Person", "phone": "0712000001", "phoneNormalized": "+254712000001",
++            "role": "chair", "status": "active", "uid": "u1",
++        },
++    })
++    monkeypatch.setattr(identity, "_db", lambda: d)
++    monkeypatch.setattr(identity, "require_finance_admin", lambda db_, uid, chama_id: types.SimpleNamespace(member_id="chair"))
++    return d
++
++
++def add(db, name, phone, idn, role=None):
++    fn = unwrap(identity.addAdmin if role else identity.addMember)
++    data = {"chamaId": "c1", "name": name, "phone": phone, "idNumber": idn}
++    if role:
++        data["role"] = role
++    return fn(req(data))
++
++
++# ------------------------------------------------------------------ addMember / addAdmin
++def test_second_member_with_same_id_is_refused_even_when_formatted_differently(db):
++    add(db, "Amina", "0722000001", "12345678")
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Amina Again", "0722000002", "12 345-678")
++    assert e.value.code == "already-exists" and "Amina" in e.value.message
++    assert len(members(db)) == 2                                     # chair + Amina only
++    assert len([k for k in db.store if k.startswith("chamas/c1/invites/")]) == 1
++
++
++def test_the_new_member_carries_its_idkey_and_a_lock_pointing_at_it(db):
++    out = add(db, "Amina", "0722000001", "12345678")
++    doc = db.store[f"chamas/c1/members/{out['memberId']}"]
++    assert doc["idKey"] == key("12345678")
++    assert db.store[lock_path("c1", "12345678")]["memberId"] == out["memberId"]
++
++
++def test_the_same_id_is_fine_in_a_different_chama(db):
++    add(db, "Amina", "0722000001", "12345678")
++    db.store["chamas/c2"] = {"name": "Other", "plan": "starter", "status": "active"}
++    db.store["chamas/c2/members/chair2"] = {"phoneNormalized": "+254712000099", "status": "active", "role": "chair"}
++    unwrap(identity.addMember)(req({"chamaId": "c2", "name": "Amina", "phone": "0722000001", "idNumber": "12345678"}))
++    assert lock_path("c2", "12345678") in db.store
++
++
++def test_an_inactive_member_still_holds_their_id_and_the_message_says_reactivate(db):
++    out = add(db, "Amina", "0722000001", "12345678")
++    db.store[f"chamas/c1/members/{out['memberId']}"]["status"] = "inactive"
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Amina Back", "0733000001", "12345678")
++    assert e.value.code == "already-exists" and "Reactivate" in e.value.message
++
++
++def test_addadmin_is_covered_too(db):
++    add(db, "Amina", "0722000001", "12345678")
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Treasurer", "0722000009", "12345678", role="treasurer")
++    assert e.value.code == "already-exists"
++
++
++def test_lock_alone_blocks_when_the_holders_idkey_is_not_written_yet(db):
++    # Trigger lag: the holder has the ID but no idKey yet, so the friendly pre-check cannot see it.
++    db.store["chamas/c1/members/lag"] = {"name": "Lagging", "idNumber": "12345678", "status": "active", "role": "member"}
++    db.store[lock_path("c1", "12345678")] = {"memberId": "lag", "createdAt": 1}
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Newcomer", "0722000003", "12345678")
++    assert e.value.code == "already-exists" and e.value.message == identity.DUPLICATE_ID_MESSAGE
++    assert "chamas/c1/members/lag" in db.store and len(members(db)) == 2
++
++
++def test_a_stray_lock_with_no_live_holder_does_not_block_the_id(db):
++    db.store[lock_path("c1", "12345678")] = {"memberId": "ghost", "createdAt": 1}          # member doc long gone
++    out = add(db, "Amina", "0722000001", "12345678")
++    assert db.store[lock_path("c1", "12345678")]["memberId"] == out["memberId"]
++
++
++def test_invalid_id_and_missing_pepper(db, monkeypatch):
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Amina", "0722000001", "ab")
++    assert e.value.code == "invalid-argument"
++    monkeypatch.setattr(identity, "ID_PEPPER", types.SimpleNamespace(value=""))
++    with pytest.raises(https_fn.HttpsError) as e:
++        add(db, "Amina", "0722000001", "12345678")
++    assert e.value.code == "internal"                                   # fails closed, writes nothing
++    assert len(members(db)) == 1 and not locks(db)
++
++
++# ------------------------------------------------------------------ removal and reactivation
++def test_permanent_removal_releases_the_id_for_a_new_member(db):
++    out = add(db, "Amina", "0722000001", "12345678")
++    unwrap(identity.removeMemberPermanently)(req({"chamaId": "c1", "memberId": out["memberId"]}))
++    assert db.store[f"chamas/c1/members/{out['memberId']}"]["status"] == "removed"
++    assert lock_path("c1", "12345678") not in db.store
++    again = add(db, "Amina New", "0744000001", "12345678")
++    assert db.store[lock_path("c1", "12345678")]["memberId"] == again["memberId"]
++
++
++def test_a_removed_member_cannot_be_resurrected_into_a_duplicate(db, monkeypatch):
++    out = add(db, "Amina", "0722000001", "12345678")
++    unwrap(identity.removeMemberPermanently)(req({"chamaId": "c1", "memberId": out["memberId"]}))
++    add(db, "Amina New", "0744000001", "12345678")
++    monkeypatch.setattr(identity, "require_membership", lambda db_, uid, chama_id: types.SimpleNamespace(is_finance_admin=True))
++    with pytest.raises(https_fn.HttpsError) as e:
++        unwrap(identity.updateMember)(req({"chamaId": "c1", "memberId": out["memberId"], "patch": {"status": "active"}}))
++    assert e.value.code == "failed-precondition"
++
++
++# ------------------------------------------------------------------ createChama
++def test_create_chama_takes_the_chairs_lock(db, monkeypatch):
++    monkeypatch.setattr(identity, "assign_public_code", lambda txn, d, ref: "SMC-0001")
++    token = {"email": "a@b.co", "email_verified": True}
++    out = unwrap(identity.createChama)(req({
++        "name": "New Chama", "contributionAmount": 500, "contributionCycle": "monthly",
++        "adminName": "Founder", "adminPhone": "0755000001", "adminIdNumber": "87654321",
++    }, uid="u9", token=token))
++    assert db.store[lock_path(out["chamaId"], "87654321")]["memberId"] == out["memberId"]
++    assert db.store[f"chamas/{out['chamaId']}/members/{out['memberId']}"]["idKey"] == key("87654321")
++
++
++# ------------------------------------------------------------------ completeProfile
++def pending_member(db, member_id, phone_norm, idn=None, chama="c1"):
++    doc = {"name": member_id, "phone": phone_norm, "phoneNormalized": phone_norm, "role": "member",
++           "status": "active", "uid": None}
++    if idn:
++        doc.update({"idNumber": idn, "idKey": key(idn)})
++        db.store[lock_path(chama, idn)] = {"memberId": member_id, "createdAt": 1}
++    db.store[f"chamas/{chama}/members/{member_id}"] = doc
++
++
++def test_complete_profile_moves_the_lock_when_the_id_changes(db):
++    pending_member(db, "m2", "+254766000001", idn="11111111")
++    unwrap(identity.completeProfile)(req({"phone": "0766000001", "idNumber": "22222222", "chamaId": "c1"}, uid="u2"))
++    assert lock_path("c1", "11111111") not in db.store
++    assert db.store[lock_path("c1", "22222222")]["memberId"] == "m2"
++    doc = db.store["chamas/c1/members/m2"]
++    assert doc["uid"] == "u2" and doc["idKey"] == key("22222222")
++
++
++def test_complete_profile_refuses_an_id_another_member_holds_without_naming_them(db):
++    pending_member(db, "m1", "+254766000002", idn="33333333")
++    pending_member(db, "m2", "+254766000003", idn="44444444")
++    with pytest.raises(https_fn.HttpsError) as e:
++        unwrap(identity.completeProfile)(req({"phone": "0766000003", "idNumber": "33333333", "chamaId": "c1"}, uid="u2"))
++    assert e.value.code == "already-exists" and e.value.message == identity.DUPLICATE_ID_SELF_MESSAGE
++    assert "m1" not in e.value.message
++    assert db.store["chamas/c1/members/m2"]["uid"] is None                      # nothing was written
++    assert db.store[lock_path("c1", "44444444")]["memberId"] == "m2"
++
++
++def test_complete_profile_without_an_id_change_touches_no_lock(db):
++    pending_member(db, "m2", "+254766000004", idn="55555555")
++    unwrap(identity.completeProfile)(req({"phone": "0766000004", "idNumber": "55 555-555", "chamaId": "c1"}, uid="u2"))
++    assert db.store[lock_path("c1", "55555555")]["memberId"] == "m2" and len(locks(db)) == 1
++
++
++# ------------------------------------------------------------------ Desk import
++def desk_db():
++    return FakeDB({
++        "publicCodes/SMC-0001": {"chamaId": "c1"},
++        "chamas/c1": {"name": "Umoja", "publicCode": "SMC-0001", "plan": "starter", "smsCredits": 100,
++                      "supportAgents": {"COG-0007": {"addedAt": 5, "addedBy": "m1"}}},
++        "chamas/c1/members/m1": {"name": "Chair", "phoneNormalized": "+254712000001", "role": "chair",
++                                 "status": "active", "idNumber": "99999999"},
++    })
++
++
++def call(db, action, payload, rid="req-00000001"):
++    return dd.handle(db, {"action": action, "entityCode": "SMC-0001", "agentCode": "COG-0007", "requestId": rid, "payload": payload})
++
++
++def test_desk_validation_flags_duplicate_ids_in_the_file_and_against_existing_members(db):
++    rows = [
++        {"name": "A", "phone": "0722000001", "idNumber": "12345678"},
++        {"name": "B", "phone": "0722000002", "idNumber": "12 345-678"},       # same ID as A, different phone
++        {"name": "C", "phone": "0722000003", "idNumber": "99999999"},         # the chair's ID
++        {"name": "D", "phone": "0722000004", "idNumber": "22345678"},
++    ]
++    _, resp = call(desk_db(), "validate_records", {"rows": rows})
++    res = resp["result"]
++    assert [v["name"] for v in res["valid"]] == ["A", "D"]
++    assert {(e["row"], e["field"]) for e in res["errors"]} == {(2, "idNumber"), (3, "idNumber")}
++
++
++def test_desk_commit_takes_a_lock_per_member_and_blocks_a_second_import(db):
++    d = desk_db()
++    rows = [{"name": "A", "phone": "0722000001", "idNumber": "12345678"}]
++    _, first = call(d, "commit_records", {"rows": rows, "source": "excel"}, rid="commit-0001")
++    assert first["result"]["created"] == 1 and lock_path("c1", "12345678") in d.store
++    again = [{"name": "A2", "phone": "0722000077", "idNumber": "12345678"}]
++    _, second = call(d, "commit_records", {"rows": again, "source": "excel"}, rid="commit-0002")
++    assert second["result"]["created"] == 0 and second["result"]["errors"][0]["field"] == "idNumber"
+diff --git a/tools/backfill_member_id_locks.py b/tools/backfill_member_id_locks.py
+new file mode 100644
+index 0000000..187d915
+--- /dev/null
++++ b/tools/backfill_member_id_locks.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""
++One-off, idempotent backfill of the per-chama ID-number locks (chamas/{chamaId}/memberIdKeys/{idKey}) for
++members that existed before one-ID-one-member was enforced.
++
++    export GOOGLE_CLOUD_PROJECT=mychama1          # runs with Application Default Credentials
++    export MYCHAMA_ID_PEPPER='<same value as the Secret Manager secret>'
++    python tools/backfill_member_id_locks.py            # DRY RUN (default): reports only
++    python tools/backfill_member_id_locks.py --apply    # creates the missing locks
++
++What it does, per chama, over every member that is not 'removed':
++  - one member holds an ID            -> make sure its lock exists (created with create(), never overwritten)
++  - two or more members share an ID   -> REPORTED, never auto-resolved and never locked. Fix those by hand
++                                         (remove or correct the extra member), then re-run.
++  - a lock already held by someone else -> reported as a conflict.
++
++Exit code 3 when duplicate groups or conflicts remain, so a script or CI step notices. Safe to re-run.
++Never prints ID numbers or keys: only counts, chama ids, member ids, role and status.
++"""
++import argparse
++import os
++import sys
++from collections import defaultdict
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "functions"))
++
++import firebase_admin  # noqa: E402
++from firebase_admin import firestore  # noqa: E402
++from google.api_core import exceptions as gexc  # noqa: E402
++
++from shared import firestore_paths as paths  # noqa: E402
++from shared.dates import now_ms  # noqa: E402
++from shared.id_key import compute_id_key  # noqa: E402
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--apply", action="store_true", help="actually create the locks (default is a dry run)")
++    args = ap.parse_args()
++
++    pepper = os.environ.get("MYCHAMA_ID_PEPPER", "")
++    if not pepper:
++        print("MYCHAMA_ID_PEPPER is not set", file=sys.stderr)
++        return 2
++
++    firebase_admin.initialize_app()
++    db = firestore.client()
++
++    # (chamaId, idKey) -> [(memberId, role, status)]
++    groups: dict[tuple[str, str], list[tuple[str, str, str]]] = defaultdict(list)
++    seen = no_id = removed = 0
++    for snap in db.collection_group(paths.MC.MEMBERS).stream():
++        seen += 1
++        data = snap.to_dict() or {}
++        if data.get("status") == "removed":
++            removed += 1
++            continue
++        key = compute_id_key(data.get("idNumber") or "", pepper)
++        if not key:
++            no_id += 1
++            continue
++        chama_id = snap.reference.parent.parent.id
++        groups[(chama_id, key)].append((snap.id, str(data.get("role") or "?"), str(data.get("status") or "?")))
++
++    unique = created = already = conflicts = 0
++    duplicate_groups: list[tuple[str, list[tuple[str, str, str]]]] = []
++    conflict_groups: list[tuple[str, str]] = []
++    for (chama_id, key), members in groups.items():
++        if len(members) > 1:
++            duplicate_groups.append((chama_id, members))
++            continue
++        unique += 1
++        member_id = members[0][0]
++        ref = db.document(paths.member_id_key(chama_id, key))
++        lock = ref.get()
++        if lock.exists:
++            if (lock.to_dict() or {}).get("memberId") == member_id:
++                already += 1
++            else:
++                conflicts += 1
++                conflict_groups.append((chama_id, member_id))
++            continue
++        if args.apply:
++            try:
++                ref.create({"memberId": member_id, "createdAt": now_ms()})
++                created += 1
++            except gexc.AlreadyExists:
++                already += 1          # the live code path created it between our read and write
++        else:
++            created += 1              # dry run: would create
++
++    mode = "APPLIED" if args.apply else "DRY RUN"
++    verb = "created" if args.apply else "would create"
++    print(f"[{mode}] members seen={seen} removed={removed} without an ID={no_id} unique IDs={unique}")
++    print(f"[{mode}] locks {verb}={created} already in place={already} held by a different member={conflicts}")
++    if duplicate_groups:
++        print(f"\n{len(duplicate_groups)} duplicate group(s) — two or more members share one ID. Resolve by hand, then re-run:")
++        for chama_id, members in duplicate_groups:
++            detail = ", ".join(f"{mid} ({role}, {status})" for mid, role, status in members)
++            print(f"  chamas/{chama_id}/members: {detail}")
++    if conflict_groups:
++        print(f"\n{len(conflict_groups)} member(s) whose ID lock is held by a different member:")
++        for chama_id, member_id in conflict_groups:
++            print(f"  chamas/{chama_id}/members/{member_id}")
++    return 3 if (duplicate_groups or conflict_groups) else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

@@ -158,11 +158,10 @@ service cloud.firestore {
                     || (isMember(chamaId) && !('idNumber' in resource.data))
                     || isSelf(chamaId, memberId);
 
-        allow create: if isFinanceAdmin(chamaId)
-                      && request.resource.data.totalContributed == 0
-                      && request.resource.data.creditBalance == 0
-                      && request.resource.data.status in ['active', 'inactive']
-                      && request.resource.data.role in ['chair', 'treasurer', 'secretary', 'member'];
+        // Members are created only by the addMember / addAdmin / createChama callables and the Desk import.
+        // They take the chama's ID-number lock (memberIdKeys) in the same write, which is what guarantees
+        // two members can never share an ID — a client write cannot take that lock, so none is accepted.
+        allow create: if false;
 
         // Balances are derived from the ledger — a client may never set them.
         // 'removed' is a terminal status reachable only through
@@ -171,8 +170,13 @@ service cloud.firestore {
         // direct write can never skip them.
         allow update: if (
                         isFinanceAdmin(chamaId)
-                        && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt'])
+                        && untouched(['totalContributed', 'creditBalance', 'uid', 'createdAt',
+                                      // ID fields are bound to the chama's ID-number lock (memberIdKeys):
+                                      // changing one here would bypass the one-ID-one-member guarantee.
+                                      'idNumber', 'idKey', 'idLast4', 'nationalIdMasked'])
                         && request.resource.data.status in ['active', 'inactive', 'suspended']
+                        // 'removed' is terminal: its ID has been released for someone else.
+                        && resource.data.status != 'removed'
                       ) || (
                         // A member maintains their own contact details only.
                         isSelf(chamaId, memberId)
@@ -194,6 +198,12 @@ service cloud.firestore {
         // Members are deactivated, never deleted — their ledger history must
         // stay resolvable.
         allow delete: if false;
+      }
+
+      // ID-number uniqueness locks (one per member ID, keyed by the idKey HMAC). Server-only: the document
+      // ids are keyed fingerprints of national IDs, so nothing here is ever readable or writable by a client.
+      match /memberIdKeys/{idKey} {
+        allow read, write: if false;
       }
 
       // -------------------------------------------------------------- //
