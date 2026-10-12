@@ -1,0 +1,38 @@
+From bfc6b237103f0c811d0aa9f60dda9261eb1c835d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 12 Oct 2026 10:31:47 +0000
+Subject: [PATCH] fix(desk): index for the desk sweeper query on desk_requests
+ (status, createdAt)
+
+---
+ firestore.indexes.json | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/firestore.indexes.json b/firestore.indexes.json
+index 4849772..c1fcf3d 100644
+--- a/firestore.indexes.json
++++ b/firestore.indexes.json
+@@ -525,6 +525,20 @@
+           "order": "DESCENDING"
+         }
+       ]
++    },
++    {
++      "collectionGroup": "desk_requests",
++      "queryScope": "COLLECTION",
++      "fields": [
++        {
++          "fieldPath": "status",
++          "order": "ASCENDING"
++        },
++        {
++          "fieldPath": "createdAt",
++          "order": "ASCENDING"
++        }
++      ]
+     }
+   ],
+   "fieldOverrides": [
+-- 
+2.43.0
+
