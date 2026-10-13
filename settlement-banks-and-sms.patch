@@ -1,0 +1,1061 @@
+diff --git a/functions/main.py b/functions/main.py
+index 98e20df..f38dbe5 100644
+--- a/functions/main.py
++++ b/functions/main.py
+@@ -63,6 +63,7 @@ from mychama.mgr import (  # noqa: E402,F401
+ 
+ # --- Phase 3: Payments, SMS & Settlement -----------------------------------
+ from mychama.payments import (  # noqa: E402,F401
++    listKenyaBanks,
+     setupSettlementAccount,
+     requestSettlementChange,
+     approveSettlementChange,
+diff --git a/functions/mychama/payments.py b/functions/mychama/payments.py
+index 144af62..ed5d18a 100644
+--- a/functions/mychama/payments.py
++++ b/functions/mychama/payments.py
+@@ -30,15 +30,16 @@ equal to the caller's own) is unchanged from before, ignores
+ 
+ setupSettlementAccount / requestSettlementChange / approveSettlementChange
+ create/change the Paystack subaccount + split code a chama's collections
+-settle into. Bank/paybill/till codes for Paystack Kenya's subaccount API
+-are NOT hardcoded here — `PAYBILL_BANK_CODE`/`TILL_BANK_CODE` are
+-placeholders to fill in from Paystack's own /bank?currency=KES list before
+-going live; get this wrong and settlement money has nowhere valid to land,
+-so treat it as a go-live blocker, not a nice-to-have.
++settle into. Paybill and Till use Paystack Kenya's fixed codes (MPPAYBILL / MPTILL, from
++GET /bank?country=kenya). Bank settlement uses the code of the bank the user
++picked from listKenyaBanks, which returns banks only (never M-PESA, Paybill
++or Till entries).
+ """
+ 
+ from __future__ import annotations
+ 
++import time
++
+ from firebase_functions import https_fn
+ from firebase_admin import firestore
+ 
+@@ -49,19 +50,28 @@ from shared.constants import PLANS, SECURITY, IntentPurposeCode
+ from shared.dates import now_ms
+ from shared.errors import bad_request, not_found, precondition, rate_limited, require_auth
+ from shared.idempotency import already_applied, record_result
+-from shared.money import contribution_fees, loan_repayment_fees, mgr_contribution_fees
++from shared.money import contribution_fees, loan_repayment_fees, main_account_charge_subunits, mgr_contribution_fees
+ from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone
+ from shared.roles import require_finance_admin, require_membership
+ from shared.secrets import PAYSTACK_SECRET_KEY
+ 
+ REGION = "africa-south1"
+ 
+-# TODO before go-live: confirm against Paystack's GET /bank?currency=KES&type=mobile_money
+-# (and the equivalent for paybill/till, which Paystack Kenya treats as bank-style
+-# settlement destinations under specific codes) — these are placeholders.
+-PAYBILL_BANK_CODE = "MPESA"
+-TILL_BANK_CODE = "MPESA"
++# Codes from Paystack's GET /bank?country=kenya (type mobile_money_business).
++PAYBILL_BANK_CODE = "MPPAYBILL"
++TILL_BANK_CODE = "MPTILL"
+ BANK_CODE_BY_TYPE = {"paybill": PAYBILL_BANK_CODE, "till": TILL_BANK_CODE}
++# Paybill is NOT accepted for settlement for now: a Paybill payout needs an account reference that the
++# subaccount API has no field for. A chama must settle to a bank account or a Till.
++ENABLED_SETTLEMENT_TYPES = ("till", "bank")
++# PAY's mychamaPayInitiate refuses to charge a chama unless settlementSplitKeyVersion == 2 (the split belongs to
++# MyChama's own Paystack account), so every settlement account saved here must carry it.
++SPLIT_KEY_VERSION = 2
++# Never valid as a "bank": the M-PESA wallet, Paybill and Till entries in the same list.
++MOBILE_MONEY_CODES = {"MPESA", PAYBILL_BANK_CODE, TILL_BANK_CODE}
++
++_BANKS_TTL_SECONDS = 60 * 60
++_banks_cache: dict = {"at": 0.0, "banks": []}
+ 
+ 
+ def _db():
+@@ -77,14 +87,42 @@ def _purpose_code(purpose: str) -> str:
+ 
+ 
+ def _bank_code(account_type: str, explicit: str | None) -> str:
++    if account_type == "paybill":
++        raise precondition("M-Pesa Paybill settlement is currently under maintenance. Please use a bank account or a Till.")
+     if account_type == "bank":
+-        if not explicit:
+-            raise bad_request("bankCode is required for a bank settlement account.")
++        if not explicit or explicit.upper() in MOBILE_MONEY_CODES:
++            raise bad_request("Pick a bank for a bank settlement account.")
+         return explicit
++    if account_type not in BANK_CODE_BY_TYPE:
++        raise bad_request("accountType must be paybill, till or bank.")
+     return BANK_CODE_BY_TYPE[account_type]
+ 
+ 
+-def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_type: str, account_number: str, bank_code: str) -> str:
++def _kenya_banks(secret_key: str) -> list[dict]:
++    """Kenyan banks only (name + code), alphabetical, cached for an hour. Excludes M-PESA, Paybill and Till."""
++    if _banks_cache["banks"] and time.time() - _banks_cache["at"] < _BANKS_TTL_SECONDS:
++        return _banks_cache["banks"]
++    banks = [
++        {"name": b["name"], "code": b["code"]}
++        for b in paystack.list_banks(secret_key=secret_key, country="kenya")
++        if b.get("name") and b.get("code")
++        and b.get("active", True) and not b.get("is_deleted")
++        and not str(b.get("type", "")).startswith("mobile_money")
++        and str(b["code"]).upper() not in MOBILE_MONEY_CODES
++    ]
++    banks.sort(key=lambda b: b["name"].lower())
++    _banks_cache.update(at=time.time(), banks=banks)
++    return banks
++
++
++@https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
++def listKenyaBanks(req: https_fn.CallableRequest) -> dict:
++    require_auth(req)
++    return {"banks": _kenya_banks(PAYSTACK_SECRET_KEY.value)}
++
++
++def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_type: str, account_number: str, bank_code: str) -> tuple[str, str]:
++    """Returns (split_code, subaccount_code). Collections are charged against the subaccount code (see initiatePayment)."""
+     sub = paystack.create_subaccount(
+         secret_key=secret_key,
+         business_name=chama_name,
+@@ -93,7 +131,7 @@ def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_ty
+     )
+     subaccount_code = sub["data"]["subaccount_code"]
+     split = paystack.create_split(secret_key=secret_key, name=f"{chama_name} settlement", subaccount_code=subaccount_code)
+-    return split["data"]["split_code"]
++    return split["data"]["split_code"], subaccount_code
+ 
+ 
+ @https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
+@@ -120,11 +158,11 @@ def setupSettlementAccount(req: https_fn.CallableRequest) -> dict:
+ 
+     account_type = data.get("accountType")
+     account_number = data.get("accountNumber") or ""
+-    bank_code = _bank_code(account_type, data.get("bankCode"))
+     if account_type not in ("paybill", "till", "bank") or not account_number:
+         raise bad_request("accountType and accountNumber are required.")
++    bank_code = _bank_code(account_type, data.get("bankCode"))
+ 
+-    split_code = _create_subaccount_and_split(
++    split_code, subaccount_code = _create_subaccount_and_split(
+         secret_key=PAYSTACK_SECRET_KEY.value,
+         chama_name=chama.get("name", "Chama"),
+         account_type=account_type,
+@@ -135,6 +173,8 @@ def setupSettlementAccount(req: https_fn.CallableRequest) -> dict:
+     chama_ref.update({
+         "settlementAccount": f"{account_type}:{account_number}",
+         "settlementSplitCode": split_code,
++        "settlementSubaccountCode": subaccount_code,
++        "settlementSplitKeyVersion": SPLIT_KEY_VERSION,
+         "updatedAt": now_ms(),
+     })
+     return {"settlementSplitCode": split_code}
+@@ -154,6 +194,7 @@ def requestSettlementChange(req: https_fn.CallableRequest) -> dict:
+     account_type = data.get("accountType")
+     if account_type not in ("paybill", "till", "bank") or not data.get("accountNumber"):
+         raise bad_request("accountType and accountNumber are required.")
++    _bank_code(account_type, data.get("bankCode"))   # rejects Paybill (maintenance) and a bank request without a real bank
+ 
+     ts = now_ms()
+     ref = db.collection(paths.settlement_account_requests(chama_id)).document()
+@@ -203,7 +244,7 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
+     chama_ref = db.document(paths.chama(chama_id))
+     chama = chama_ref.get().to_dict()
+     bank_code = _bank_code(request["accountType"], request.get("bankCode"))
+-    split_code = _create_subaccount_and_split(
++    split_code, subaccount_code = _create_subaccount_and_split(
+         secret_key=PAYSTACK_SECRET_KEY.value,
+         chama_name=chama.get("name", "Chama"),
+         account_type=request["accountType"],
+@@ -216,6 +257,8 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
+     chama_ref.update({
+         "settlementAccount": f"{request['accountType']}:{request['accountNumber']}",
+         "settlementSplitCode": split_code,
++        "settlementSubaccountCode": subaccount_code,
++        "settlementSplitKeyVersion": SPLIT_KEY_VERSION,
+         "updatedAt": ts,
+     })
+     return {"ok": True}
+@@ -280,6 +323,8 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+         raise precondition("This chama's plan doesn't include online collections yet — pay in cash, or ask the chair to upgrade the plan.")
+     if not chama.get("settlementSplitCode"):
+         raise precondition("This chama hasn't set up a settlement account yet — ask the chair to set one up first.")
++    if not chama.get("settlementSubaccountCode"):
++        raise precondition("This chama's settlement account needs to be saved again before it can collect — ask the chair to re-enter it in Payments.")
+ 
+     # Rate limit: MAX_INTENTS_PER_HOUR, keyed on whoever is actually being
+     # charged (member_id) — not the caller — so an admin working down a
+@@ -348,6 +393,10 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
+             phone_e164=normalized_phone,
+             provider=provider,
+             reference=reference,
++            # The chama's subaccount gets exactly the net amount: the main account keeps gross - net as a flat
++            # charge (and bears Paystack's fee out of it), so the chama is never paid more or less than owed.
++            subaccount=chama["settlementSubaccountCode"],
++            transaction_charge_subunits=main_account_charge_subunits(fee_calc["gross"], fee_calc["net"]),
+             metadata={
+                 "chargeType": "mychama_payment",
+                 "targetProject": "mychama1",
+diff --git a/functions/mychama/sms.py b/functions/mychama/sms.py
+index 2677d5c..7c0dfa1 100644
+--- a/functions/mychama/sms.py
++++ b/functions/mychama/sms.py
+@@ -27,7 +27,7 @@ from shared.idempotency import already_applied, record_result
+ from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone, normalize_sms_phone
+ from shared.roles import require_official
+ from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
+-from shared.sms_validation import MAX_SMS_LENGTH, count_sms_segments, validate_sms_content
++from shared.sms_validation import MAX_SMS_LENGTH, compose_sms, count_sms_segments, validate_sms_content
+ import logging
+ 
+ REGION = "africa-south1"
+@@ -115,28 +115,53 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
+     return result
+ 
+ 
++def build_messages(chama: dict, recipients: list[dict], body: str) -> tuple[list[tuple[dict, str, int]] | None, int]:
++    """
++    One (recipient, final text, segments) per recipient, where the final text carries that recipient's
++    "Dear <first name>," greeting and the chama signature (compose_sms). Segments are counted on the
++    final text, so the greeting and signature are part of the cost. Returns (None, longest_length)
++    when any final text is over the hard cap.
++    """
++    chama_name = chama.get("name")
++    items: list[tuple[dict, str, int]] = []
++    longest = 0
++    for member in recipients:
++        text = compose_sms(body, chama_name, member.get("name"))
++        longest = max(longest, len(text))
++        segs = count_sms_segments(text)
++        if segs is None:
++            return None, longest
++        items.append((member, text, segs))
++    return items, longest
++
++
+ def plan_campaign(db, chama_id: str, chama: dict, audience: str, message: str, member_ids: list[str] | None) -> dict:
+     """
+     The rules for one campaign, shared by sendSmsCampaign and desk's schedule_sms/send_sms_now: content and
+     segment validation, recipient resolution + opt-in/phone filter, 1 credit per segment per recipient.
+-    Returns {"recipients", "segments", "cost", "credits"}. Raises HttpsError on a rule failure.
++    Segments are counted per recipient on the full text (greeting + body + signature).
++    Returns {"recipients", "messages", "cost", "credits"}. Raises HttpsError on a rule failure.
+     """
+     content_error = validate_sms_content(message)
+     if content_error:
+         raise bad_request(content_error)
+-    segments = count_sms_segments(message)
+-    if segments is None:
+-        raise bad_request(
+-            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
+-        )
+     recipients = _recipients(db, chama_id, audience, member_ids)
+     recipients = [m for m in recipients if m.get("phoneNormalized") and m.get("whatsappOptIn", True) is not False]
++    # Length is checked even with no recipients, against the generic "Dear Member," greeting.
++    messages, longest = build_messages(chama, recipients or [{}], message)
++    if messages is None:
++        raise bad_request(
++            f"Message is {longest} characters with the greeting and signature added — SMS campaigns are capped at "
++            f"{MAX_SMS_LENGTH} characters (3 segments). Shorten the message by {longest - MAX_SMS_LENGTH}."
++        )
++    if not recipients:
++        messages = []
+     # 1 credit per SMS segment per recipient — flat across every plan tier. PLANS[plan].smsRate is the KES
+     # price per credit at top-up time and must not be multiplied in here.
+     return {
+         "recipients": recipients,
+-        "segments": segments,
+-        "cost": segments * len(recipients),
++        "messages": messages,
++        "cost": sum(segs for _, _, segs in messages),
+         "credits": chama.get("smsCredits", 0),
+     }
+ 
+@@ -151,7 +176,7 @@ def send_campaign(
+     {"sent", "creditsUsed", "recipients", "creditsRemaining"}; the callable adds nothing to it.
+     """
+     plan = plan_campaign(db, chama_id, chama, audience, message, member_ids)
+-    recipients, segments, cost, credits = plan["recipients"], plan["segments"], plan["cost"], plan["credits"]
++    recipients, messages, cost, credits = plan["recipients"], plan["messages"], plan["cost"], plan["credits"]
+     if not recipients:
+         return {"sent": 0, "creditsUsed": 0, "recipients": 0, "creditsRemaining": credits}
+     if dry_run:  # a quote: count only, never charge or send, and never fail on a low balance
+@@ -161,7 +186,8 @@ def send_campaign(
+ 
+     sent = 0
+     failed = 0
+-    for member in recipients:
++    actual_cost = 0
++    for member, text, segs in messages:
+         phone = member.get("phoneNormalized")
+         try:
+             send_sms(
+@@ -170,9 +196,10 @@ def send_campaign(
+                 apikey=HP_APIKEY.value,
+                 sender_id=HP_SENDER_ID.value,
+                 phone_e164=normalize_sms_phone(phone),
+-                message=message,
++                message=text,
+             )
+             sent += 1
++            actual_cost += segs
+         except Exception as e:  # noqa: BLE001 — one failed send must not abort the whole campaign
+             failed += 1
+             logging.error(
+@@ -180,7 +207,6 @@ def send_campaign(
+             )
+     logging.info("send_campaign: chamaId=%s sent=%d failed=%d", chama_id, sent, failed)
+ 
+-    actual_cost = segments * sent
+     ts = now_ms()
+     chama_ref = db.document(paths.chama(chama_id))
+     # Decrement atomically: the balance read above may be stale if another send ran meanwhile.
+@@ -312,12 +338,12 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
+             recipients = [m for m in recipients if m.get("phoneNormalized")]
+ 
+-            segments = count_sms_segments(body) if body else 0
+             content_error = validate_sms_content(body) if body else None
+-            # 1 credit per SMS segment per recipient — flat across every plan
+-            # tier; see sendSmsCampaign above for why smsRate must not be
+-            # multiplied in here.
+-            cost = (segments or 0) * len(recipients)
++            # Per-recipient segments on the full text (greeting + body + signature), 1 credit each — flat
++            # across every plan tier; see sendSmsCampaign above for why smsRate must not be multiplied in.
++            messages, longest = build_messages(chama, recipients, body) if body and recipients else ([], 0)
++            segments = 1 if messages is not None else 0   # 0 marks an over-length body, as before
++            cost = sum(segs for _, _, segs in messages) if messages else 0
+ 
+             credits = chama.get("smsCredits", 0)
+             if credits < cost or not recipients or not body or not segments or content_error:
+@@ -328,13 +354,14 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+                 if content_error or not segments:
+                     logging.warning(
+                         "run_sms_schedules: skipping invalid schedule chamaId=%s scheduleId=%s error=%s len=%d",
+-                        chama_id, sched_doc.id, content_error or "message too long", len(body),
++                        chama_id, sched_doc.id, content_error or "message too long", longest or len(body),
+                     )
+                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
+                 continue
+ 
+             sent = 0
+-            for member in recipients:
++            actual_cost = 0
++            for member, text, segs in messages:
+                 try:
+                     send_sms(
+                         userid=HP_USERID.value,
+@@ -342,13 +369,13 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
+                         apikey=HP_APIKEY.value,
+                         sender_id=HP_SENDER_ID.value,
+                         phone_e164=normalize_sms_phone(member["phoneNormalized"]),
+-                        message=body,
++                        message=text,
+                     )
+                     sent += 1
++                    actual_cost += segs
+                 except Exception:  # noqa: BLE001
+                     continue
+ 
+-            actual_cost = segments * sent
+             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
+             db.collection(paths.sms_log(chama_id)).document().set({
+                 "audience": sched.get("audience", "all"),
+diff --git a/functions/shared/hostpinnacle.py b/functions/shared/hostpinnacle.py
+index e831360..570799f 100644
+--- a/functions/shared/hostpinnacle.py
++++ b/functions/shared/hostpinnacle.py
+@@ -16,11 +16,11 @@ import re
+ import requests
+ 
+ SMS_API_URL = "https://smsportal.hostpinnacle.co.ke/SMSApi/send"
+-# Matches shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385 segment
++# Matches shared.sms_validation.MAX_SMS_LENGTH (the 135/250/380 segment
+ # cap) — sendSmsCampaign/run_sms_schedules already reject anything over
+ # this before it gets here, so this trim is a last-resort safety net,
+ # not the primary enforcement point.
+-MAX_SMS_LENGTH = 385
++MAX_SMS_LENGTH = 380
+ 
+ _NON_GSM = re.compile(r"[^\x00-\x7F\u00A0-\u00FF]")
+ 
+diff --git a/functions/shared/money.py b/functions/shared/money.py
+index cb710aa..505fda4 100644
+--- a/functions/shared/money.py
++++ b/functions/shared/money.py
+@@ -56,6 +56,17 @@ def gross_up_for_fees(net: float, our_rate: float) -> FeeBreakdown:
+     )
+ 
+ 
++def main_account_charge_subunits(gross: float, net: float) -> int:
++    """
++    The flat amount (in subunits, i.e. cents) that stays with MyChama's main Paystack account on a split
++    payment: everything the member is charged beyond what the chama is owed. The chama's subaccount gets
++    the rest, so it receives exactly `net`, never more and never less. Computed in whole subunits so float
++    rounding can't move a cent to the chama; any rounding left over, and any gap between our estimate of
++    Paystack's fee and what Paystack really charges, is absorbed by the main account (MyChama's margin).
++    """
++    return round(gross * 100) - round(net * 100)
++
++
+ def contribution_fees(net: float) -> FeeBreakdown:
+     return gross_up_for_fees(net, CONTRIBUTION_MARKUP_RATE)
+ 
+diff --git a/functions/shared/paystack.py b/functions/shared/paystack.py
+index 78a4edd..27d7679 100644
+--- a/functions/shared/paystack.py
++++ b/functions/shared/paystack.py
+@@ -37,9 +37,13 @@ def charge_mobile_money(
+     reference: str,
+     metadata: dict,
+     split_code: str | None = None,
++    subaccount: str | None = None,
++    transaction_charge_subunits: int | None = None,
+ ) -> dict:
+     """
+-    Initiates an STK push. `split_code` (a Paystack percentage split in THIS account, see
++    Initiates an STK push. With `subaccount` + `transaction_charge_subunits`, Paystack keeps that flat amount
++    in the main account (which also bears Paystack's fee, bearer "account") and pays the subaccount the rest —
++    so a chama's settlement is exactly gross - transaction_charge. A charge takes a split_code OR a subaccount, never both. `split_code` (a Paystack percentage split in THIS account, see
+     create_commission_split) is attached when a desk commission applies — the same mechanism PAY's
+     chargeCustomer uses. Returns Paystack's response body — the caller
+     stores its `data.status`/`data.display_text` on the paymentIntent for
+@@ -54,8 +58,16 @@ def charge_mobile_money(
+         "reference": reference,
+         "metadata": metadata,
+     }
++    if split_code and subaccount:
++        raise ValueError("A charge takes a split_code or a subaccount, not both.")
+     if split_code:
+         payload["split_code"] = split_code
++    if subaccount:
++        if transaction_charge_subunits is None or transaction_charge_subunits < 0:
++            raise ValueError("transaction_charge_subunits is required with a subaccount.")
++        payload["subaccount"] = subaccount
++        payload["transaction_charge"] = int(transaction_charge_subunits)
++        payload["bearer"] = "account"
+     resp = requests.post(f"{PAYSTACK_API_BASE}/charge", json=payload, headers=_headers(secret_key), timeout=20)
+     resp.raise_for_status()
+     return resp.json()
+@@ -70,8 +82,11 @@ def create_subaccount(
+     percentage_charge: float = 0,
+ ) -> dict:
+     """Creates a Paystack subaccount for a chama's settlement destination."""
++    # Paystack's docs name this field both `bank_code` and `settlement_bank`; both are sent because that exact
++    # request was accepted in test mode for M-PESA Till (MPTILL) and M-PESA Paybill (MPPAYBILL) subaccounts.
+     payload = {
+         "business_name": business_name,
++        "bank_code": settlement_bank_code,
+         "settlement_bank": settlement_bank_code,
+         "account_number": account_number,
+         "percentage_charge": percentage_charge,
+@@ -81,6 +96,18 @@ def create_subaccount(
+     return resp.json()
+ 
+ 
++def list_banks(*, secret_key: str, country: str = "kenya") -> list[dict]:
++    """Paystack's bank list for a country (first page, up to 100 entries)."""
++    resp = requests.get(
++        f"{PAYSTACK_API_BASE}/bank",
++        params={"country": country, "perPage": 100},
++        headers=_headers(secret_key),
++        timeout=20,
++    )
++    resp.raise_for_status()
++    return resp.json().get("data", [])
++
++
+ def create_split(
+     *,
+     secret_key: str,
+diff --git a/functions/shared/sms_validation.py b/functions/shared/sms_validation.py
+index bec8d1c..d1ad3cb 100644
+--- a/functions/shared/sms_validation.py
++++ b/functions/shared/sms_validation.py
+@@ -2,7 +2,7 @@
+ SMS segmentation & content rules — shared by sendSmsCampaign and
+ run_sms_schedules (functions/mychama/sms.py).
+ 
+-Segment breakpoints (140 / 270 / 385 chars) are MyChama's own product
++Segment breakpoints (135 / 250 / 380 chars) are MyChama's own product
+ rule, not GSM-7 concatenation math: 1 credit is charged per SMS segment,
+ the same regardless of plan tier. PLANS[plan]['smsRate'] in
+ shared/constants.py is a *different* number — the KES price per credit
+@@ -21,9 +21,9 @@ from __future__ import annotations
+ 
+ import re
+ 
+-# Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
++# Cumulative character caps: <=135 chars -> 1 segment, <=250 -> 2, <=380 -> 3.
+ # A message over the last breakpoint is rejected outright (no 4th segment).
+-SEGMENT_BREAKPOINTS: tuple[int, ...] = (140, 270, 385)
++SEGMENT_BREAKPOINTS: tuple[int, ...] = (135, 250, 380)
+ MAX_SMS_LENGTH = SEGMENT_BREAKPOINTS[-1]
+ MAX_SMS_SEGMENTS = len(SEGMENT_BREAKPOINTS)
+ 
+@@ -46,8 +46,8 @@ _WHATSAPP_HOSTS = ("wa.me", "chat.whatsapp.com", "api.whatsapp.com", "whatsapp.c
+ 
+ def count_sms_segments(message: str) -> int | None:
+     """
+-    Returns 1, 2, or 3 per the 140/270/385 breakpoints, 0 for an empty
+-    message, or None if the message is over the 385-char hard cap (the
++    Returns 1, 2, or 3 per the 135/250/380 breakpoints, 0 for an empty
++    message, or None if the message is over the 380-char hard cap (the
+     caller should reject rather than send).
+     """
+     length = len(message)
+@@ -72,3 +72,25 @@ def validate_sms_content(message: str) -> str | None:
+         if not _is_whatsapp_link(match.group(0)):
+             return "Only WhatsApp links (wa.me or whatsapp.com) are allowed in SMS messages."
+     return None
++
++
++_NAME_CHARS_RE = re.compile(r"[^A-Za-z'\-]")
++_DISALLOWED_CHARS_RE = re.compile(rf"[^A-Za-z0-9\s{_ALLOWED_PUNCTUATION}]")
++
++
++def sms_first_name(full_name: str | None, fallback: str = "Member") -> str:
++    """First name of the recipient for the greeting, or `fallback` ("Member"/"Customer") when there is none."""
++    parts = (full_name or "").split()
++    first = _NAME_CHARS_RE.sub("", parts[0]).title() if parts else ""
++    return first or fallback
++
++
++def compose_sms(body: str, chama_name: str | None, recipient_name: str | None = None, fallback: str = "Member") -> str:
++    """
++    The text actually sent, and the text that is segmented and charged: "Dear <first name>," on top,
++    the body, a blank line, then "<chama name> by MyChama". The greeting and signature count toward the
++    135/250/380 limits, so cost must always be computed on this string, never on the bare body.
++    """
++    chama = " ".join(_DISALLOWED_CHARS_RE.sub("", chama_name or "").split())
++    signature = f"{chama} by MyChama" if chama else "MyChama"
++    return f"Dear {sms_first_name(recipient_name, fallback)},\n{body}\n\n{signature}"
+diff --git a/functions/shared/types.py b/functions/shared/types.py
+index 71289d6..305cc21 100644
+--- a/functions/shared/types.py
++++ b/functions/shared/types.py
+@@ -61,6 +61,8 @@ class Chama(TypedDict):
+     smsCredits: NotRequired[float]
+     settlementAccount: NotRequired[str]
+     settlementSplitCode: NotRequired[str]
++    settlementSplitKeyVersion: NotRequired[int]   # 2 = split belongs to MyChama's own Paystack account (PAY gates on it)
++    settlementSubaccountCode: NotRequired[str]   # charged against so the chama gets exactly net (see initiatePayment)
+     autoSettle: NotRequired[bool]
+     settlementFreq: NotRequired[Frequency]
+     lastSettlement: NotRequired[str]
+diff --git a/functions/tests/test_exact_settlement.py b/functions/tests/test_exact_settlement.py
+new file mode 100644
+index 0000000..0526bb9
+--- /dev/null
++++ b/functions/tests/test_exact_settlement.py
+@@ -0,0 +1,60 @@
++"""A chama owed `net` is paid exactly `net`: the main account keeps gross - net, the subaccount gets the rest."""
++import pytest
++
++from shared import paystack
++from shared.money import contribution_fees, loan_repayment_fees, main_account_charge_subunits, mgr_contribution_fees
++
++
++def _cents(x: float) -> int:
++    return round(x * 100)
++
++
++@pytest.mark.parametrize("fees", [contribution_fees, mgr_contribution_fees, lambda n: loan_repayment_fees(n, "starter")])
++def test_chama_receives_exactly_net_for_every_amount(fees):
++    for net in [1, 2, 10, 33, 99.99, 100, 250.5, 1000, 1234.56, 5000, 49999.99, 100000, 250000]:
++        f = fees(float(net))
++        charge = main_account_charge_subunits(f["gross"], f["net"])
++        assert _cents(f["gross"]) - charge == _cents(net)                    # subaccount share == net, to the cent
++        assert charge >= _cents(f["paystackFee"]) - 1                         # main account covers Paystack's fee (rounding only)
++
++
++def test_charge_payload_uses_subaccount_flat_charge_and_main_account_bearer(monkeypatch):
++    sent = {}
++
++    class R:
++        def raise_for_status(self): pass
++        def json(self): return {"status": True}
++
++    monkeypatch.setattr(paystack.requests, "post", lambda url, json, headers, timeout: sent.update(json) or R())
++    f = contribution_fees(100.0)
++    paystack.charge_mobile_money(
++        secret_key="sk", email="a@b.co", amount_kes=f["gross"], phone_e164="+254700000000", provider="mpesa",
++        reference="r1", metadata={}, subaccount="ACCT_x", transaction_charge_subunits=main_account_charge_subunits(f["gross"], 100.0),
++    )
++    assert sent["subaccount"] == "ACCT_x" and sent["bearer"] == "account" and "split_code" not in sent
++    assert sent["amount"] - sent["transaction_charge"] == 10000
++
++
++def test_charge_rejects_split_code_with_subaccount_and_subaccount_without_charge():
++    base = dict(secret_key="sk", email="a@b.co", amount_kes=10, phone_e164="+254700000000", provider="mpesa", reference="r", metadata={})
++    with pytest.raises(ValueError):
++        paystack.charge_mobile_money(**base, split_code="SPL_1", subaccount="ACCT_x", transaction_charge_subunits=100)
++    with pytest.raises(ValueError):
++        paystack.charge_mobile_money(**base, subaccount="ACCT_x")
++
++
++def test_desk_commission_charges_still_use_split_code_only(monkeypatch):
++    """SMS top-ups, plan billing and reports carry the desk's split_code; none of them may gain a subaccount/flat charge."""
++    sent = {}
++
++    class R:
++        def raise_for_status(self): pass
++        def json(self): return {"status": True}
++
++    monkeypatch.setattr(paystack.requests, "post", lambda url, json, headers, timeout: sent.update(json) or R())
++    paystack.charge_mobile_money(
++        secret_key="sk", email="a@b.co", amount_kes=500, phone_e164="+254700000000", provider="mpesa",
++        reference="MCS-1", metadata={}, split_code="SPL_desk",
++    )
++    assert sent["split_code"] == "SPL_desk"
++    assert not {"subaccount", "transaction_charge", "bearer"} & sent.keys()
+diff --git a/functions/tests/test_settlement_banks.py b/functions/tests/test_settlement_banks.py
+new file mode 100644
+index 0000000..54f6896
+--- /dev/null
++++ b/functions/tests/test_settlement_banks.py
+@@ -0,0 +1,43 @@
++"""Settlement account codes: Till/Paybill use fixed Paystack codes; the bank list excludes M-PESA entries."""
++import pytest
++from firebase_functions import https_fn
++
++from mychama import payments
++
++
++def _reset_cache():
++    payments._banks_cache.update(at=0.0, banks=[])
++
++
++def test_till_uses_its_fixed_code_and_paybill_is_refused():
++    assert payments._bank_code("till", None) == "MPTILL"
++    with pytest.raises(https_fn.HttpsError) as e:
++        payments._bank_code("paybill", None)
++    assert "maintenance" in e.value.message
++
++
++def test_bank_needs_a_real_bank_code():
++    assert payments._bank_code("bank", "063") == "063"
++    for bad in (None, "", "MPTILL", "mppaybill", "MPESA"):
++        with pytest.raises(https_fn.HttpsError):
++            payments._bank_code("bank", bad)
++    with pytest.raises(https_fn.HttpsError):
++        payments._bank_code("sacco", None)
++
++
++def test_kenya_bank_list_is_banks_only_sorted_and_cached(monkeypatch):
++    _reset_cache()
++    calls = []
++    raw = [
++        {"name": "Zeta Bank", "code": "99", "type": "kepss", "active": True},
++        {"name": "M-PESA", "code": "MPESA", "type": "mobile_money"},
++        {"name": "M-PESA Paybill", "code": "MPPAYBILL", "type": "mobile_money_business"},
++        {"name": "M-PESA Till", "code": "MPTILL", "type": "mobile_money_business"},
++        {"name": "Alpha Bank", "code": "01", "type": "kepss", "active": True},
++        {"name": "Old Bank", "code": "02", "type": "kepss", "is_deleted": True},
++    ]
++    monkeypatch.setattr(payments.paystack, "list_banks", lambda **kw: calls.append(kw) or raw)
++    assert payments._kenya_banks("sk") == [{"name": "Alpha Bank", "code": "01"}, {"name": "Zeta Bank", "code": "99"}]
++    payments._kenya_banks("sk")
++    assert len(calls) == 1
++    _reset_cache()
+diff --git a/functions/tests/test_sms_compose.py b/functions/tests/test_sms_compose.py
+new file mode 100644
+index 0000000..9e63166
+--- /dev/null
++++ b/functions/tests/test_sms_compose.py
+@@ -0,0 +1,35 @@
++"""SMS greeting/signature composition and the 135/250/380 segment rules (cost is counted on the full text)."""
++from mychama.sms import build_messages
++from shared.sms_validation import compose_sms, count_sms_segments, sms_first_name
++
++
++def test_segment_breakpoints():
++    assert [count_sms_segments("x" * n) for n in (0, 1, 135, 136, 250, 251, 380, 381)] == [0, 1, 1, 2, 2, 3, 3, None]
++
++
++def test_compose_format_and_fallbacks():
++    assert compose_sms("Meeting Friday", "Umoja Chama", "WANJIKU MUHIA") == "Dear Wanjiku,\nMeeting Friday\n\nUmoja Chama by MyChama"
++    assert compose_sms("Hi", "Umoja", None).startswith("Dear Member,\n")
++    assert compose_sms("Hi", "Umoja", "", fallback="Customer").startswith("Dear Customer,\n")
++    assert sms_first_name("o'brien jane") == "O'Brien"
++    assert sms_first_name("1234 Joe") == "Member"            # no usable letters in the first token
++
++
++def test_compose_strips_non_standard_characters_from_the_chama_name():
++    text = compose_sms("Hi", "Umoja \U0001F600 Wa\u00e9 Chama\n", "Al")
++    assert text.endswith("\n\nUmoja Wa Chama by MyChama") and text.isascii()
++    assert compose_sms("Hi", "\U0001F600", "Al").endswith("\n\nMyChama")
++
++
++def test_cost_is_counted_per_recipient_on_the_full_text():
++    chama = {"name": "Umoja"}
++    body = "x" * (135 - len(compose_sms("", "Umoja", "Al")))        # exactly 135 chars for a short first name
++    items, _ = build_messages(chama, [{"name": "Al B"}, {"name": "Wanjiku M"}], body)
++    assert [segs for _, _, segs in items] == [1, 2]                  # the longer name tips over the 135 limit
++
++
++def test_over_cap_is_reported_with_the_longest_length():
++    chama = {"name": "Umoja"}
++    body = "x" * (380 - len(compose_sms("", "Umoja", "Al")) + 1)
++    items, longest = build_messages(chama, [{"name": "Al"}], body)
++    assert items is None and longest == 381
+diff --git a/src/features/communication/Communication.tsx b/src/features/communication/Communication.tsx
+index ccea082..4dd88ea 100644
+--- a/src/features/communication/Communication.tsx
++++ b/src/features/communication/Communication.tsx
+@@ -7,7 +7,7 @@ import { useMembers } from '../../app/useMembers';
+ import { sendSmsCampaign, purchaseSmsCredits } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { AUDIENCE_LABEL, PLANS } from '../../lib/constants';
+-import { countSmsSegments, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
++import { estimateSmsCost, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
+ import { kes } from '../../lib/money';
+ import type { Chama, ChamaMember, SmsLogEntry, SmsSchedule } from '../../lib/types';
+ 
+@@ -23,12 +23,12 @@ function estimateRecipients(
+   activeMembers: ChamaMember[],
+   overdueMemberIds: Set<string>,
+   loanHolderMemberIds: Set<string>
+-): number {
+-  if (audience === 'all') return activeMembers.length;
+-  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin).length;
+-  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id)).length;
+-  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id)).length;
+-  return customIds.length;
++): ChamaMember[] {
++  if (audience === 'all') return activeMembers;
++  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin);
++  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id));
++  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id));
++  return activeMembers.filter((m) => customIds.includes(m.id));
+ }
+ 
+ export default function Communication() {
+@@ -78,16 +78,18 @@ export default function Communication() {
+     };
+   }, [chamaId]);
+ 
+-  const recipientEstimate = useMemo(() => {
++  const recipientList = useMemo(() => {
+     const active = members.filter((m) => m.status === 'active');
+     return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
+   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
++  const recipientEstimate = recipientList.length;
+ 
+   const trimmedMessage = message.trim();
+-  const segments = countSmsSegments(trimmedMessage); // null once over the 385-char cap
+-  const overLength = segments === null;
++  // Counted per recipient on the full text the server sends: greeting + message + signature.
++  const smsCost = estimateSmsCost(trimmedMessage, chama?.name, recipientList.map((m) => m.name));
++  const overLength = smsCost.tooLong; // true once the longest final text is over the 380-char cap
+   const contentError = trimmedMessage ? validateSmsContent(trimmedMessage) : null;
+-  const creditsNeeded = segments ? segments * recipientEstimate : 0;
++  const creditsNeeded = smsCost.credits;
+   const kesEquivalent = chama ? creditsNeeded * PLANS[chama.plan].smsRate : 0;
+   const availableCredits = chama?.smsCredits ?? 0;
+   const insufficientCredits = creditsNeeded > availableCredits;
+@@ -108,7 +110,7 @@ export default function Communication() {
+       return;
+     }
+     if (overLength) {
+-      setError(`Message is too long — SMS campaigns are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
++      setError(`Message is too long — with the greeting and signature it is ${smsCost.longest} characters, and SMS campaigns are capped at ${MAX_SMS_LENGTH} (3 segments).`);
+       return;
+     }
+     if (contentError) {
+@@ -200,12 +202,13 @@ export default function Communication() {
+               <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+             </label>
+             <p className="text-xs text-forest-900/50">
+-              {message.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
++              {message.length} characters · longest SMS with greeting and signature {smsCost.longest}/{MAX_SMS_LENGTH} · up to{' '}
++              {smsCost.maxSegments || 1} segment{smsCost.maxSegments > 1 ? 's' : ''} × {recipientEstimate} recipient
+               {recipientEstimate === 1 ? '' : 's'} = {creditsNeeded} credit{creditsNeeded === 1 ? '' : 's'} (≈ {kes(kesEquivalent)})
+             </p>
+             {overLength && (
+               <p className="text-sm text-brick-500 font-medium">
+-                Too long — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments).
++                Too long — with the greeting and signature the longest SMS is {smsCost.longest} characters; campaigns are capped at {MAX_SMS_LENGTH} (3 segments).
+               </p>
+             )}
+             {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
+@@ -403,20 +406,21 @@ function ScheduleForm({
+     setCustomIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+   }
+ 
+-  const recipientEstimate = useMemo(() => {
++  const recipientList = useMemo(() => {
+     const active = members.filter((m) => m.status === 'active');
+     return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
+   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
++  const recipientEstimate = recipientList.length;
+ 
+   const trimmedBody = body.trim();
+-  const segments = countSmsSegments(trimmedBody);
+-  const overLength = segments === null;
++  const smsCost = estimateSmsCost(trimmedBody, chama.name, recipientList.map((m) => m.name));
++  const overLength = smsCost.tooLong;
+   const contentError = trimmedBody ? validateSmsContent(trimmedBody) : null;
+   // Each occurrence of a recurring schedule costs this many credits — the
+   // same precheck as a one-off send, run against the audience's current
+   // size (a later run may differ if membership changes, but this is the
+   // best estimate available at creation time).
+-  const creditsNeededPerRun = segments ? segments * recipientEstimate : 0;
++  const creditsNeededPerRun = smsCost.credits;
+   const availableCredits = chama.smsCredits ?? 0;
+   const insufficientCredits = creditsNeededPerRun > availableCredits;
+   const canSubmit = !busy && !!trimmedBody && !overLength && !contentError && !insufficientCredits;
+@@ -428,7 +432,7 @@ function ScheduleForm({
+       return;
+     }
+     if (overLength) {
+-      onError(`Message is too long — SMS schedules are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
++      onError(`Message is too long — with the greeting and signature it is ${smsCost.longest} characters, and SMS schedules are capped at ${MAX_SMS_LENGTH} (3 segments).`);
+       return;
+     }
+     if (contentError) {
+@@ -494,13 +498,14 @@ function ScheduleForm({
+         </select>
+       </label>
+       <p className="text-xs text-forest-900/50">
+-        {body.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
++        {body.length} characters · longest SMS with greeting and signature {smsCost.longest}/{MAX_SMS_LENGTH} · up to{' '}
++        {smsCost.maxSegments || 1} segment{smsCost.maxSegments > 1 ? 's' : ''} × {recipientEstimate} recipient
+         {recipientEstimate === 1 ? '' : 's'} = {creditsNeededPerRun} credit{creditsNeededPerRun === 1 ? '' : 's'} per run
+       </p>
+       <p className="text-xs text-forest-900/50">Starts within about 15 minutes, then repeats on this cadence until paused or deleted.</p>
+       {overLength && (
+         <p className="text-sm text-brick-500 font-medium">
+-          Too long — SMS schedules are capped at {MAX_SMS_LENGTH} characters (3 segments).
++          Too long — with the greeting and signature the longest SMS is {smsCost.longest} characters; schedules are capped at {MAX_SMS_LENGTH} (3 segments).
+         </p>
+       )}
+       {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
+diff --git a/src/features/payments/Payments.tsx b/src/features/payments/Payments.tsx
+index 71ea64f..2132adc 100644
+--- a/src/features/payments/Payments.tsx
++++ b/src/features/payments/Payments.tsx
+@@ -1,6 +1,6 @@
+-import { useState } from 'react';
++import { useEffect, useState } from 'react';
+ import { useChama } from '../../app/ChamaProvider';
+-import { setupSettlementAccount, requestSettlementChange } from '../../lib/callables';
++import { setupSettlementAccount, requestSettlementChange, listKenyaBanks } from '../../lib/callables';
+ import { describeCallError } from '../../lib/errorMessages';
+ import { PLANS } from '../../lib/constants';
+ 
+@@ -53,26 +53,54 @@ export default function Payments() {
+ }
+ 
+ function SettlementForm({ mode, chamaId, onDone }: { mode: 'setup' | 'change'; chamaId: string; onDone: () => void }) {
+-  const [accountType, setAccountType] = useState<'paybill' | 'till' | 'bank'>('paybill');
++  const [accountType, setAccountType] = useState<'paybill' | 'till' | 'bank'>('till');
+   const [accountNumber, setAccountNumber] = useState('');
+   const [bankCode, setBankCode] = useState('');
++  const [banks, setBanks] = useState<{ name: string; code: string }[]>([]);
++  const [bankFilter, setBankFilter] = useState('');
++  const [banksLoading, setBanksLoading] = useState(false);
++  const [banksError, setBanksError] = useState<string | null>(null);
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const [ok, setOk] = useState<string | null>(null);
+ 
++  // Banks are only needed (and only fetched) once, when the bank type is first chosen.
++  useEffect(() => {
++    if (accountType !== 'bank' || banks.length || banksLoading) return;
++    setBanksLoading(true);
++    setBanksError(null);
++    listKenyaBanks({})
++      .then((res) => setBanks(res.banks))
++      .catch((e) => setBanksError(describeCallError(e).message))
++      .finally(() => setBanksLoading(false));
++  }, [accountType, banks.length, banksLoading]);
++
++  const selectedBank = banks.find((b) => b.code === bankCode);
++  const filteredBanks = banks.filter((b) => b.code === bankCode || b.name.toLowerCase().includes(bankFilter.trim().toLowerCase()));
++
+   async function submit() {
+     setError(null);
++    if (accountType === 'paybill') {
++      setError('M-Pesa Paybill is currently under maintenance. Choose a bank account or a Till.');
++      return;
++    }
++    if (accountType === 'bank' && !selectedBank) {
++      setError('Pick a bank.');
++      return;
++    }
+     if (!accountNumber.trim()) {
+       setError('Enter the paybill/till/account number.');
+       return;
+     }
++    const accountLabel = accountType === 'bank' && selectedBank ? selectedBank.name : accountType;
++    const code = accountType === 'bank' ? selectedBank?.code : undefined;
+     setBusy(true);
+     try {
+       if (mode === 'setup') {
+-        await setupSettlementAccount({ chamaId, accountLabel: accountType, accountType, accountNumber, bankCode: bankCode || undefined });
++        await setupSettlementAccount({ chamaId, accountLabel, accountType, accountNumber, bankCode: code });
+         setOk('Settlement account set up.');
+       } else {
+-        await requestSettlementChange({ chamaId, accountLabel: accountType, accountType, accountNumber, bankCode: bankCode || undefined });
++        await requestSettlementChange({ chamaId, accountLabel, accountType, accountNumber, bankCode: code });
+         setOk('Change requested — needs approval from another official.');
+       }
+       setTimeout(onDone, 1500);
+@@ -94,17 +122,43 @@ function SettlementForm({ mode, chamaId, onDone }: { mode: 'setup' | 'change'; c
+           <option value="bank">Bank account</option>
+         </select>
+       </label>
++      {accountType === 'paybill' && (
++        <p className="text-sm text-gold-700 font-medium">M-Pesa Paybill is currently under maintenance. Choose a bank account or a Till to collect online.</p>
++      )}
++      {accountType === 'bank' && (
++        <>
++          <label className="flex flex-col gap-1 text-sm font-medium">
++            Bank
++            <input
++              value={bankFilter}
++              onChange={(e) => setBankFilter(e.target.value)}
++              placeholder="Type to filter banks"
++              disabled={busy || banksLoading}
++              className="px-3 py-2 rounded-lg border border-forest-100"
++            />
++          </label>
++          <select
++            value={bankCode}
++            onChange={(e) => setBankCode(e.target.value)}
++            disabled={busy || banksLoading}
++            aria-label="Bank"
++            className="px-3 py-2 rounded-lg border border-forest-100"
++          >
++            <option value="">{banksLoading ? 'Loading banks…' : 'Select a bank'}</option>
++            {filteredBanks.map((b) => (
++              <option key={b.code} value={b.code}>
++                {b.name}
++              </option>
++            ))}
++          </select>
++          {banksError && <p className="text-sm text-brick-500 font-medium">{banksError}</p>}
++        </>
++      )}
+       <label className="flex flex-col gap-1 text-sm font-medium">
+         {accountType === 'bank' ? 'Account number' : 'Paybill/Till number'}
+         <input value={accountNumber} onChange={(e) => setAccountNumber(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+       </label>
+-      {accountType === 'bank' && (
+-        <label className="flex flex-col gap-1 text-sm font-medium">
+-          Bank code
+-          <input value={bankCode} onChange={(e) => setBankCode(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
+-        </label>
+-      )}
+-      <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
++      <button onClick={submit} disabled={busy || accountType === 'paybill'} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
+         {busy ? 'Saving…' : mode === 'setup' ? 'Set up settlement account' : 'Request change'}
+       </button>
+       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
+diff --git a/src/lib/callables.ts b/src/lib/callables.ts
+index 305a86e..d1e136e 100644
+--- a/src/lib/callables.ts
++++ b/src/lib/callables.ts
+@@ -292,6 +292,12 @@ export const mgrStartNewCycle = callable<{ chamaId: string; potId: string }, { o
+ // Phase 3 — Payments, SMS & Settlement
+ // ---------------------------------------------------------------------------
+ 
++/** Kenyan banks (name + Paystack code) for the settlement-account picker. Banks only — no M-PESA/Paybill/Till entries. */
++export const listKenyaBanks = liveCallable<Record<string, never>, { banks: { name: string; code: string }[] }>(
++  'listKenyaBanks',
++  'Loading banks'
++);
++
+ /** Not queueable: account setup talks to Paystack live and returns a split code the UI needs now. */
+ export const setupSettlementAccount = liveCallable<
+   { chamaId: string; accountLabel: string; accountType: 'paybill' | 'till' | 'bank'; accountNumber?: string; bankCode?: string },
+diff --git a/src/lib/constants.ts b/src/lib/constants.ts
+index 8d9f990..7cdece0 100644
+--- a/src/lib/constants.ts
++++ b/src/lib/constants.ts
+@@ -247,7 +247,7 @@ export const SECURITY = {
+   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
+ } as const;
+ 
+-// SMS segment breakpoints (140/270/385 chars) and content-validation rules
++// SMS segment breakpoints (135/250/380 chars) and content-validation rules
+ // live in src/lib/smsValidation.ts, mirroring functions/shared/sms_validation.py.
+ 
+ export const AUDIENCE_LABEL: Record<string, string> = {
+diff --git a/src/lib/smsValidation.ts b/src/lib/smsValidation.ts
+index cb4e7d6..09133e1 100644
+--- a/src/lib/smsValidation.ts
++++ b/src/lib/smsValidation.ts
+@@ -10,12 +10,12 @@
+  * as the source of truth — this file is a UX layer, not the enforcement point.
+  */
+ 
+-// Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
+-export const SMS_SEGMENT_BREAKPOINTS = [140, 270, 385] as const;
++// Cumulative character caps: <=135 chars -> 1 segment, <=250 -> 2, <=380 -> 3.
++export const SMS_SEGMENT_BREAKPOINTS = [135, 250, 380] as const;
+ export const MAX_SMS_LENGTH = SMS_SEGMENT_BREAKPOINTS[SMS_SEGMENT_BREAKPOINTS.length - 1];
+ export const MAX_SMS_SEGMENTS = SMS_SEGMENT_BREAKPOINTS.length;
+ 
+-/** Returns 1/2/3 segments, 0 for an empty message, or null if over the 385-char cap. */
++/** Returns 1/2/3 segments, 0 for an empty message, or null if over the 380-char cap. */
+ export function countSmsSegments(message: string): number | null {
+   const length = message.length;
+   if (length === 0) return 0;
+@@ -53,3 +53,44 @@ export function validateSmsContent(message: string): string | null {
+   }
+   return null;
+ }
++
++/** First name for the greeting, or `fallback` ("Member"/"Customer") when there is none. Mirrors sms_first_name(). */
++export function smsFirstName(fullName: string | null | undefined, fallback = 'Member'): string {
++  const first = (fullName ?? '').trim().split(/\s+/)[0] ?? '';
++  const cleaned = first.replace(/[^A-Za-z'-]/g, '').replace(/[A-Za-z]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
++  return cleaned || fallback;
++}
++
++/** The text actually sent and charged: greeting, body, blank line, signature. Mirrors compose_sms(). */
++export function composeSms(body: string, chamaName: string | null | undefined, recipientName?: string | null, fallback = 'Member'): string {
++  const chama = (chamaName ?? '').replace(new RegExp(`[^A-Za-z0-9\\s${ALLOWED_PUNCTUATION}]`, 'g'), '').split(/\s+/).filter(Boolean).join(' ');
++  const signature = chama ? `${chama} by MyChama` : 'MyChama';
++  return `Dear ${smsFirstName(recipientName, fallback)},\n${body}\n\n${signature}`;
++}
++
++/**
++ * Credits for one send, counted per recipient on the full text (greeting + body + signature) — what the
++ * server charges. `names` holds one entry per recipient; with none, length is checked against "Dear Member,".
++ */
++export function estimateSmsCost(
++  body: string,
++  chamaName: string | null | undefined,
++  names: Array<string | null | undefined>
++): { credits: number; maxSegments: number; longest: number; tooLong: boolean } {
++  if (!body) return { credits: 0, maxSegments: 0, longest: 0, tooLong: false };
++  let credits = 0;
++  let maxSegments = 0;
++  let longest = 0;
++  let tooLong = false;
++  for (const name of names.length ? names : [undefined]) {
++    const text = composeSms(body, chamaName, name);
++    longest = Math.max(longest, text.length);
++    const segs = countSmsSegments(text);
++    if (segs === null) tooLong = true;
++    else {
++      maxSegments = Math.max(maxSegments, segs);
++      if (names.length) credits += segs;
++    }
++  }
++  return { credits: tooLong ? 0 : credits, maxSegments, longest, tooLong };
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 57426f7..a450999 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -35,6 +35,7 @@ export interface Chama {
+   smsCredits?: number;
+   settlementAccount?: string;
+   settlementSplitCode?: string;
++  settlementSubaccountCode?: string;
+   autoSettle?: boolean;
+   settlementFreq?: 'daily' | 'weekly' | 'monthly';
+   lastSettlement?: string;

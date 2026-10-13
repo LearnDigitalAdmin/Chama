@@ -247,7 +247,7 @@ export const SECURITY = {
   PAYMENT_INTENT_TTL_SECONDS: 30 * 60,
 } as const;
 
-// SMS segment breakpoints (140/270/385 chars) and content-validation rules
+// SMS segment breakpoints (135/250/380 chars) and content-validation rules
 // live in src/lib/smsValidation.ts, mirroring functions/shared/sms_validation.py.
 
 export const AUDIENCE_LABEL: Record<string, string> = {

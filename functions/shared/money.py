@@ -56,6 +56,17 @@ def gross_up_for_fees(net: float, our_rate: float) -> FeeBreakdown:
     )
 
 
+def main_account_charge_subunits(gross: float, net: float) -> int:
+    """
+    The flat amount (in subunits, i.e. cents) that stays with MyChama's main Paystack account on a split
+    payment: everything the member is charged beyond what the chama is owed. The chama's subaccount gets
+    the rest, so it receives exactly `net`, never more and never less. Computed in whole subunits so float
+    rounding can't move a cent to the chama; any rounding left over, and any gap between our estimate of
+    Paystack's fee and what Paystack really charges, is absorbed by the main account (MyChama's margin).
+    """
+    return round(gross * 100) - round(net * 100)
+
+
 def contribution_fees(net: float) -> FeeBreakdown:
     return gross_up_for_fees(net, CONTRIBUTION_MARKUP_RATE)
 

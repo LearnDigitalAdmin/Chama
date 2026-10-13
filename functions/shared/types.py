@@ -61,6 +61,8 @@ class Chama(TypedDict):
     smsCredits: NotRequired[float]
     settlementAccount: NotRequired[str]
     settlementSplitCode: NotRequired[str]
+    settlementSplitKeyVersion: NotRequired[int]   # 2 = split belongs to MyChama's own Paystack account (PAY gates on it)
+    settlementSubaccountCode: NotRequired[str]   # charged against so the chama gets exactly net (see initiatePayment)
     autoSettle: NotRequired[bool]
     settlementFreq: NotRequired[Frequency]
     lastSettlement: NotRequired[str]

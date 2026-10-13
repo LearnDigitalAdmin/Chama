@@ -16,11 +16,11 @@ import re
 import requests
 
 SMS_API_URL = "https://smsportal.hostpinnacle.co.ke/SMSApi/send"
-# Matches shared.sms_validation.MAX_SMS_LENGTH (the 140/270/385 segment
+# Matches shared.sms_validation.MAX_SMS_LENGTH (the 135/250/380 segment
 # cap) — sendSmsCampaign/run_sms_schedules already reject anything over
 # this before it gets here, so this trim is a last-resort safety net,
 # not the primary enforcement point.
-MAX_SMS_LENGTH = 385
+MAX_SMS_LENGTH = 380
 
 _NON_GSM = re.compile(r"[^\x00-\x7F\u00A0-\u00FF]")
 

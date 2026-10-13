@@ -27,7 +27,7 @@ from shared.idempotency import already_applied, record_result
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone, normalize_sms_phone
 from shared.roles import require_official
 from shared.secrets import PAYSTACK_SECRET_KEY, HP_USERID, HP_PASSWORD, HP_APIKEY, HP_SENDER_ID
-from shared.sms_validation import MAX_SMS_LENGTH, count_sms_segments, validate_sms_content
+from shared.sms_validation import MAX_SMS_LENGTH, compose_sms, count_sms_segments, validate_sms_content
 import logging
 
 REGION = "africa-south1"
@@ -115,28 +115,53 @@ def sendSmsCampaign(req: https_fn.CallableRequest) -> dict:
     return result
 
 
+def build_messages(chama: dict, recipients: list[dict], body: str) -> tuple[list[tuple[dict, str, int]] | None, int]:
+    """
+    One (recipient, final text, segments) per recipient, where the final text carries that recipient's
+    "Dear <first name>," greeting and the chama signature (compose_sms). Segments are counted on the
+    final text, so the greeting and signature are part of the cost. Returns (None, longest_length)
+    when any final text is over the hard cap.
+    """
+    chama_name = chama.get("name")
+    items: list[tuple[dict, str, int]] = []
+    longest = 0
+    for member in recipients:
+        text = compose_sms(body, chama_name, member.get("name"))
+        longest = max(longest, len(text))
+        segs = count_sms_segments(text)
+        if segs is None:
+            return None, longest
+        items.append((member, text, segs))
+    return items, longest
+
+
 def plan_campaign(db, chama_id: str, chama: dict, audience: str, message: str, member_ids: list[str] | None) -> dict:
     """
     The rules for one campaign, shared by sendSmsCampaign and desk's schedule_sms/send_sms_now: content and
     segment validation, recipient resolution + opt-in/phone filter, 1 credit per segment per recipient.
-    Returns {"recipients", "segments", "cost", "credits"}. Raises HttpsError on a rule failure.
+    Segments are counted per recipient on the full text (greeting + body + signature).
+    Returns {"recipients", "messages", "cost", "credits"}. Raises HttpsError on a rule failure.
     """
     content_error = validate_sms_content(message)
     if content_error:
         raise bad_request(content_error)
-    segments = count_sms_segments(message)
-    if segments is None:
-        raise bad_request(
-            f"Message is {len(message)} characters — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments)."
-        )
     recipients = _recipients(db, chama_id, audience, member_ids)
     recipients = [m for m in recipients if m.get("phoneNormalized") and m.get("whatsappOptIn", True) is not False]
+    # Length is checked even with no recipients, against the generic "Dear Member," greeting.
+    messages, longest = build_messages(chama, recipients or [{}], message)
+    if messages is None:
+        raise bad_request(
+            f"Message is {longest} characters with the greeting and signature added — SMS campaigns are capped at "
+            f"{MAX_SMS_LENGTH} characters (3 segments). Shorten the message by {longest - MAX_SMS_LENGTH}."
+        )
+    if not recipients:
+        messages = []
     # 1 credit per SMS segment per recipient — flat across every plan tier. PLANS[plan].smsRate is the KES
     # price per credit at top-up time and must not be multiplied in here.
     return {
         "recipients": recipients,
-        "segments": segments,
-        "cost": segments * len(recipients),
+        "messages": messages,
+        "cost": sum(segs for _, _, segs in messages),
         "credits": chama.get("smsCredits", 0),
     }
 
@@ -151,7 +176,7 @@ def send_campaign(
     {"sent", "creditsUsed", "recipients", "creditsRemaining"}; the callable adds nothing to it.
     """
     plan = plan_campaign(db, chama_id, chama, audience, message, member_ids)
-    recipients, segments, cost, credits = plan["recipients"], plan["segments"], plan["cost"], plan["credits"]
+    recipients, messages, cost, credits = plan["recipients"], plan["messages"], plan["cost"], plan["credits"]
     if not recipients:
         return {"sent": 0, "creditsUsed": 0, "recipients": 0, "creditsRemaining": credits}
     if dry_run:  # a quote: count only, never charge or send, and never fail on a low balance
@@ -161,7 +186,8 @@ def send_campaign(
 
     sent = 0
     failed = 0
-    for member in recipients:
+    actual_cost = 0
+    for member, text, segs in messages:
         phone = member.get("phoneNormalized")
         try:
             send_sms(
@@ -170,9 +196,10 @@ def send_campaign(
                 apikey=HP_APIKEY.value,
                 sender_id=HP_SENDER_ID.value,
                 phone_e164=normalize_sms_phone(phone),
-                message=message,
+                message=text,
             )
             sent += 1
+            actual_cost += segs
         except Exception as e:  # noqa: BLE001 — one failed send must not abort the whole campaign
             failed += 1
             logging.error(
@@ -180,7 +207,6 @@ def send_campaign(
             )
     logging.info("send_campaign: chamaId=%s sent=%d failed=%d", chama_id, sent, failed)
 
-    actual_cost = segments * sent
     ts = now_ms()
     chama_ref = db.document(paths.chama(chama_id))
     # Decrement atomically: the balance read above may be stale if another send ran meanwhile.
@@ -312,12 +338,12 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
             recipients = _recipients(db, chama_id, sched.get("audience", "all"), sched.get("memberIds"))
             recipients = [m for m in recipients if m.get("phoneNormalized")]
 
-            segments = count_sms_segments(body) if body else 0
             content_error = validate_sms_content(body) if body else None
-            # 1 credit per SMS segment per recipient — flat across every plan
-            # tier; see sendSmsCampaign above for why smsRate must not be
-            # multiplied in here.
-            cost = (segments or 0) * len(recipients)
+            # Per-recipient segments on the full text (greeting + body + signature), 1 credit each — flat
+            # across every plan tier; see sendSmsCampaign above for why smsRate must not be multiplied in.
+            messages, longest = build_messages(chama, recipients, body) if body and recipients else ([], 0)
+            segments = 1 if messages is not None else 0   # 0 marks an over-length body, as before
+            cost = sum(segs for _, _, segs in messages) if messages else 0
 
             credits = chama.get("smsCredits", 0)
             if credits < cost or not recipients or not body or not segments or content_error:
@@ -328,13 +354,14 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
                 if content_error or not segments:
                     logging.warning(
                         "run_sms_schedules: skipping invalid schedule chamaId=%s scheduleId=%s error=%s len=%d",
-                        chama_id, sched_doc.id, content_error or "message too long", len(body),
+                        chama_id, sched_doc.id, content_error or "message too long", longest or len(body),
                     )
                 sched_doc.reference.update({"nextRun": now + _frequency_ms(sched.get("frequency", "monthly"))})
                 continue
 
             sent = 0
-            for member in recipients:
+            actual_cost = 0
+            for member, text, segs in messages:
                 try:
                     send_sms(
                         userid=HP_USERID.value,
@@ -342,13 +369,13 @@ def run_sms_schedules(event: scheduler_fn.ScheduledEvent) -> None:
                         apikey=HP_APIKEY.value,
                         sender_id=HP_SENDER_ID.value,
                         phone_e164=normalize_sms_phone(member["phoneNormalized"]),
-                        message=body,
+                        message=text,
                     )
                     sent += 1
+                    actual_cost += segs
                 except Exception:  # noqa: BLE001
                     continue
 
-            actual_cost = segments * sent
             db.document(paths.chama(chama_id)).update({"smsCredits": credits - actual_cost, "updatedAt": now_ms()})
             db.collection(paths.sms_log(chama_id)).document().set({
                 "audience": sched.get("audience", "all"),

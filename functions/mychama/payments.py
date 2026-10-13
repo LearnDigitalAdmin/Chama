@@ -30,14 +30,15 @@ equal to the caller's own) is unchanged from before, ignores
 
 setupSettlementAccount / requestSettlementChange / approveSettlementChange
 create/change the Paystack subaccount + split code a chama's collections
-settle into. Bank/paybill/till codes for Paystack Kenya's subaccount API
-are NOT hardcoded here — `PAYBILL_BANK_CODE`/`TILL_BANK_CODE` are
-placeholders to fill in from Paystack's own /bank?currency=KES list before
-going live; get this wrong and settlement money has nowhere valid to land,
-so treat it as a go-live blocker, not a nice-to-have.
+settle into. Paybill and Till use Paystack Kenya's fixed codes (MPPAYBILL / MPTILL, from
+GET /bank?country=kenya). Bank settlement uses the code of the bank the user
+picked from listKenyaBanks, which returns banks only (never M-PESA, Paybill
+or Till entries).
 """
 
 from __future__ import annotations
+
+import time
 
 from firebase_functions import https_fn
 from firebase_admin import firestore
@@ -49,19 +50,28 @@ from shared.constants import PLANS, SECURITY, IntentPurposeCode
 from shared.dates import now_ms
 from shared.errors import bad_request, not_found, precondition, rate_limited, require_auth
 from shared.idempotency import already_applied, record_result
-from shared.money import contribution_fees, loan_repayment_fees, mgr_contribution_fees
+from shared.money import contribution_fees, loan_repayment_fees, main_account_charge_subunits, mgr_contribution_fees
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone
 from shared.roles import require_finance_admin, require_membership
 from shared.secrets import PAYSTACK_SECRET_KEY
 
 REGION = "africa-south1"
 
-# TODO before go-live: confirm against Paystack's GET /bank?currency=KES&type=mobile_money
-# (and the equivalent for paybill/till, which Paystack Kenya treats as bank-style
-# settlement destinations under specific codes) — these are placeholders.
-PAYBILL_BANK_CODE = "MPESA"
-TILL_BANK_CODE = "MPESA"
+# Codes from Paystack's GET /bank?country=kenya (type mobile_money_business).
+PAYBILL_BANK_CODE = "MPPAYBILL"
+TILL_BANK_CODE = "MPTILL"
 BANK_CODE_BY_TYPE = {"paybill": PAYBILL_BANK_CODE, "till": TILL_BANK_CODE}
+# Paybill is NOT accepted for settlement for now: a Paybill payout needs an account reference that the
+# subaccount API has no field for. A chama must settle to a bank account or a Till.
+ENABLED_SETTLEMENT_TYPES = ("till", "bank")
+# PAY's mychamaPayInitiate refuses to charge a chama unless settlementSplitKeyVersion == 2 (the split belongs to
+# MyChama's own Paystack account), so every settlement account saved here must carry it.
+SPLIT_KEY_VERSION = 2
+# Never valid as a "bank": the M-PESA wallet, Paybill and Till entries in the same list.
+MOBILE_MONEY_CODES = {"MPESA", PAYBILL_BANK_CODE, TILL_BANK_CODE}
+
+_BANKS_TTL_SECONDS = 60 * 60
+_banks_cache: dict = {"at": 0.0, "banks": []}
 
 
 def _db():
@@ -77,14 +87,42 @@ def _purpose_code(purpose: str) -> str:
 
 
 def _bank_code(account_type: str, explicit: str | None) -> str:
+    if account_type == "paybill":
+        raise precondition("M-Pesa Paybill settlement is currently under maintenance. Please use a bank account or a Till.")
     if account_type == "bank":
-        if not explicit:
-            raise bad_request("bankCode is required for a bank settlement account.")
+        if not explicit or explicit.upper() in MOBILE_MONEY_CODES:
+            raise bad_request("Pick a bank for a bank settlement account.")
         return explicit
+    if account_type not in BANK_CODE_BY_TYPE:
+        raise bad_request("accountType must be paybill, till or bank.")
     return BANK_CODE_BY_TYPE[account_type]
 
 
-def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_type: str, account_number: str, bank_code: str) -> str:
+def _kenya_banks(secret_key: str) -> list[dict]:
+    """Kenyan banks only (name + code), alphabetical, cached for an hour. Excludes M-PESA, Paybill and Till."""
+    if _banks_cache["banks"] and time.time() - _banks_cache["at"] < _BANKS_TTL_SECONDS:
+        return _banks_cache["banks"]
+    banks = [
+        {"name": b["name"], "code": b["code"]}
+        for b in paystack.list_banks(secret_key=secret_key, country="kenya")
+        if b.get("name") and b.get("code")
+        and b.get("active", True) and not b.get("is_deleted")
+        and not str(b.get("type", "")).startswith("mobile_money")
+        and str(b["code"]).upper() not in MOBILE_MONEY_CODES
+    ]
+    banks.sort(key=lambda b: b["name"].lower())
+    _banks_cache.update(at=time.time(), banks=banks)
+    return banks
+
+
+@https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
+def listKenyaBanks(req: https_fn.CallableRequest) -> dict:
+    require_auth(req)
+    return {"banks": _kenya_banks(PAYSTACK_SECRET_KEY.value)}
+
+
+def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_type: str, account_number: str, bank_code: str) -> tuple[str, str]:
+    """Returns (split_code, subaccount_code). Collections are charged against the subaccount code (see initiatePayment)."""
     sub = paystack.create_subaccount(
         secret_key=secret_key,
         business_name=chama_name,
@@ -93,7 +131,7 @@ def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_ty
     )
     subaccount_code = sub["data"]["subaccount_code"]
     split = paystack.create_split(secret_key=secret_key, name=f"{chama_name} settlement", subaccount_code=subaccount_code)
-    return split["data"]["split_code"]
+    return split["data"]["split_code"], subaccount_code
 
 
 @https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
@@ -120,11 +158,11 @@ def setupSettlementAccount(req: https_fn.CallableRequest) -> dict:
 
     account_type = data.get("accountType")
     account_number = data.get("accountNumber") or ""
-    bank_code = _bank_code(account_type, data.get("bankCode"))
     if account_type not in ("paybill", "till", "bank") or not account_number:
         raise bad_request("accountType and accountNumber are required.")
+    bank_code = _bank_code(account_type, data.get("bankCode"))
 
-    split_code = _create_subaccount_and_split(
+    split_code, subaccount_code = _create_subaccount_and_split(
         secret_key=PAYSTACK_SECRET_KEY.value,
         chama_name=chama.get("name", "Chama"),
         account_type=account_type,
@@ -135,6 +173,8 @@ def setupSettlementAccount(req: https_fn.CallableRequest) -> dict:
     chama_ref.update({
         "settlementAccount": f"{account_type}:{account_number}",
         "settlementSplitCode": split_code,
+        "settlementSubaccountCode": subaccount_code,
+        "settlementSplitKeyVersion": SPLIT_KEY_VERSION,
         "updatedAt": now_ms(),
     })
     return {"settlementSplitCode": split_code}
@@ -154,6 +194,7 @@ def requestSettlementChange(req: https_fn.CallableRequest) -> dict:
     account_type = data.get("accountType")
     if account_type not in ("paybill", "till", "bank") or not data.get("accountNumber"):
         raise bad_request("accountType and accountNumber are required.")
+    _bank_code(account_type, data.get("bankCode"))   # rejects Paybill (maintenance) and a bank request without a real bank
 
     ts = now_ms()
     ref = db.collection(paths.settlement_account_requests(chama_id)).document()
@@ -203,7 +244,7 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
     chama_ref = db.document(paths.chama(chama_id))
     chama = chama_ref.get().to_dict()
     bank_code = _bank_code(request["accountType"], request.get("bankCode"))
-    split_code = _create_subaccount_and_split(
+    split_code, subaccount_code = _create_subaccount_and_split(
         secret_key=PAYSTACK_SECRET_KEY.value,
         chama_name=chama.get("name", "Chama"),
         account_type=request["accountType"],
@@ -216,6 +257,8 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
     chama_ref.update({
         "settlementAccount": f"{request['accountType']}:{request['accountNumber']}",
         "settlementSplitCode": split_code,
+        "settlementSubaccountCode": subaccount_code,
+        "settlementSplitKeyVersion": SPLIT_KEY_VERSION,
         "updatedAt": ts,
     })
     return {"ok": True}
@@ -280,6 +323,8 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
         raise precondition("This chama's plan doesn't include online collections yet — pay in cash, or ask the chair to upgrade the plan.")
     if not chama.get("settlementSplitCode"):
         raise precondition("This chama hasn't set up a settlement account yet — ask the chair to set one up first.")
+    if not chama.get("settlementSubaccountCode"):
+        raise precondition("This chama's settlement account needs to be saved again before it can collect — ask the chair to re-enter it in Payments.")
 
     # Rate limit: MAX_INTENTS_PER_HOUR, keyed on whoever is actually being
     # charged (member_id) — not the caller — so an admin working down a
@@ -348,6 +393,10 @@ def initiatePayment(req: https_fn.CallableRequest) -> dict:
             phone_e164=normalized_phone,
             provider=provider,
             reference=reference,
+            # The chama's subaccount gets exactly the net amount: the main account keeps gross - net as a flat
+            # charge (and bears Paystack's fee out of it), so the chama is never paid more or less than owed.
+            subaccount=chama["settlementSubaccountCode"],
+            transaction_charge_subunits=main_account_charge_subunits(fee_calc["gross"], fee_calc["net"]),
             metadata={
                 "chargeType": "mychama_payment",
                 "targetProject": "mychama1",

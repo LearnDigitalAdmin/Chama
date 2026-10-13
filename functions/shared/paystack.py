@@ -37,9 +37,13 @@ def charge_mobile_money(
     reference: str,
     metadata: dict,
     split_code: str | None = None,
+    subaccount: str | None = None,
+    transaction_charge_subunits: int | None = None,
 ) -> dict:
     """
-    Initiates an STK push. `split_code` (a Paystack percentage split in THIS account, see
+    Initiates an STK push. With `subaccount` + `transaction_charge_subunits`, Paystack keeps that flat amount
+    in the main account (which also bears Paystack's fee, bearer "account") and pays the subaccount the rest —
+    so a chama's settlement is exactly gross - transaction_charge. A charge takes a split_code OR a subaccount, never both. `split_code` (a Paystack percentage split in THIS account, see
     create_commission_split) is attached when a desk commission applies — the same mechanism PAY's
     chargeCustomer uses. Returns Paystack's response body — the caller
     stores its `data.status`/`data.display_text` on the paymentIntent for
@@ -54,8 +58,16 @@ def charge_mobile_money(
         "reference": reference,
         "metadata": metadata,
     }
+    if split_code and subaccount:
+        raise ValueError("A charge takes a split_code or a subaccount, not both.")
     if split_code:
         payload["split_code"] = split_code
+    if subaccount:
+        if transaction_charge_subunits is None or transaction_charge_subunits < 0:
+            raise ValueError("transaction_charge_subunits is required with a subaccount.")
+        payload["subaccount"] = subaccount
+        payload["transaction_charge"] = int(transaction_charge_subunits)
+        payload["bearer"] = "account"
     resp = requests.post(f"{PAYSTACK_API_BASE}/charge", json=payload, headers=_headers(secret_key), timeout=20)
     resp.raise_for_status()
     return resp.json()
@@ -70,8 +82,11 @@ def create_subaccount(
     percentage_charge: float = 0,
 ) -> dict:
     """Creates a Paystack subaccount for a chama's settlement destination."""
+    # Paystack's docs name this field both `bank_code` and `settlement_bank`; both are sent because that exact
+    # request was accepted in test mode for M-PESA Till (MPTILL) and M-PESA Paybill (MPPAYBILL) subaccounts.
     payload = {
         "business_name": business_name,
+        "bank_code": settlement_bank_code,
         "settlement_bank": settlement_bank_code,
         "account_number": account_number,
         "percentage_charge": percentage_charge,
@@ -79,6 +94,18 @@ def create_subaccount(
     resp = requests.post(f"{PAYSTACK_API_BASE}/subaccount", json=payload, headers=_headers(secret_key), timeout=20)
     resp.raise_for_status()
     return resp.json()
+
+
+def list_banks(*, secret_key: str, country: str = "kenya") -> list[dict]:
+    """Paystack's bank list for a country (first page, up to 100 entries)."""
+    resp = requests.get(
+        f"{PAYSTACK_API_BASE}/bank",
+        params={"country": country, "perPage": 100},
+        headers=_headers(secret_key),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json().get("data", [])
 
 
 def create_split(

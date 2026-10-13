@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useChama } from '../../app/ChamaProvider';
-import { setupSettlementAccount, requestSettlementChange } from '../../lib/callables';
+import { setupSettlementAccount, requestSettlementChange, listKenyaBanks } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { PLANS } from '../../lib/constants';
 
@@ -53,26 +53,54 @@ export default function Payments() {
 }
 
 function SettlementForm({ mode, chamaId, onDone }: { mode: 'setup' | 'change'; chamaId: string; onDone: () => void }) {
-  const [accountType, setAccountType] = useState<'paybill' | 'till' | 'bank'>('paybill');
+  const [accountType, setAccountType] = useState<'paybill' | 'till' | 'bank'>('till');
   const [accountNumber, setAccountNumber] = useState('');
   const [bankCode, setBankCode] = useState('');
+  const [banks, setBanks] = useState<{ name: string; code: string }[]>([]);
+  const [bankFilter, setBankFilter] = useState('');
+  const [banksLoading, setBanksLoading] = useState(false);
+  const [banksError, setBanksError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
 
+  // Banks are only needed (and only fetched) once, when the bank type is first chosen.
+  useEffect(() => {
+    if (accountType !== 'bank' || banks.length || banksLoading) return;
+    setBanksLoading(true);
+    setBanksError(null);
+    listKenyaBanks({})
+      .then((res) => setBanks(res.banks))
+      .catch((e) => setBanksError(describeCallError(e).message))
+      .finally(() => setBanksLoading(false));
+  }, [accountType, banks.length, banksLoading]);
+
+  const selectedBank = banks.find((b) => b.code === bankCode);
+  const filteredBanks = banks.filter((b) => b.code === bankCode || b.name.toLowerCase().includes(bankFilter.trim().toLowerCase()));
+
   async function submit() {
     setError(null);
+    if (accountType === 'paybill') {
+      setError('M-Pesa Paybill is currently under maintenance. Choose a bank account or a Till.');
+      return;
+    }
+    if (accountType === 'bank' && !selectedBank) {
+      setError('Pick a bank.');
+      return;
+    }
     if (!accountNumber.trim()) {
       setError('Enter the paybill/till/account number.');
       return;
     }
+    const accountLabel = accountType === 'bank' && selectedBank ? selectedBank.name : accountType;
+    const code = accountType === 'bank' ? selectedBank?.code : undefined;
     setBusy(true);
     try {
       if (mode === 'setup') {
-        await setupSettlementAccount({ chamaId, accountLabel: accountType, accountType, accountNumber, bankCode: bankCode || undefined });
+        await setupSettlementAccount({ chamaId, accountLabel, accountType, accountNumber, bankCode: code });
         setOk('Settlement account set up.');
       } else {
-        await requestSettlementChange({ chamaId, accountLabel: accountType, accountType, accountNumber, bankCode: bankCode || undefined });
+        await requestSettlementChange({ chamaId, accountLabel, accountType, accountNumber, bankCode: code });
         setOk('Change requested — needs approval from another official.');
       }
       setTimeout(onDone, 1500);
@@ -94,17 +122,43 @@ function SettlementForm({ mode, chamaId, onDone }: { mode: 'setup' | 'change'; c
           <option value="bank">Bank account</option>
         </select>
       </label>
+      {accountType === 'paybill' && (
+        <p className="text-sm text-gold-700 font-medium">M-Pesa Paybill is currently under maintenance. Choose a bank account or a Till to collect online.</p>
+      )}
+      {accountType === 'bank' && (
+        <>
+          <label className="flex flex-col gap-1 text-sm font-medium">
+            Bank
+            <input
+              value={bankFilter}
+              onChange={(e) => setBankFilter(e.target.value)}
+              placeholder="Type to filter banks"
+              disabled={busy || banksLoading}
+              className="px-3 py-2 rounded-lg border border-forest-100"
+            />
+          </label>
+          <select
+            value={bankCode}
+            onChange={(e) => setBankCode(e.target.value)}
+            disabled={busy || banksLoading}
+            aria-label="Bank"
+            className="px-3 py-2 rounded-lg border border-forest-100"
+          >
+            <option value="">{banksLoading ? 'Loading banks…' : 'Select a bank'}</option>
+            {filteredBanks.map((b) => (
+              <option key={b.code} value={b.code}>
+                {b.name}
+              </option>
+            ))}
+          </select>
+          {banksError && <p className="text-sm text-brick-500 font-medium">{banksError}</p>}
+        </>
+      )}
       <label className="flex flex-col gap-1 text-sm font-medium">
         {accountType === 'bank' ? 'Account number' : 'Paybill/Till number'}
         <input value={accountNumber} onChange={(e) => setAccountNumber(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
       </label>
-      {accountType === 'bank' && (
-        <label className="flex flex-col gap-1 text-sm font-medium">
-          Bank code
-          <input value={bankCode} onChange={(e) => setBankCode(e.target.value)} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
-        </label>
-      )}
-      <button onClick={submit} disabled={busy} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
+      <button onClick={submit} disabled={busy || accountType === 'paybill'} className="btn-primary text-sm font-semibold px-4 py-2 rounded-full self-start disabled:opacity-50">
         {busy ? 'Saving…' : mode === 'setup' ? 'Set up settlement account' : 'Request change'}
       </button>
       {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}

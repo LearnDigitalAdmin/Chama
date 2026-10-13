@@ -292,6 +292,12 @@ export const mgrStartNewCycle = callable<{ chamaId: string; potId: string }, { o
 // Phase 3 — Payments, SMS & Settlement
 // ---------------------------------------------------------------------------
 
+/** Kenyan banks (name + Paystack code) for the settlement-account picker. Banks only — no M-PESA/Paybill/Till entries. */
+export const listKenyaBanks = liveCallable<Record<string, never>, { banks: { name: string; code: string }[] }>(
+  'listKenyaBanks',
+  'Loading banks'
+);
+
 /** Not queueable: account setup talks to Paystack live and returns a split code the UI needs now. */
 export const setupSettlementAccount = liveCallable<
   { chamaId: string; accountLabel: string; accountType: 'paybill' | 'till' | 'bank'; accountNumber?: string; bankCode?: string },

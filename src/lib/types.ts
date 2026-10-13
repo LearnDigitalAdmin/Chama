@@ -35,6 +35,7 @@ export interface Chama {
   smsCredits?: number;
   settlementAccount?: string;
   settlementSplitCode?: string;
+  settlementSubaccountCode?: string;
   autoSettle?: boolean;
   settlementFreq?: 'daily' | 'weekly' | 'monthly';
   lastSettlement?: string;

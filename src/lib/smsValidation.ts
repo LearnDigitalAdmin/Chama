@@ -10,12 +10,12 @@
  * as the source of truth — this file is a UX layer, not the enforcement point.
  */
 
-// Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
-export const SMS_SEGMENT_BREAKPOINTS = [140, 270, 385] as const;
+// Cumulative character caps: <=135 chars -> 1 segment, <=250 -> 2, <=380 -> 3.
+export const SMS_SEGMENT_BREAKPOINTS = [135, 250, 380] as const;
 export const MAX_SMS_LENGTH = SMS_SEGMENT_BREAKPOINTS[SMS_SEGMENT_BREAKPOINTS.length - 1];
 export const MAX_SMS_SEGMENTS = SMS_SEGMENT_BREAKPOINTS.length;
 
-/** Returns 1/2/3 segments, 0 for an empty message, or null if over the 385-char cap. */
+/** Returns 1/2/3 segments, 0 for an empty message, or null if over the 380-char cap. */
 export function countSmsSegments(message: string): number | null {
   const length = message.length;
   if (length === 0) return 0;
@@ -52,4 +52,45 @@ export function validateSmsContent(message: string): string | null {
     }
   }
   return null;
+}
+
+/** First name for the greeting, or `fallback` ("Member"/"Customer") when there is none. Mirrors sms_first_name(). */
+export function smsFirstName(fullName: string | null | undefined, fallback = 'Member'): string {
+  const first = (fullName ?? '').trim().split(/\s+/)[0] ?? '';
+  const cleaned = first.replace(/[^A-Za-z'-]/g, '').replace(/[A-Za-z]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+  return cleaned || fallback;
+}
+
+/** The text actually sent and charged: greeting, body, blank line, signature. Mirrors compose_sms(). */
+export function composeSms(body: string, chamaName: string | null | undefined, recipientName?: string | null, fallback = 'Member'): string {
+  const chama = (chamaName ?? '').replace(new RegExp(`[^A-Za-z0-9\\s${ALLOWED_PUNCTUATION}]`, 'g'), '').split(/\s+/).filter(Boolean).join(' ');
+  const signature = chama ? `${chama} by MyChama` : 'MyChama';
+  return `Dear ${smsFirstName(recipientName, fallback)},\n${body}\n\n${signature}`;
+}
+
+/**
+ * Credits for one send, counted per recipient on the full text (greeting + body + signature) — what the
+ * server charges. `names` holds one entry per recipient; with none, length is checked against "Dear Member,".
+ */
+export function estimateSmsCost(
+  body: string,
+  chamaName: string | null | undefined,
+  names: Array<string | null | undefined>
+): { credits: number; maxSegments: number; longest: number; tooLong: boolean } {
+  if (!body) return { credits: 0, maxSegments: 0, longest: 0, tooLong: false };
+  let credits = 0;
+  let maxSegments = 0;
+  let longest = 0;
+  let tooLong = false;
+  for (const name of names.length ? names : [undefined]) {
+    const text = composeSms(body, chamaName, name);
+    longest = Math.max(longest, text.length);
+    const segs = countSmsSegments(text);
+    if (segs === null) tooLong = true;
+    else {
+      maxSegments = Math.max(maxSegments, segs);
+      if (names.length) credits += segs;
+    }
+  }
+  return { credits: tooLong ? 0 : credits, maxSegments, longest, tooLong };
 }

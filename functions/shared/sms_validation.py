@@ -2,7 +2,7 @@
 SMS segmentation & content rules — shared by sendSmsCampaign and
 run_sms_schedules (functions/mychama/sms.py).
 
-Segment breakpoints (140 / 270 / 385 chars) are MyChama's own product
+Segment breakpoints (135 / 250 / 380 chars) are MyChama's own product
 rule, not GSM-7 concatenation math: 1 credit is charged per SMS segment,
 the same regardless of plan tier. PLANS[plan]['smsRate'] in
 shared/constants.py is a *different* number — the KES price per credit
@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import re
 
-# Cumulative character caps: <=140 chars -> 1 segment, <=270 -> 2, <=385 -> 3.
+# Cumulative character caps: <=135 chars -> 1 segment, <=250 -> 2, <=380 -> 3.
 # A message over the last breakpoint is rejected outright (no 4th segment).
-SEGMENT_BREAKPOINTS: tuple[int, ...] = (140, 270, 385)
+SEGMENT_BREAKPOINTS: tuple[int, ...] = (135, 250, 380)
 MAX_SMS_LENGTH = SEGMENT_BREAKPOINTS[-1]
 MAX_SMS_SEGMENTS = len(SEGMENT_BREAKPOINTS)
 
@@ -46,8 +46,8 @@ _WHATSAPP_HOSTS = ("wa.me", "chat.whatsapp.com", "api.whatsapp.com", "whatsapp.c
 
 def count_sms_segments(message: str) -> int | None:
     """
-    Returns 1, 2, or 3 per the 140/270/385 breakpoints, 0 for an empty
-    message, or None if the message is over the 385-char hard cap (the
+    Returns 1, 2, or 3 per the 135/250/380 breakpoints, 0 for an empty
+    message, or None if the message is over the 380-char hard cap (the
     caller should reject rather than send).
     """
     length = len(message)
@@ -72,3 +72,25 @@ def validate_sms_content(message: str) -> str | None:
         if not _is_whatsapp_link(match.group(0)):
             return "Only WhatsApp links (wa.me or whatsapp.com) are allowed in SMS messages."
     return None
+
+
+_NAME_CHARS_RE = re.compile(r"[^A-Za-z'\-]")
+_DISALLOWED_CHARS_RE = re.compile(rf"[^A-Za-z0-9\s{_ALLOWED_PUNCTUATION}]")
+
+
+def sms_first_name(full_name: str | None, fallback: str = "Member") -> str:
+    """First name of the recipient for the greeting, or `fallback` ("Member"/"Customer") when there is none."""
+    parts = (full_name or "").split()
+    first = _NAME_CHARS_RE.sub("", parts[0]).title() if parts else ""
+    return first or fallback
+
+
+def compose_sms(body: str, chama_name: str | None, recipient_name: str | None = None, fallback: str = "Member") -> str:
+    """
+    The text actually sent, and the text that is segmented and charged: "Dear <first name>," on top,
+    the body, a blank line, then "<chama name> by MyChama". The greeting and signature count toward the
+    135/250/380 limits, so cost must always be computed on this string, never on the bare body.
+    """
+    chama = " ".join(_DISALLOWED_CHARS_RE.sub("", chama_name or "").split())
+    signature = f"{chama} by MyChama" if chama else "MyChama"
+    return f"Dear {sms_first_name(recipient_name, fallback)},\n{body}\n\n{signature}"

@@ -63,6 +63,7 @@ from mychama.mgr import (  # noqa: E402,F401
 
 # --- Phase 3: Payments, SMS & Settlement -----------------------------------
 from mychama.payments import (  # noqa: E402,F401
+    listKenyaBanks,
     setupSettlementAccount,
     requestSettlementChange,
     approveSettlementChange,

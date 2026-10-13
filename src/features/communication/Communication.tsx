@@ -7,7 +7,7 @@ import { useMembers } from '../../app/useMembers';
 import { sendSmsCampaign, purchaseSmsCredits } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { AUDIENCE_LABEL, PLANS } from '../../lib/constants';
-import { countSmsSegments, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
+import { estimateSmsCost, validateSmsContent, MAX_SMS_LENGTH } from '../../lib/smsValidation';
 import { kes } from '../../lib/money';
 import type { Chama, ChamaMember, SmsLogEntry, SmsSchedule } from '../../lib/types';
 
@@ -23,12 +23,12 @@ function estimateRecipients(
   activeMembers: ChamaMember[],
   overdueMemberIds: Set<string>,
   loanHolderMemberIds: Set<string>
-): number {
-  if (audience === 'all') return activeMembers.length;
-  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin).length;
-  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id)).length;
-  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id)).length;
-  return customIds.length;
+): ChamaMember[] {
+  if (audience === 'all') return activeMembers;
+  if (audience === 'admins') return activeMembers.filter((m) => m.isAdmin);
+  if (audience === 'overdue') return activeMembers.filter((m) => overdueMemberIds.has(m.id));
+  if (audience === 'loan_holders') return activeMembers.filter((m) => loanHolderMemberIds.has(m.id));
+  return activeMembers.filter((m) => customIds.includes(m.id));
 }
 
 export default function Communication() {
@@ -78,16 +78,18 @@ export default function Communication() {
     };
   }, [chamaId]);
 
-  const recipientEstimate = useMemo(() => {
+  const recipientList = useMemo(() => {
     const active = members.filter((m) => m.status === 'active');
     return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
+  const recipientEstimate = recipientList.length;
 
   const trimmedMessage = message.trim();
-  const segments = countSmsSegments(trimmedMessage); // null once over the 385-char cap
-  const overLength = segments === null;
+  // Counted per recipient on the full text the server sends: greeting + message + signature.
+  const smsCost = estimateSmsCost(trimmedMessage, chama?.name, recipientList.map((m) => m.name));
+  const overLength = smsCost.tooLong; // true once the longest final text is over the 380-char cap
   const contentError = trimmedMessage ? validateSmsContent(trimmedMessage) : null;
-  const creditsNeeded = segments ? segments * recipientEstimate : 0;
+  const creditsNeeded = smsCost.credits;
   const kesEquivalent = chama ? creditsNeeded * PLANS[chama.plan].smsRate : 0;
   const availableCredits = chama?.smsCredits ?? 0;
   const insufficientCredits = creditsNeeded > availableCredits;
@@ -108,7 +110,7 @@ export default function Communication() {
       return;
     }
     if (overLength) {
-      setError(`Message is too long — SMS campaigns are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
+      setError(`Message is too long — with the greeting and signature it is ${smsCost.longest} characters, and SMS campaigns are capped at ${MAX_SMS_LENGTH} (3 segments).`);
       return;
     }
     if (contentError) {
@@ -200,12 +202,13 @@ export default function Communication() {
               <textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={4} maxLength={MAX_SMS_LENGTH} disabled={busy} className="px-3 py-2 rounded-lg border border-forest-100" />
             </label>
             <p className="text-xs text-forest-900/50">
-              {message.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
+              {message.length} characters · longest SMS with greeting and signature {smsCost.longest}/{MAX_SMS_LENGTH} · up to{' '}
+              {smsCost.maxSegments || 1} segment{smsCost.maxSegments > 1 ? 's' : ''} × {recipientEstimate} recipient
               {recipientEstimate === 1 ? '' : 's'} = {creditsNeeded} credit{creditsNeeded === 1 ? '' : 's'} (≈ {kes(kesEquivalent)})
             </p>
             {overLength && (
               <p className="text-sm text-brick-500 font-medium">
-                Too long — SMS campaigns are capped at {MAX_SMS_LENGTH} characters (3 segments).
+                Too long — with the greeting and signature the longest SMS is {smsCost.longest} characters; campaigns are capped at {MAX_SMS_LENGTH} (3 segments).
               </p>
             )}
             {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
@@ -403,20 +406,21 @@ function ScheduleForm({
     setCustomIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }
 
-  const recipientEstimate = useMemo(() => {
+  const recipientList = useMemo(() => {
     const active = members.filter((m) => m.status === 'active');
     return estimateRecipients(audience, customIds, active, overdueMemberIds, loanHolderMemberIds);
   }, [members, audience, overdueMemberIds, loanHolderMemberIds, customIds]);
+  const recipientEstimate = recipientList.length;
 
   const trimmedBody = body.trim();
-  const segments = countSmsSegments(trimmedBody);
-  const overLength = segments === null;
+  const smsCost = estimateSmsCost(trimmedBody, chama.name, recipientList.map((m) => m.name));
+  const overLength = smsCost.tooLong;
   const contentError = trimmedBody ? validateSmsContent(trimmedBody) : null;
   // Each occurrence of a recurring schedule costs this many credits — the
   // same precheck as a one-off send, run against the audience's current
   // size (a later run may differ if membership changes, but this is the
   // best estimate available at creation time).
-  const creditsNeededPerRun = segments ? segments * recipientEstimate : 0;
+  const creditsNeededPerRun = smsCost.credits;
   const availableCredits = chama.smsCredits ?? 0;
   const insufficientCredits = creditsNeededPerRun > availableCredits;
   const canSubmit = !busy && !!trimmedBody && !overLength && !contentError && !insufficientCredits;
@@ -428,7 +432,7 @@ function ScheduleForm({
       return;
     }
     if (overLength) {
-      onError(`Message is too long — SMS schedules are capped at ${MAX_SMS_LENGTH} characters (3 segments).`);
+      onError(`Message is too long — with the greeting and signature it is ${smsCost.longest} characters, and SMS schedules are capped at ${MAX_SMS_LENGTH} (3 segments).`);
       return;
     }
     if (contentError) {
@@ -494,13 +498,14 @@ function ScheduleForm({
         </select>
       </label>
       <p className="text-xs text-forest-900/50">
-        {body.length}/{MAX_SMS_LENGTH} characters · {segments ?? 3}+ segment{(segments ?? 3) === 1 ? '' : 's'} × {recipientEstimate} recipient
+        {body.length} characters · longest SMS with greeting and signature {smsCost.longest}/{MAX_SMS_LENGTH} · up to{' '}
+        {smsCost.maxSegments || 1} segment{smsCost.maxSegments > 1 ? 's' : ''} × {recipientEstimate} recipient
         {recipientEstimate === 1 ? '' : 's'} = {creditsNeededPerRun} credit{creditsNeededPerRun === 1 ? '' : 's'} per run
       </p>
       <p className="text-xs text-forest-900/50">Starts within about 15 minutes, then repeats on this cadence until paused or deleted.</p>
       {overLength && (
         <p className="text-sm text-brick-500 font-medium">
-          Too long — SMS schedules are capped at {MAX_SMS_LENGTH} characters (3 segments).
+          Too long — with the greeting and signature the longest SMS is {smsCost.longest} characters; schedules are capped at {MAX_SMS_LENGTH} (3 segments).
         </p>
       )}
       {!overLength && contentError && <p className="text-sm text-brick-500 font-medium">{contentError}</p>}
