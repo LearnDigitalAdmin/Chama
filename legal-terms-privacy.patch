@@ -1,0 +1,1381 @@
+diff --git a/docs/LEGAL.md b/docs/LEGAL.md
+new file mode 100644
+index 0000000..bf59d32
+--- /dev/null
++++ b/docs/LEGAL.md
+@@ -0,0 +1,38 @@
++# Legal pages — Terms & Conditions and Privacy Policy
++
++Public routes: `/terms` and `/privacy` (indexable, listed in `public/sitemap.xml` and `public/llms.txt`).
++They are linked from the landing-page footer, under every sign-in / onboarding card (`AuthLayout`), and in the signed-in user menu (`AppShell`).
++
++## Files
++
++| File | What it is |
++|---|---|
++| `src/legal/legalConfig.ts` | Company name, contact, **version + effective date**, retention windows, liability floor. Edit facts here. |
++| `src/legal/LegalLayout.tsx` | Shared page shell (table of contents, anchors, mobile jump menu) and content primitives. |
++| `src/legal/TermsPage.tsx` | Terms & Conditions (27 sections). |
++| `src/legal/PrivacyPage.tsx` | Privacy Policy (16 sections). |
++
++## Never drifts from the product
++
++Plan prices, member limits, report credits, Paystack and MyChama fee rates, SMS segment limits,
++payment-prompt expiry and WhatsApp lockout windows are **imported** from `src/lib/constants.ts` and
++`src/lib/smsValidation.ts`. Change a number there and both pages update on the next build.
++
++## When to edit the pages (keep them true)
++
++Update the wording — and bump `version` / `effectiveDate` in `legalConfig.ts` — whenever you:
++
++- add or replace an outside provider (SMS gateway, payment processor, analytics, error tracking, fonts, maps…) → Privacy §6 table, §3 table if it receives new data, and the "no analytics / no trackers" statements;
++- collect a new kind of personal data, or change who can read ID numbers → Privacy §3, §7;
++- change where data is stored (Firestore location, function regions) → Privacy §8;
++- add online payouts / disbursements (today loans and merry-go-round payouts are recorded cash only) → Terms §3, §7, §8, §9;
++- change refunds, plan expiry behaviour, or SMS credit rules → Terms §6, §10;
++- start sending our own marketing → Privacy §4 and §14 (requires consent first).
++
++## Operational follow-ups the text relies on
++
++1. **Technical-log TTL.** Privacy §12 says WhatsApp audit / rate-limit logs are deleted after `technicalLogRetentionDays` (90). Set a Firestore TTL policy to match, e.g.
++   `gcloud firestore fields ttl-policies update expiresAt --collection-group=whatsappAuditLog --enable-ttl`
++   (see TOUCH_BASE.md, deploy step 3). If you pick a different period, change the number in `legalConfig.ts`.
++2. **ODPC registration.** Register as a data controller/processor with the Office of the Data Protection Commissioner, then put the number in `odpcRegistrationNumber`; the Privacy Policy shows it automatically once set.
++3. **Legal review.** Have a Kenyan advocate review the final text before launch (liability cap, indemnity, retention period, governing-law clause).
+diff --git a/public/llms.txt b/public/llms.txt
+index 3f97d80..3fb28e3 100644
+--- a/public/llms.txt
++++ b/public/llms.txt
+@@ -20,3 +20,10 @@ MyChama does not hold chama funds — online payments are processed by Paystack
+ 
+ - [Sign in](https://chama.samuhia.co.ke/signin): for existing chama members and officials
+ - [Create a chama](https://chama.samuhia.co.ke/create-chama): start a new chama on the Free plan
++
++## Legal
++
++- Terms & Conditions: https://chama.samuhia.co.ke/terms
++- Privacy Policy: https://chama.samuhia.co.ke/privacy
++
++MyChama is operated by SAMUHIA BUSINESSES KENYA, registered in Kenya and operating from Nakuru. Personal data is used only to deliver the service and is never sold.
+diff --git a/public/sitemap.xml b/public/sitemap.xml
+index ea20604..cd2364b 100644
+--- a/public/sitemap.xml
++++ b/public/sitemap.xml
+@@ -7,4 +7,18 @@
+     <changefreq>weekly</changefreq>
+     <priority>1.0</priority>
+   </url>
++  <url>
++    <loc>https://chama.samuhia.co.ke/terms</loc>
++    <xhtml:link rel="alternate" hreflang="en-KE" href="https://chama.samuhia.co.ke/terms" />
++    <xhtml:link rel="alternate" hreflang="x-default" href="https://chama.samuhia.co.ke/terms" />
++    <changefreq>yearly</changefreq>
++    <priority>0.3</priority>
++  </url>
++  <url>
++    <loc>https://chama.samuhia.co.ke/privacy</loc>
++    <xhtml:link rel="alternate" hreflang="en-KE" href="https://chama.samuhia.co.ke/privacy" />
++    <xhtml:link rel="alternate" hreflang="x-default" href="https://chama.samuhia.co.ke/privacy" />
++    <changefreq>yearly</changefreq>
++    <priority>0.3</priority>
++  </url>
+ </urlset>
+diff --git a/src/App.tsx b/src/App.tsx
+index 03d045b..9398eca 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -29,6 +29,9 @@ import { useAuth } from './auth/AuthProvider';
+ import PWAPrompts from './pwa/PWAPrompts';
+ import { pwaManager } from './pwa/pwaManager';
+ import RouteSeo from './seo/RouteSeo';
++import TermsPage from './legal/TermsPage';
++import PrivacyPage from './legal/PrivacyPage';
++import { LEGAL_PATHS } from './legal/legalConfig';
+ 
+ function Root() {
+   const { user, authReady } = useAuth();
+@@ -46,6 +49,8 @@ export default function App() {
+       <PWAPrompts />
+     <Routes>
+       <Route path="/" element={<Root />} />
++      <Route path={LEGAL_PATHS.terms} element={<TermsPage />} />
++      <Route path={LEGAL_PATHS.privacy} element={<PrivacyPage />} />
+       <Route path="/signin" element={<SignInLanding />} />
+       <Route path="/signin/phone" element={<PhoneSignIn />} />
+       <Route path="/signin/admin" element={<EmailSignInAdmin />} />
+diff --git a/src/app/AppShell.tsx b/src/app/AppShell.tsx
+index c66e743..2ac50f3 100644
+--- a/src/app/AppShell.tsx
++++ b/src/app/AppShell.tsx
+@@ -1,5 +1,5 @@
+ import { useState } from 'react';
+-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
++import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+ import { signOut } from 'firebase/auth';
+ import { auth } from '../lib/firebase';
+ import { useAuth } from '../auth/AuthProvider';
+@@ -103,6 +103,12 @@ export default function AppShell() {
+                     {user?.displayName || user?.phoneNumber || user?.email}
+                   </p>
+                   <p className="px-2 pb-1.5 text-xs font-semibold text-forest-700 capitalize">{role}</p>
++                  <Link to="/terms" target="_blank" rel="noopener" className="block px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50">
++                    Terms &amp; Conditions
++                  </Link>
++                  <Link to="/privacy" target="_blank" rel="noopener" className="block px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50">
++                    Privacy Policy
++                  </Link>
+                   <button
+                     onClick={() => signOut(auth)}
+                     className="w-full text-left px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50"
+diff --git a/src/auth/AuthLayout.tsx b/src/auth/AuthLayout.tsx
+index adff234..8b9bdba 100644
+--- a/src/auth/AuthLayout.tsx
++++ b/src/auth/AuthLayout.tsx
+@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
+ import { Link } from 'react-router-dom';
+ import BrandMark from '../brand/BrandMark';
+ import InstallButton from '../pwa/InstallButton';
++import { LEGAL_PATHS } from '../legal/legalConfig';
+ 
+ export default function AuthLayout({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) {
+   return (
+@@ -18,6 +19,11 @@ export default function AuthLayout({ title, subtitle, children }: { title: strin
+           <h1 className="font-display text-xl font-semibold text-ink">{title}</h1>
+           {subtitle && <p className="text-sm text-forest-900/60 mt-1">{subtitle}</p>}
+           <div className="mt-6 flex flex-col gap-4">{children}</div>
++          <p className="mt-6 text-xs text-forest-900/55 text-center leading-relaxed">
++            By continuing you agree to our{' '}
++            <Link to={LEGAL_PATHS.terms} className="underline underline-offset-2 hover:text-forest-700">Terms</Link> and{' '}
++            <Link to={LEGAL_PATHS.privacy} className="underline underline-offset-2 hover:text-forest-700">Privacy Policy</Link>.
++          </p>
+         </div>
+       </main>
+     </div>
+diff --git a/src/legal/LegalLayout.tsx b/src/legal/LegalLayout.tsx
+new file mode 100644
+index 0000000..14904c7
+--- /dev/null
++++ b/src/legal/LegalLayout.tsx
+@@ -0,0 +1,142 @@
++import { useEffect, type ReactNode } from 'react';
++import { Link } from 'react-router-dom';
++import BrandMark from '../brand/BrandMark';
++import { LEGAL, LEGAL_PATHS, formatEffectiveDate } from './legalConfig';
++
++export interface LegalSection { id: string; title: string; body: ReactNode }
++
++/* ---------- tiny content primitives so the two documents read the same ---------- */
++
++export const P = ({ children }: { children: ReactNode }) => <p className="text-[15px] leading-relaxed text-ink/80 mt-3">{children}</p>;
++
++export const UL = ({ children }: { children: ReactNode }) => (
++  <ul className="list-disc pl-5 mt-3 space-y-1.5 text-[15px] leading-relaxed text-ink/80 marker:text-forest-400">{children}</ul>
++);
++
++export const H3 = ({ children }: { children: ReactNode }) => <h3 className="font-display font-semibold text-base text-ink mt-6">{children}</h3>;
++
++export function Callout({ title, children, tone = 'plain' }: { title?: string; children: ReactNode; tone?: 'plain' | 'important' }) {
++  const cls = tone === 'important' ? 'bg-gold-50 border-gold-200' : 'bg-forest-50 border-forest-100';
++  return (
++    <div className={`mt-4 rounded-xl border px-4 py-3 text-[15px] leading-relaxed text-ink/85 ${cls}`}>
++      {title && <p className="font-display font-semibold text-ink mb-1">{title}</p>}
++      {children}
++    </div>
++  );
++}
++
++export function Table({ head, rows }: { head: string[]; rows: ReactNode[][] }) {
++  return (
++    <div className="mt-4 overflow-x-auto rounded-xl border border-forest-100 bg-white">
++      <table className="w-full text-sm text-left">
++        <thead className="bg-forest-50 text-forest-800">
++          <tr>{head.map((h) => <th key={h} className="px-3 py-2 font-semibold align-bottom">{h}</th>)}</tr>
++        </thead>
++        <tbody>
++          {rows.map((r, i) => (
++            <tr key={i} className="border-t border-forest-100 align-top">
++              {r.map((c, j) => <td key={j} className="px-3 py-2 text-ink/80">{c}</td>)}
++            </tr>
++          ))}
++        </tbody>
++      </table>
++    </div>
++  );
++}
++
++export const Mail = () => <a href={`mailto:${LEGAL.email}`} className="text-forest-700 underline underline-offset-2">{LEGAL.email}</a>;
++export const TermsLink = () => <Link to={LEGAL_PATHS.terms} className="text-forest-700 underline underline-offset-2">Terms &amp; Conditions</Link>;
++export const PrivacyLink = () => <Link to={LEGAL_PATHS.privacy} className="text-forest-700 underline underline-offset-2">Privacy Policy</Link>;
++
++/* ---------- page shell ---------- */
++
++export default function LegalLayout({
++  title, intro, sections, other,
++}: {
++  title: string;
++  intro: ReactNode;
++  sections: LegalSection[];
++  other: { to: string; label: string };
++}) {
++  // Honour #section links on first load (the router doesn't scroll to hashes by itself).
++  useEffect(() => {
++    const id = window.location.hash.slice(1);
++    if (id) document.getElementById(id)?.scrollIntoView();
++    else window.scrollTo(0, 0);
++  }, [title]);
++
++  return (
++    <div className="min-h-screen bg-paper text-ink">
++      <header className="h-16 flex items-center px-5 border-b border-forest-100 bg-paper/90 backdrop-blur sticky top-0 z-20">
++        <Link to="/" className="flex items-center gap-2">
++          <BrandMark size={32} />
++          <span className="font-display font-semibold text-lg tracking-tight">MyChama</span>
++        </Link>
++        <nav aria-label="Legal" className="ml-auto flex gap-4 text-sm font-semibold">
++          <Link to={LEGAL_PATHS.terms} className="text-forest-700 hover:text-forest-800">Terms</Link>
++          <Link to={LEGAL_PATHS.privacy} className="text-forest-700 hover:text-forest-800">Privacy</Link>
++        </nav>
++      </header>
++
++      <main className="max-w-6xl mx-auto px-5 py-10 lg:grid lg:grid-cols-[15rem_1fr] lg:gap-12">
++        <aside className="hidden lg:block">
++          <nav aria-label="On this page" className="sticky top-24 max-h-[calc(100vh-7rem)] overflow-y-auto pr-2 text-sm">
++            <p className="font-display font-semibold text-ink mb-2">On this page</p>
++            <ol className="space-y-1.5">
++              {sections.map((s, i) => (
++                <li key={s.id}>
++                  <a href={`#${s.id}`} className="text-forest-900/65 hover:text-forest-700 leading-snug block">
++                    <span className="num text-forest-400 mr-1.5">{i + 1}.</span>{s.title}
++                  </a>
++                </li>
++              ))}
++            </ol>
++          </nav>
++        </aside>
++
++        <article className="min-w-0 max-w-3xl">
++          <h1 className="font-display text-3xl md:text-4xl font-semibold tracking-tight">{title}</h1>
++          <p className="text-sm text-forest-900/55 mt-2">
++            Version {LEGAL.version} · Effective {formatEffectiveDate()} · {LEGAL.company}, {LEGAL.place}
++          </p>
++          {intro}
++
++          <details className="lg:hidden mt-6 card px-4 py-3">
++            <summary className="font-display font-semibold cursor-pointer">Jump to a section</summary>
++            <ol className="mt-3 space-y-2 text-sm">
++              {sections.map((s, i) => (
++                <li key={s.id}><a href={`#${s.id}`} className="text-forest-700">{i + 1}. {s.title}</a></li>
++              ))}
++            </ol>
++          </details>
++
++          {sections.map((s, i) => (
++            <section key={s.id} id={s.id} className="scroll-mt-24 mt-10 pt-8 border-t border-forest-100 first-of-type:border-t-0">
++              <h2 className="font-display text-xl font-semibold">
++                <a href={`#${s.id}`} className="no-underline text-ink"><span className="num text-forest-400 mr-2">{i + 1}.</span>{s.title}</a>
++              </h2>
++              {s.body}
++            </section>
++          ))}
++
++          <div className="mt-12 pt-6 border-t border-forest-100 text-sm text-forest-900/60 flex flex-wrap items-center justify-between gap-3">
++            <span>Questions? <Mail /></span>
++            <Link to={other.to} className="font-semibold text-forest-700 hover:text-forest-800">{other.label} →</Link>
++          </div>
++        </article>
++      </main>
++
++      <footer className="border-t border-forest-100 py-8">
++        <div className="max-w-6xl mx-auto px-5 text-xs text-forest-900/50 flex flex-wrap items-center justify-between gap-3">
++          <span>© {new Date().getFullYear()} {LEGAL.company}</span>
++          <nav aria-label="Footer" className="flex gap-4">
++            <Link to="/" className="hover:text-forest-700">Home</Link>
++            <Link to={LEGAL_PATHS.terms} className="hover:text-forest-700">Terms</Link>
++            <Link to={LEGAL_PATHS.privacy} className="hover:text-forest-700">Privacy</Link>
++          </nav>
++          <span>By Samuhia</span>
++        </div>
++      </footer>
++    </div>
++  );
++}
+diff --git a/src/legal/PrivacyPage.tsx b/src/legal/PrivacyPage.tsx
+new file mode 100644
+index 0000000..a09e86e
+--- /dev/null
++++ b/src/legal/PrivacyPage.tsx
+@@ -0,0 +1,391 @@
++import { useSeo } from '../seo/useSeo';
++import { SECURITY } from '../lib/constants';
++import LegalLayout, { Callout, H3, Mail, P, Table, TermsLink, UL, type LegalSection } from './LegalLayout';
++import { LEGAL, LEGAL_PATHS } from './legalConfig';
++
++const mins = (s: number) => Math.round(s / 60);
++
++const sections: LegalSection[] = [
++  /* ------------------------------------------------------------------ 1 */
++  {
++    id: 'summary',
++    title: 'The short version',
++    body: (
++      <>
++        <P>
++          This policy explains what personal information {LEGAL.product} collects, why, who can see it, and what your rights are. It applies to everyone who uses {LEGAL.product}: chama officials, members,
++          and people who receive our SMS. It is written to follow the <strong>Data Protection Act, 2019</strong> of Kenya.
++        </P>
++        <Callout title="In plain words">
++          <UL>
++            <li><strong>We never sell your data.</strong> We do not rent it, trade it, or give it to advertisers, data brokers or marketers.</li>
++            <li><strong>We use your data only to run {LEGAL.product}</strong> — to sign you in, keep your chama's records, take payments, send the SMS and WhatsApp messages the service needs, and keep it secure.</li>
++            <li><strong>No advertising, no tracking.</strong> We have no ad networks, no analytics or social-media trackers, and we set no tracking cookies. We do not build marketing profiles or score people.</li>
++            <li><strong>A few providers run the technology for us</strong> (Google for hosting and sign-in, Paystack for payments, an SMS provider, and WhatsApp for the assistant). They receive only what they need to do that job. They are listed in full in section 6.</li>
++            <li><strong>Your chama's officials see more than other members.</strong> Section 7 shows who sees what.</li>
++            <li><strong>You have rights</strong> to see, correct and, where the law allows, delete your data — see section 11.</li>
++          </UL>
++        </Callout>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 2 */
++  {
++    id: 'who',
++    title: 'Who is responsible for your data',
++    body: (
++      <>
++        <P>
++          <strong>{LEGAL.company}</strong> ("{LEGAL.brand}", "we"), registered in Kenya and operating from {LEGAL.place}, runs {LEGAL.product}. You can reach us at <Mail />.
++          {LEGAL.odpcRegistrationNumber && <> We are registered with the Office of the Data Protection Commissioner (registration number {LEGAL.odpcRegistrationNumber}).</>}
++        </P>
++        <P>The Data Protection Act distinguishes two roles, and we act in both:</P>
++        <UL>
++          <li>
++            <strong>We are the data controller</strong> for information about you as a user of {LEGAL.product}: your account and sign-in details, your payments for plans, SMS and reports,
++            security and fraud checks, and your communication with our support. We decide why and how that data is used.
++          </li>
++          <li>
++            <strong>We are a data processor for your chama</strong> for the member records and chama records its officials enter (member lists, ID numbers, contributions, loans, merry-go-round pots, minutes, messages).
++            The chama decides what to collect and why; we store and process it on the chama's behalf, to deliver the service. Chama officials are responsible for having a proper basis to collect members' details and for using them only for the chama's business.
++          </li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 3 */
++  {
++    id: 'collect',
++    title: 'What we collect',
++    body: (
++      <>
++        <P>We collect only what {LEGAL.product} needs to work. Here is everything, by purpose.</P>
++        <Table
++          head={['Information', 'Details', 'Comes from']}
++          rows={[
++            [<strong key="1">Account &amp; sign-in</strong>, 'Name; mobile number; email address (if you use Google or email sign-in); a unique account ID; sign-in method. Passwords for email sign-in are handled by Google Firebase Authentication and are never visible to us.', 'You; Google (if you use Google sign-in)'],
++            [<strong key="2">Member record</strong>, 'Full name; mobile number; National ID or passport number; join date; role (Chair, Treasurer, Secretary, member); status; running total contributed and credit balance; whether the member has opted in to messages; a display colour and initial.', 'The chama\'s officials, and you'],
++            [<strong key="3">Money records</strong>, 'Contributions due and paid; loan applications, approvals, schedules and repayments; merry-go-round pots, queue order, payments, arrears, shortfalls, exits and payouts; a transaction ledger with amounts, fees and references; cash entries recorded by officials.', 'Officials, members, and Paystack (payment confirmations)'],
++            [<strong key="4">Payment details</strong>, 'The phone number that receives the M-Pesa or Airtel prompt; payment references, amounts, status and time; the chama\'s settlement account (bank or till) and its Paystack codes. We never see or store your M-Pesa or Airtel PIN, card numbers or bank passwords.', 'You; the chama\'s Chair; Paystack'],
++            [<strong key="5">Plan &amp; billing</strong>, 'The chama\'s plan, expiry date, SMS credit balance, report credits and purchase history.', 'The chama; Paystack'],
++            [<strong key="6">Messages</strong>, 'The text of SMS sent through the app, who it was addressed to, how many were sent and credits used; scheduled reminders; the in-app message inbox. A security PIN SMS or sign-in code is sent but its PIN is not logged.', 'Officials'],
++            [<strong key="7">Minutes &amp; reports</strong>, 'Meeting minutes text; generated reports (PDF/CSV) held in a private store and reachable only by short-lived links.', 'Officials; generated by us from the records'],
++            [<strong key="8">WhatsApp assistant</strong>, 'Your WhatsApp phone number and the messages needed to run the chat; the step you are on; a log of actions (for security and support); counters used to stop abuse; and daily usage totals in which each user appears only as a salted, one-way code — never a phone number.', 'You, through WhatsApp'],
++            [<strong key="9">Support</strong>, 'Support requests (subject, message, category, status and replies) and an audit trail of actions a desk takes in a chama (what was done, by which desk, and the outcome — not message text or ID numbers).', 'Officials; desks'],
++            [<strong key="10">Technical</strong>, 'Device and browser type, IP address and error logs created when you use the app or functions; reCAPTCHA signals used by Google to stop automated sign-ins; data kept on your device (section 10).', 'Your device'],
++          ]}
++        />
++        <H3>What we do not collect</H3>
++        <UL>
++          <li>Your location, camera, microphone, contacts or photos. (The app blocks them.)</li>
++          <li>Card numbers, PINs, or bank or mobile-money passwords.</li>
++          <li>Biometric data, or any information about your health, religion, politics, race or sexual life.</li>
++          <li>Advertising IDs or tracking identifiers.</li>
++        </UL>
++        <Callout tone="important" title="About your ID number">
++          Your National ID or passport number is personal information that deserves extra care. It is used to confirm who you are in your chama (for example, when you sign in through WhatsApp), to make sure one ID is not registered twice in a chama,
++          and to match you to your chama membership in Samuhia Payments if you use it. It is shown masked in most screens. Only the chama's Chair and Treasurer, and you for your own record, can see the full number. We also keep a one-way coded form of it (a keyed hash) so it can be matched without exposing the number.
++        </Callout>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 4 */
++  {
++    id: 'use',
++    title: 'Why we use your information',
++    body: (
++      <>
++        <Table
++          head={['What we do', 'Information used', 'Our lawful basis']}
++          rows={[
++            ['Create and secure your account; sign you in; keep you signed in on your device', 'Account & sign-in, technical', 'Contract — to provide the service you asked for'],
++            ['Keep the chama\'s members, contributions, loans, pots, minutes and reports', 'Member record, money records, minutes', 'Contract and the chama\'s instructions (we act as its processor)'],
++            ['Take payments, apply them correctly and avoid double-charging', 'Payment details, money records', 'Contract; legal obligation (accounting and anti-fraud)'],
++            ['Bill the chama for plans, SMS credits and reports', 'Plan & billing, payment details', 'Contract; legal obligation'],
++            ['Send SMS and WhatsApp messages the service needs: sign-in codes, report PINs, plan reminders, and messages your officials send', 'Phone number, message text, member opt-in status', 'Contract; the chama\'s instructions; your consent for chama messages where required'],
++            ['Check who you are (ID check, one ID per chama, WhatsApp verification) and stop fraud and abuse', 'Member record, WhatsApp data, technical', 'Legitimate interest in protecting members and the service; legal obligation'],
++            ['Give support and help a chama through its desk', 'Support, relevant chama records', 'Contract; the chama\'s instructions'],
++            ['Keep the service running, fix faults and plan capacity (using logs and counts that do not identify people)', 'Technical, daily usage totals', 'Legitimate interest'],
++            ['Comply with law, a court order or a lawful request', 'Whatever the legal request covers', 'Legal obligation'],
++          ]}
++        />
++        <H3>What we do not do</H3>
++        <UL>
++          <li>We do not sell, rent or trade personal data.</li>
++          <li>We do not use it for advertising, marketing profiles, credit scoring or to train AI models.</li>
++          <li>We do not send our own marketing SMS or WhatsApp messages. If that ever changes, we will ask for your consent first and you will be able to say no.</li>
++          <li>We do not use it for any purpose that is incompatible with the ones above without telling you and, where required, asking for your consent.</li>
++        </UL>
++        <H3>Automated steps</H3>
++        <P>
++          Some features run automatically from payment records: contribution status (paid, partial, overdue), loan schedules, fee calculations, and — if a chama turns them on — the merry-go-round "smart" draw and
++          late-payer protection, which can move a member's place in a queue. They apply rules the chama has chosen. They do not produce a legal effect by themselves, and you may ask an official or us for a human review of any result (section 11).
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 5 */
++  {
++    id: 'never-sold',
++    title: 'We never sell or trade your data',
++    body: (
++      <>
++        <P>
++          We state it plainly because it matters: <strong>{LEGAL.product} does not sell personal data, and does not give it to third parties for their own purposes</strong>.
++          There are no advertising partners, no data brokers and no analytics or tracking companies connected to the app.
++        </P>
++        <P>
++          The only outside parties that handle data are the technology and payment providers we need in order to deliver the service. They act on our instructions, for that purpose only (section 6). Section 7 explains what other people in your chama can see.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 6 */
++  {
++    id: 'providers',
++    title: 'The providers that help us deliver the service',
++    body: (
++      <>
++        <P>
++          {LEGAL.product} is not built from advertising or marketing services. But no software runs alone, so these providers process data for us, and only what is needed for their task:
++        </P>
++        <Table
++          head={['Provider', 'What it does for you', 'What it receives']}
++          rows={[
++            [<strong key="g">Google (Firebase / Google Cloud)</strong>, 'Hosts the app and database, runs our server code, stores report files, signs you in (phone codes, Google sign-in, email and password), delivers one-time codes by SMS, and blocks automated sign-ins with reCAPTCHA.', 'Everything stored in the service, in encrypted form, plus the sign-in details and device signals needed for sign-in.'],
++            [<strong key="gf">Google Fonts</strong>, 'Serves the typefaces used on screen.', 'Your IP address and browser details when a page loads.'],
++            [<strong key="p">Paystack</strong>, 'Processes M-Pesa, Airtel Money and bank payments and settles them to the chama\'s account. For a payment it is also an independent controller under its own privacy notice.', 'The payer\'s phone number, amount, payment reference, the chama\'s settlement account codes, and a placeholder email we generate (it is not a real address).'],
++            [<strong key="s">Our SMS provider (HostPinnacle)</strong>, 'Delivers SMS from the sender name SAMUHIA over mobile networks.', 'The recipient\'s phone number and the message text.'],
++            [<strong key="w">WhatsApp (Meta)</strong>, 'Carries the WhatsApp assistant conversation.', 'The messages and phone number of the people chatting with the assistant, under Meta\'s terms.'],
++            [<strong key="m">Mobile networks and banks</strong>, 'Carry SMS and move money.', 'Whatever is needed to deliver the SMS or complete the transaction.'],
++          ]}
++        />
++        <H3>Our own connected products</H3>
++        <UL>
++          <li><strong>Samuhia Desk</strong> (support desks). A desk can reach a chama\'s records through limited functions to help with setup, imports, SMS and reports, and each action is logged. Access is one-way. The company desk is always connected; the chama chooses any others.</li>
++          <li><strong>Samuhia Payments.</strong> If you use it too, it can match you to your chama memberships using your ID number and a verified phone, so you can see and pay your chama dues. It reads chama data; it does not change records.</li>
++        </UL>
++        <H3>Other disclosures</H3>
++        <UL>
++          <li><strong>By law.</strong> If a court, regulator or authority lawfully requires it, or to prevent serious fraud or harm. We will tell the affected chama where the law lets us.</li>
++          <li><strong>If the business changes.</strong> If {LEGAL.company} merges or transfers the business, the successor must honour this policy and we will tell you.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 7 */
++  {
++    id: 'inside-chama',
++    title: 'Who inside your chama can see what',
++    body: (
++      <>
++        <Table
++          head={['Role', 'What they can see']}
++          rows={[
++            [<strong key="m">Member</strong>, 'Their own profile, full ID number, contributions, loans, pots and statements; the chama\'s name, public settings and member list with masked ID details; messages addressed to them; minutes.'],
++            [<strong key="s">Secretary</strong>, 'Member list (ID masked), minutes and communications, and chama records the secretary role allows.'],
++            [<strong key="t">Treasurer and Chair (finance admins)</strong>, 'All of the above plus every member\'s full ID number and phone, all contributions, loans, pots, transactions, settlement details, SMS logs, reports and billing. The Chair also manages plan and settlement.'],
++            [<strong key="d">A support desk</strong>, 'Only what its limited functions allow, only for chamas that it is connected to (or the company desk), and logged.'],
++          ]}
++        />
++        <P>
++          These limits are enforced on our servers and in our database rules, not just on screen, and an official's access changes as soon as their role changes. People outside your chama cannot see your chama's records.
++          Remember that an official or member can also copy or share what they can see, which is beyond our control; this is why chamas should only hold the details they need.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 8 */
++  {
++    id: 'transfers',
++    title: 'Where your data is stored and international transfers',
++    body: (
++      <>
++        <P>
++          Our systems run on Google Cloud. The database is held in Google's North America region, and our server functions run in Google's Johannesburg (South Africa) and United States regions. Google, Paystack, our SMS provider and Meta may also process data in other countries.
++          So your information can be transferred and stored outside Kenya.
++        </P>
++        <P>
++          When data leaves Kenya, we rely on providers that apply strong security and contractual protection for personal data, as the Data Protection Act requires, and we send them only what they need. By using {LEGAL.product} you accept these transfers; if you object, please write to <Mail />.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 9 */
++  {
++    id: 'security',
++    title: 'How we keep it safe',
++    body: (
++      <>
++        <UL>
++          <li><strong>Encryption.</strong> Data is encrypted in transit (HTTPS) and at rest by our hosting provider.</li>
++          <li><strong>Role checks on the server.</strong> Every sensitive action re-checks your role on our servers, independently of what the app shows. Database rules block direct access to other chamas' data.</li>
++          <li><strong>Protected ID numbers.</strong> Full ID numbers are visible only to finance admins and to the member; elsewhere they are masked. A keyed one-way code is used for matching, with its secret kept in a managed secrets vault.</li>
++          <li><strong>Secrets and files.</strong> API keys are held in a secrets vault, not in code. The file store cannot be read directly from a browser; reports are issued through links that expire after {LEGAL.reportLinkHours} hours, and the most sensitive reports are PIN-protected.</li>
++          <li><strong>Payments.</strong> We never handle your PIN. Each payment has a unique reference that prevents double processing, and money only counts once Paystack confirms it.</li>
++          <li><strong>WhatsApp assistant.</strong> Identity checks, re-verification after {mins(SECURITY.REAUTH_AFTER_SECONDS)} minutes of inactivity, a {mins(SECURITY.AUTH_LOCKOUT_SECONDS)}-minute lock after {SECURITY.MAX_AUTH_ATTEMPTS} wrong attempts, and rate limits.</li>
++          <li><strong>Audit trails.</strong> Money entries are permanent and desk actions are logged.</li>
++        </UL>
++        <P>
++          No system is perfectly secure. You help by guarding your phone and codes, signing out on shared devices, and never sharing your PIN, one-time codes or ID number with anyone claiming to be us.
++        </P>
++        <H3>If something goes wrong</H3>
++        <P>
++          If a breach is likely to harm you, we will notify the Office of the Data Protection Commissioner within 72 hours of becoming aware of it, tell affected people without unreasonable delay, and explain what happened and what to do.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 10 */
++  {
++    id: 'device',
++    title: 'Cookies and data on your device',
++    body: (
++      <>
++        <P>{LEGAL.product} sets <strong>no advertising or tracking cookies</strong>. It keeps a few things on your device only to work:</P>
++        <UL>
++          <li><strong>Your sign-in session</strong>, so you do not need a new SMS code on every visit. Signing out removes it.</li>
++          <li><strong>The offline queue and a local copy of your chama's data</strong>, so the app keeps working with no signal and syncs when you reconnect. Anything not yet synced lives only on your device until it does.</li>
++          <li><strong>App files (service worker and cache)</strong>, and your choices about the install prompt.</li>
++        </UL>
++        <P>You can clear all of this in your browser settings. Doing so signs you out and removes unsynced changes.</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 11 */
++  {
++    id: 'rights',
++    title: 'Your rights',
++    body: (
++      <>
++        <P>Under the Data Protection Act, 2019, you have the right to:</P>
++        <UL>
++          <li><strong>be informed</strong> about how your data is used (this policy);</li>
++          <li><strong>access</strong> your personal data and get a copy;</li>
++          <li><strong>correct</strong> information that is wrong or out of date;</li>
++          <li><strong>delete</strong> your data, where it is no longer needed or was collected without a lawful basis;</li>
++          <li><strong>object</strong> to processing and <strong>withdraw consent</strong> you gave (this does not undo what was lawfully done before);</li>
++          <li><strong>move</strong> your data (a portable copy) where it applies; and</li>
++          <li><strong>ask for human review</strong> of an automated result that affects you (section 4).</li>
++        </UL>
++        <H3>How to use them</H3>
++        <UL>
++          <li>For records about your membership — contributions, loans, pots — ask your chama's officials first; they control that data and can correct it in the app. You can also write to us.</li>
++          <li>For anything else, write to <Mail /> from the phone number or email linked to your account, or give us enough to confirm you are who you say. We aim to answer within {LEGAL.privacyRequestDays} days.</li>
++          <li>To stop SMS from your chama, tell an official or write to us and we will mark you as opted out.</li>
++        </UL>
++        <H3>Limits you should know about</H3>
++        <UL>
++          <li>Money ledgers must stay complete. We keep financial records for the period in section 12 even if you leave, because other members' records depend on them and the law may require it. We can limit access to your contact details and remove what is not needed.</li>
++          <li>We cannot give you other people's data, or release data where that would harm someone else or the law forbids it.</li>
++        </UL>
++        <H3>If you are not satisfied</H3>
++        <P>
++          Please contact us first and we will try to put it right. You may also complain to the <strong>Office of the Data Protection Commissioner of Kenya</strong> (odpc.go.ke). Your rights under Kenyan law are not affected by anything in this policy.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 12 */
++  {
++    id: 'retention',
++    title: 'How long we keep data',
++    body: (
++      <>
++        <Table
++          head={['Data', 'How long']}
++          rows={[
++            ['Account and member records', 'While the account or chama is active. If a member is removed, the record is marked removed and no longer counted, but is not erased because other members\' histories depend on it.'],
++            ['Financial records and the transaction ledger', `For as long as the chama exists and for up to ${LEGAL.financialRecordRetentionYears} years afterwards, for accounting, tax and dispute purposes.`],
++            ['SMS log, support requests, minutes', 'While the chama is active, then with the financial records unless the chama asks us to delete them and the law allows.'],
++            ['Generated report files', `Held in a private store; download links expire after ${LEGAL.reportLinkHours} hours.`],
++            ['WhatsApp audit log, rate-limit counters and similar technical logs', `Deleted automatically after about ${LEGAL.technicalLogRetentionDays} days.`],
++            ['Device data (session, offline copy)', 'Until you sign out or clear your browser data.'],
++          ]}
++        />
++        <P>When data is no longer needed, we delete or anonymise it.</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 13 */
++  {
++    id: 'children',
++    title: 'Children',
++    body: (
++      <P>
++        {LEGAL.product} is for people aged 18 and over and is not directed at children. If you believe a child's data has been entered, write to <Mail /> and we will remove it.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 14 */
++  {
++    id: 'sms-whatsapp',
++    title: 'SMS and WhatsApp messages',
++    body: (
++      <UL>
++        <li>You may receive an SMS from the sender name <strong>{LEGAL.smsSenderName}</strong> because (a) you signed in or asked for a code or PIN, (b) your chama's officials sent a reminder or announcement, or (c) you are the chair or treasurer and your plan is about to expire.</li>
++        <li>Those messages go through our SMS provider and mobile networks. Your phone number and the message text are shared with them for delivery only.</li>
++        <li>We do not send promotional messages from {LEGAL.brand}. To stop a chama's messages, see section 11.</li>
++        <li>On WhatsApp, the assistant only answers when you message it.</li>
++      </UL>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 15 */
++  {
++    id: 'changes',
++    title: 'Changes to this policy',
++    body: (
++      <P>
++        We will update this policy when we add features, change providers or the law changes. The version and date at the top show when it last changed. For a change that matters (for example, a new type of provider or purpose), we will tell you in the app or by SMS before it takes effect.
++        The <TermsLink /> also apply.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 16 */
++  {
++    id: 'contact',
++    title: 'Contact us',
++    body: (
++      <P>
++        <strong>{LEGAL.company}</strong> — Data protection contact<br />
++        {LEGAL.place}<br />
++        Email: <Mail />
++      </P>
++    ),
++  },
++];
++
++export default function PrivacyPage() {
++  useSeo({
++    title: `Privacy Policy | ${LEGAL.product} by ${LEGAL.brand}`,
++    description: `How ${LEGAL.product} collects, uses and protects your data. We never sell it: it is used only to deliver the service, with a short, named list of providers.`,
++    path: LEGAL_PATHS.privacy,
++  });
++  return (
++    <LegalLayout
++      title="Privacy Policy"
++      sections={sections}
++      other={{ to: LEGAL_PATHS.terms, label: 'Read the Terms & Conditions' }}
++      intro={
++        <P>
++          Your chama's records are personal and so is your money. This policy tells you exactly what {LEGAL.product} collects, what it is used for, who else touches it, and what you can do about it.
++        </P>
++      }
++    />
++  );
++}
+diff --git a/src/legal/TermsPage.tsx b/src/legal/TermsPage.tsx
+new file mode 100644
+index 0000000..629df41
+--- /dev/null
++++ b/src/legal/TermsPage.tsx
+@@ -0,0 +1,582 @@
++import { useSeo } from '../seo/useSeo';
++import { FEES, PLANS, PLAN_ORDER, REPORT_WALLET_CREDIT_PRICE_KES, SECURITY } from '../lib/constants';
++import { MAX_SMS_LENGTH, MAX_SMS_SEGMENTS, SMS_SEGMENT_BREAKPOINTS } from '../lib/smsValidation';
++import LegalLayout, { Callout, H3, Mail, P, PrivacyLink, Table, UL, type LegalSection } from './LegalLayout';
++import { LEGAL, LEGAL_PATHS } from './legalConfig';
++
++const kes = (n: number) => 'KES ' + n.toLocaleString('en-KE');
++const pct = (r: number) => `${+(r * 100).toFixed(2)}%`;
++const mins = (s: number) => Math.round(s / 60);
++
++const PAID_PLANS = PLAN_ORDER.filter((p) => PLANS[p].price > 0);
++
++const sections: LegalSection[] = [
++  /* ------------------------------------------------------------------ 1 */
++  {
++    id: 'about',
++    title: 'Who we are and what these terms cover',
++    body: (
++      <>
++        <P>
++          {LEGAL.product} is operated by <strong>{LEGAL.company}</strong>, a business registered in Kenya and operating from {LEGAL.place}
++          {' '}("<strong>{LEGAL.brand}</strong>", "<strong>we</strong>", "<strong>us</strong>"). These Terms &amp; Conditions
++          ("<strong>Terms</strong>") are the agreement between {LEGAL.brand} and every person who uses {LEGAL.product} —
++          through the web app, the installable app (PWA), the WhatsApp assistant, SMS messages we send, or a {LEGAL.brand} support desk.
++        </P>
++        <P>
++          By creating an account, signing in, being added to a chama, paying through {LEGAL.product}, or otherwise using it, you agree to
++          these Terms and to our <PrivacyLink />. If you do not agree, please do not use {LEGAL.product}.
++        </P>
++        <Callout title="The short version">
++          <UL>
++            <li>{LEGAL.product} is record-keeping and collection software for chamas. It is <strong>not a bank, SACCO, lender, insurer or financial adviser</strong>, and it <strong>does not hold your chama's money</strong>.</li>
++            <li>Your chama's officials run the chama. Money rules, loan decisions, penalties and disputes are between the members of the chama — not {LEGAL.brand}.</li>
++            <li>Online payments are processed by Paystack and settle to your chama's own bank account or till. A small fee is shown to the payer before they confirm.</li>
++            <li>SMS is sold in credits, sent from the name <strong>{LEGAL.smsSenderName}</strong>, and the chama's officials are responsible for what they send.</li>
++            <li>We use your data only to run the service. We never sell it (see the <PrivacyLink />).</li>
++          </UL>
++        </Callout>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 2 */
++  {
++    id: 'definitions',
++    title: 'Words we use',
++    body: (
++      <Table
++        head={['Term', 'Meaning']}
++        rows={[
++          [<strong key="a">Chama</strong>, 'A group of people who save, lend or rotate money together and have set it up in MyChama.'],
++          [<strong key="b">Official</strong>, 'A member holding the role of Chair, Treasurer or Secretary. Chair and Treasurer are "finance admins".'],
++          [<strong key="c">Member</strong>, 'Anyone recorded in a chama\'s member list, including officials.'],
++          [<strong key="d">Plan</strong>, 'The subscription tier of a chama: Free, Starter, Basic, Growth or Max.'],
++          [<strong key="e">WhatsApp assistant</strong>, 'The member-facing chat assistant on WhatsApp that lets members check balances and pay.'],
++          [<strong key="f">SMS credits</strong>, 'Prepaid units a chama buys to send SMS from MyChama.'],
++          [<strong key="g">Desk</strong>, `A ${LEGAL.brand} support desk (the company desk, or an agent a chama connects) that helps a chama with setup, imports, SMS and reports.`],
++          [<strong key="h">Paystack</strong>, 'The licensed payment processor that handles M-Pesa, Airtel Money and bank collections for MyChama.'],
++          [<strong key="i">Samuhia Payments</strong>, `${LEGAL.brand}'s separate payments product, which can link to your chama memberships (section 12).`],
++        ]}
++      />
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 3 */
++  {
++    id: 'what-it-is',
++    title: 'What MyChama is — and is not',
++    body: (
++      <>
++        <P>{LEGAL.product} helps a chama keep its records (members, contributions, loans, merry-go-round pots, minutes), collect money online, send SMS, and produce reports.</P>
++        <H3>We do not hold or move your chama's money</H3>
++        <P>
++          Online collections are charged by Paystack and settle directly to the bank account or till your chama's Chair registered.
++          {' '}{LEGAL.product} keeps the <em>records</em> of who paid and what is owed. {LEGAL.brand} does not keep a wallet, pool or balance of chama funds,
++          pays no interest on anything, and does not pay out loans or merry-go-round payouts. Those are handed over by your officials and
++          then recorded in {LEGAL.product}.
++        </P>
++        <H3>We are not a financial institution</H3>
++        <UL>
++          <li>We are not a bank, deposit-taker, SACCO, microfinance institution, insurer, investment adviser or money-lender, and nothing in {LEGAL.product} is financial, legal, tax or accounting advice.</li>
++          <li>We do not lend. Any loan is a loan <em>from your chama to a member</em>, on terms the chama sets.</li>
++          <li>We do not register chamas or make a chama a legal entity. Whether and how your chama is registered, and any licences or tax obligations it has, are the chama's own responsibility.</li>
++          <li>We do not credit-check members, guarantee repayment, or collect debts.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 4 */
++  {
++    id: 'accounts',
++    title: 'Accounts, sign-in and eligibility',
++    body: (
++      <>
++        <UL>
++          <li><strong>Age.</strong> You must be 18 or older. {LEGAL.product} is not for children.</li>
++          <li><strong>Sign-in methods.</strong> Members sign in with a Kenyan phone number and an SMS one-time code. Anyone can also use Google sign-in. Admins creating a chama can use an email address and password, and must verify that email first.</li>
++          <li><strong>Accurate details.</strong> You must give true information — your name, phone number and, where asked, your National ID or passport number — and keep it current. A chama's officials are responsible for the accuracy of the details they enter about other members.</li>
++          <li><strong>One person, one identity.</strong> An ID or passport number can be registered only once per chama. You must not register or use another person's identity or phone number without their permission.</li>
++          <li><strong>Keep access safe.</strong> You are responsible for your phone, your SMS codes, your password and anything done from your signed-in device. For convenience, a signed-in session stays active on your device until you sign out — sign out on any shared or borrowed device. Tell us promptly if you think someone else has access.</li>
++          <li><strong>Roles are checked on our servers.</strong> What you can do depends on your role in each chama. If an official changes your role or status, your access changes straight away.</li>
++        </UL>
++        <P>We may refuse, limit or close an account that is unlawful, abusive, fraudulent, or in breach of these Terms (see section 22).</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 5 */
++  {
++    id: 'responsibilities',
++    title: 'Who is responsible for what',
++    body: (
++      <>
++        <H3>What {LEGAL.brand} is responsible for</H3>
++        <UL>
++          <li>Providing {LEGAL.product} with reasonable skill and care, and keeping the records you enter safe (see the <PrivacyLink />).</li>
++          <li>Calculating fees, loan schedules, contribution status and reports from the information in the system, and showing the payer any fee before they pay.</li>
++          <li>Enforcing roles, plan limits and security checks on our servers.</li>
++        </UL>
++        <H3>What a chama and its officials are responsible for</H3>
++        <UL>
++          <li>The chama's constitution, rules, contribution amounts, loan products and rates, penalties, merry-go-round rules and every decision made under them.</li>
++          <li>Entering accurate information and recording cash and payouts honestly and promptly.</li>
++          <li>Having the right to collect and store the personal details of members (including ID numbers) and telling members how they are used. Officials act for the chama; for member records they enter, the chama decides the purpose and {LEGAL.brand} processes the data on its behalf (see the <PrivacyLink />).</li>
++          <li>The chama's SMS content and audiences (section 10), its bank or till details, and its own accounts and tax affairs.</li>
++          <li>Resolving disputes between members, and between members and officials.</li>
++        </UL>
++        <H3>What every member is responsible for</H3>
++        <UL>
++          <li>Paying what they have agreed to pay, on time, to the chama.</li>
++          <li>Checking the phone number and amount before confirming a payment prompt, and entering their M-Pesa or Airtel PIN only on their own phone. We never see or ask for your PIN.</li>
++          <li>Telling an official or us quickly about any record that looks wrong.</li>
++        </UL>
++        <Callout tone="important" title="Officials hold real power">
++          Chair and Treasurer can record cash, approve loans, change settings and see member ID details. {LEGAL.brand} gives the tools (for example, both the Chair and the Treasurer must approve a loan, and a settlement-account change must be approved by a different official) but cannot supervise how officials behave. If you are a member, choose your officials carefully.
++        </Callout>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 6 */
++  {
++    id: 'plans',
++    title: 'Plans, prices and billing',
++    body: (
++      <>
++        <P>Every chama starts on the Free plan. The Chair can upgrade. Prices are in Kenya Shillings per month, and any taxes that apply are charged as the law requires.</P>
++        <Table
++          head={['Plan', 'Price / month', 'Member limit', 'Online collection', 'Standard report credits / month', 'Premium report credits / month']}
++          rows={PLAN_ORDER.map((p) => [
++            <strong key={p}>{PLANS[p].name}</strong>,
++            PLANS[p].price === 0 ? 'Free' : kes(PLANS[p].price),
++            PLANS[p].memberLimit >= 999 ? 'Very high (999)' : String(PLANS[p].memberLimit),
++            PLANS[p].onlineCollection ? 'Yes' : 'No — cash records only',
++            PLANS[p].standardReportCredits === null ? 'Unlimited' : String(PLANS[p].standardReportCredits),
++            String(PLANS[p].premiumReportCredits),
++          ])}
++        />
++        <UL>
++          <li><strong>How you pay.</strong> The Chair pays for a plan by an M-Pesa or Airtel Money prompt on their phone (processed by Paystack). The plan starts when Paystack confirms the payment — not when the prompt is sent.</li>
++          <li><strong>No automatic charging.</strong> We cannot silently charge a mobile-money account. "Remind me to renew" only sends a reminder SMS a few days before expiry.</li>
++          <li><strong>Expiry.</strong> If a paid plan is not renewed by its expiry date, the chama moves to the Free plan automatically. Your records stay, but Free-plan limits apply until you upgrade again.</li>
++          <li><strong>Downgrades.</strong> Changing to a cheaper plan takes effect immediately, there is no refund for unused time, and it is blocked if the chama has more active members than the new plan allows.</li>
++          <li><strong>Price changes.</strong> We may change prices or plan limits. A change applies from the next time you buy or renew, and we will show the new price in the app before you pay.</li>
++          <li><strong>Refunds.</strong> Plan fees, SMS credits and report credits are not refundable once they are credited, except where we charged you in error, charged twice for one purchase, or the law requires a refund. Write to <Mail /> with the payment reference.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 7 */
++  {
++    id: 'payments',
++    title: 'Payments, fees and settlement',
++    body: (
++      <>
++        <H3>How an online payment works</H3>
++        <UL>
++          <li>A member (or an official on their behalf) chooses what to pay — a contribution, a loan repayment or a merry-go-round contribution — and the amount.</li>
++          <li>{LEGAL.product} shows the <strong>total to be charged</strong> and the fees inside it <strong>before</strong> the payer confirms.</li>
++          <li>Paystack sends an M-Pesa or Airtel Money prompt to the phone number entered. The payer approves it with their PIN. A prompt expires after {mins(SECURITY.PAYMENT_INTENT_TTL_SECONDS)} minutes.</li>
++          <li>The payment only counts when Paystack confirms it to us. Each payment has a unique reference, so a repeated confirmation can never be applied twice.</li>
++          <li>For safety, no more than {SECURITY.MAX_INTENTS_PER_HOUR} payment attempts can be started per hour.</li>
++        </UL>
++        <H3>Fees</H3>
++        <P>
++          The payer pays the fees <em>on top of</em> the amount owed, so the chama receives exactly the amount recorded. The charge is the amount owed plus two parts:
++        </P>
++        <UL>
++          <li><strong>Paystack's processing fee</strong> — currently {pct(FEES.PAYSTACK_FEE_RATE)} of the charge, capped at {kes(FEES.PAYSTACK_FEE_CAP)} per transaction.</li>
++          <li><strong>{LEGAL.product} service fee</strong> — {pct(FEES.CONTRIBUTION_MARKUP_RATE)} on contributions and merry-go-round contributions; on loan repayments it depends on the chama's plan:</li>
++        </UL>
++        <Table
++          head={['Plan', 'Service fee on loan repayments']}
++          rows={PAID_PLANS.map((p) => [PLANS[p].name, FEES.LOAN_MARKUP_RATE[p] === null ? 'None' : pct(FEES.LOAN_MARKUP_RATE[p] as number)])}
++        />
++        <P>
++          Paystack may change its own pricing; where it does, the amount shown to the payer before they confirm is the amount that applies. Your mobile-money provider or bank
++          may also charge its own fees, which we do not control.
++        </P>
++        <H3>Settlement to the chama</H3>
++        <UL>
++          <li>The Chair sets a settlement account — a bank account or an M-Pesa Till. (M-Pesa Paybill is not currently accepted.) Online collections cannot be taken until this is done.</li>
++          <li>Paystack pays collections into that account on the schedule Paystack and the chama's settings provide. Timing depends on Paystack and the receiving bank or mobile-money operator.</li>
++          <li>Changing the settlement account needs a request by one official and approval by a <em>different</em> official. Wrong account details given by the chama are the chama's responsibility.</li>
++        </UL>
++        <H3>Cash and payouts</H3>
++        <P>
++          Officials can record cash received, loans handed out and merry-go-round payouts. Those entries are the chama's own statements and {LEGAL.brand} cannot verify that cash actually changed hands.
++          Recorded money entries are permanent; if a mistake is made it is corrected by a new, visible entry, not by erasing the old one.
++        </P>
++        <H3>Mistakes, disputes and refunds of chama money</H3>
++        <UL>
++          <li>Because we do not hold chama funds, we <strong>cannot refund a contribution or repayment</strong>. Money is returned, if at all, by the chama from its own account, under its own rules.</li>
++          <li>If you paid the wrong amount or typed the wrong phone number, tell an official and write to <Mail /> with the reference. We will help trace the payment but cannot reverse a completed mobile-money transaction ourselves.</li>
++          <li>If a payment succeeds at Paystack but is not reflected in the chama's records, we will reconcile it from the payment reference.</li>
++          <li>Paystack's and your provider's own terms and dispute processes also apply to the underlying transaction.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 8 */
++  {
++    id: 'loans',
++    title: 'Loans between chama members',
++    body: (
++      <>
++        <UL>
++          <li>Loan products (flat-rate or reducing-balance), rates, limits and terms are set by the chama. {LEGAL.product} turns them into a repayment schedule as a calculation aid; the chama's rules and the members' agreement are what bind the borrower.</li>
++          <li>A loan application needs approval from <strong>both</strong> the Chair and the Treasurer before it can be marked as handed out.</li>
++          <li>Marking a loan as disbursed records that the chama gave the money. {LEGAL.brand} does not pay it out.</li>
++          <li>Late payments, penalties, guarantors, security and recovery are matters for the chama. {LEGAL.brand} is not a party to any loan and is not responsible if a borrower does not repay.</li>
++          <li>A member cannot be permanently removed while they have an unsettled loan or belong to an unfinished merry-go-round pot.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 9 */
++  {
++    id: 'mgr',
++    title: 'Merry-go-round (table banking) pots',
++    body: (
++      <>
++        <UL>
++          <li>A pot is a voluntary arrangement among its members. Each member agrees to the contribution amount, frequency and rules the chama sets for it.</li>
++          <li>The order of payouts can be set by a random draw or a "smart" draw. If the chama turns on <strong>late-payer protection</strong>, a member's place in the queue can move back automatically based on their payment record. These are automated steps configured by the chama; ask an official if you want a decision reviewed.</li>
++          <li>The chama chooses how a final or uneven round is handled, and whether a departing member forfeits a percentage of their refund. Those settings are shown in the pot and are agreed between members, not set by us.</li>
++          <li>Arrears, shortfalls and exits are tracked in a pot ledger. Payouts are handed over by officials and recorded in {LEGAL.product}; {LEGAL.brand} does not pay them.</li>
++          <li>Taking part in a pot carries the risk that another member stops paying. {LEGAL.brand} does not guarantee that anyone will pay, or will be paid.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 10 */
++  {
++    id: 'sms',
++    title: 'SMS messages and SMS credits',
++    body: (
++      <>
++        <H3>What we send</H3>
++        <UL>
++          <li><strong>Chama messages</strong> — announcements and reminders that officials choose to send to members (once, or on a daily, weekly or monthly schedule).</li>
++          <li><strong>Service messages</strong> — sign-in codes, report PINs, and plan expiry or renewal reminders. These are part of running your account and do not use SMS credits.</li>
++        </UL>
++        <P>
++          Every message from {LEGAL.product}, for every chama, is sent under the single registered sender name <strong>{LEGAL.smsSenderName}</strong>, through our SMS provider.
++          Each message starts with "Dear [first name]," and ends with the chama's name, and those words count towards its length and cost.
++        </P>
++        <H3>Credits and cost</H3>
++        <UL>
++          <li>SMS is prepaid. The Chair or an official tops up credits by M-Pesa or Airtel Money through Paystack; the credit price and the number of credits you receive are shown before you pay.</li>
++          <li>One credit pays for one SMS segment to one recipient, on every plan. A message of up to {SMS_SEGMENT_BREAKPOINTS[0]} characters is 1 segment, up to {SMS_SEGMENT_BREAKPOINTS[1]} is 2, and up to {SMS_SEGMENT_BREAKPOINTS[2]} is 3. Messages longer than {MAX_SMS_LENGTH} characters ({MAX_SMS_SEGMENTS} segments) are not sent.</li>
++          <li>Credits are deducted for messages we hand to the SMS network. A message that fails at our end is not charged. Delivery is not guaranteed, and a message already handed to the network is charged even if the phone is off, out of coverage, blocked or on a network that does not deliver it.</li>
++          <li>Credits belong to one chama, cannot be transferred, withdrawn or exchanged for money, and are non-refundable except as in section 6.</li>
++        </UL>
++        <H3>Rules for the content</H3>
++        <UL>
++          <li>Only letters, numbers and standard punctuation are allowed — no emoji or special characters. The only links allowed are WhatsApp links.</li>
++          <li>Messages may be sent <strong>only to the chama's own members</strong>, about the chama's business. No spam, advertising for third parties, political campaigning, harassment, threats, shaming of members, misleading or fraudulent messages, or anything unlawful.</li>
++          <li>The official who sends a message, and the chama, are responsible for its content and for having a proper basis to contact each recipient. Members who have opted out of messages are skipped automatically; a member who wants to opt out can tell an official or write to <Mail />.</li>
++          <li>Sending must follow Kenyan law, including rules of the Communications Authority of Kenya and mobile network operators.</li>
++        </UL>
++        <P>We keep a log of messages sent (see the <PrivacyLink />), and may stop a sender who breaks these rules.</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 11 */
++  {
++    id: 'whatsapp',
++    title: 'The WhatsApp assistant',
++    body: (
++      <>
++        <UL>
++          <li>The assistant lets a member check their own records and pay by following the chat. It treats <strong>everyone as an ordinary member</strong>, including officials; officials' powers are in the app only.</li>
++          <li>To protect you, it verifies who you are against the chama's records (for example with your ID details), asks you to verify again after {mins(SECURITY.REAUTH_AFTER_SECONDS)} minutes of inactivity, and locks for {mins(SECURITY.AUTH_LOCKOUT_SECONDS)} minutes after {SECURITY.MAX_AUTH_ATTEMPTS} failed attempts.</li>
++          <li>Never share your ID number, one-time codes or PIN with anyone claiming to be us. We will never ask for your M-Pesa or Airtel PIN.</li>
++          <li>WhatsApp is run by Meta. Its terms and privacy practices apply to your use of WhatsApp itself, and the assistant is only as available as WhatsApp is.</li>
++          <li>Payments from WhatsApp follow section 7 in full.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 12 */
++  {
++    id: 'desk',
++    title: 'Support desks and Samuhia Payments',
++    body: (
++      <>
++        <H3>Support desks</H3>
++        <UL>
++          <li>{LEGAL.brand}'s own desk (code COG-0000) is always connected to every chama. A chama can also connect other desk agents by their code (up to 5), and the Chair or Treasurer can disconnect them.</li>
++          <li>A desk can help with setup, member imports, SMS, payments questions and reports, and receives the support requests a chama submits. It can act inside a chama only through limited functions we provide, and each action is logged.</li>
++          <li>Desk access is one-way: a desk can reach a chama's records to help; {LEGAL.product} never gives a desk the chama's credentials.</li>
++          <li>Where a chama is looked after by a desk agent, the agent may earn a commission from {LEGAL.brand} on the plan, SMS and report charges we receive. It is paid out of our share and does not increase what you pay, and no commission is taken from contributions, loan repayments or merry-go-round money.</li>
++          <li>You may ask a desk to do only things the chama is entitled to do. Instructions you give to a desk are treated as the chama's own.</li>
++        </UL>
++        <H3>Samuhia Payments</H3>
++        <P>
++          If you also use Samuhia Payments (for example as a landlord or tenant), it can match you to your chama memberships using your National ID or passport number together with a verified phone number, and show your chama balances and let you pay chama dues there.
++          This is read-only from the chama's side and never touches rental data. Samuhia Payments' own terms apply to its features.
++        </P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 13 */
++  {
++    id: 'reports',
++    title: 'Reports and exports',
++    body: (
++      <>
++        <UL>
++          <li>Standard reports (member statement, contribution ledger, arrears and penalties, minutes) and premium reports (cashflow, profit &amp; loss, balance sheet) use report credits. Credits included each month depend on the plan; extra credits can be bought, starting at {kes(REPORT_WALLET_CREDIT_PRICE_KES)} per credit, with cheaper bundles shown in the app. The Free plan has no PDF or Excel export. A member's own statement is free on every plan.</li>
++          <li>Some reports are always protected with a 6-digit PIN that we SMS to the chair and treasurer (or to the member, for their own statement). Download links expire after {LEGAL.reportLinkHours} hours. CSV files cannot be PIN-protected.</li>
++          <li>Reports are generated from the entries made in {LEGAL.product}. They are <strong>management reports, not audited financial statements</strong>, and are only as accurate as the records behind them. Use a qualified accountant for audits, tax returns and regulatory filings.</li>
++          <li>Anyone you give a report or its PIN to can read it. Share reports carefully, because they contain members' personal and money information.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 14 */
++  {
++    id: 'content',
++    title: 'Your records and what we may do with them',
++    body: (
++      <>
++        <UL>
++          <li><strong>The chama's data stays the chama's.</strong> We do not claim ownership of the records, minutes, messages or documents you put into {LEGAL.product}.</li>
++          <li>You give us permission to store, process, display and transmit that data, and to produce reports from it, as needed to run the service for you — and for no other purpose.</li>
++          <li>Money entries and ledgers are kept as a permanent trail. Members are marked removed or inactive rather than deleted so that other people's histories stay accurate.</li>
++          <li>You are responsible for lawful content: no unlawful, defamatory, fraudulent or infringing material.</li>
++          <li>You can export your chama's records on the plans that allow exports. Do this before closing a chama or letting a plan lapse.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 15 */
++  {
++    id: 'acceptable-use',
++    title: 'Acceptable use',
++    body: (
++      <>
++        <P>You must not use {LEGAL.product} to:</P>
++        <UL>
++          <li>run an unlawful scheme, including a pyramid, Ponzi or other deceptive scheme, or to take deposits from the public;</li>
++          <li>launder money, finance crime or terrorism, or breach sanctions;</li>
++          <li>commit fraud, impersonate anyone, or use someone's ID, phone or payment details without permission;</li>
++          <li>send spam or abusive, threatening or misleading messages;</li>
++          <li>get around limits, plan checks, rate limits or security measures, probe or attack the service, scrape it, or overload it;</li>
++          <li>copy, reverse-engineer or resell {LEGAL.product}, or its SMS sender name, without our written permission; or</li>
++          <li>do anything else that breaks Kenyan law or harms other people.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 16 */
++  {
++    id: 'availability',
++    title: 'Availability, offline use and changes to the service',
++    body: (
++      <>
++        <UL>
++          <li>{LEGAL.product} is built to keep working offline. Changes made without a connection are saved on your device and sent when you are online again. Until they sync they are not recorded on our servers, other people will not see them, and clearing your browser data or losing the device may lose them. Sending SMS, paying online, reports and plan changes always need a connection.</li>
++          <li>We aim for reliable service but do not promise it will always be available or error-free. Maintenance, network problems, and outages at our providers (Google, Paystack, our SMS provider, Meta/WhatsApp, mobile networks) can interrupt it.</li>
++          <li>We may improve, change or remove features. If a change materially reduces what a paid plan offers, we will tell you in advance.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 17 */
++  {
++    id: 'ip',
++    title: 'Our intellectual property',
++    body: (
++      <P>
++        {LEGAL.product}, {LEGAL.brand}, {LEGAL.smsSenderName}, the logos, software, design and content of the service belong to {LEGAL.company} or its licensors.
++        You get a personal, non-exclusive, non-transferable right to use {LEGAL.product} for your chama's lawful purposes while these Terms apply. "My Chama" is a brand name.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 18 */
++  {
++    id: 'disclaimers',
++    title: 'Disclaimers',
++    body: (
++      <>
++        <P>To the fullest extent the law allows:</P>
++        <UL>
++          <li>{LEGAL.product} is provided "as is" and "as available". We do not promise it will meet every need or be uninterrupted.</li>
++          <li>Calculations, schedules, draws and reports are tools. Check them against your chama's rules before relying on them.</li>
++          <li>We do not guarantee that any member will pay, that any loan will be repaid, that any merry-go-round payout will be made, or that any SMS will arrive.</li>
++          <li>We are not responsible for what Paystack, your bank, your mobile-money provider, WhatsApp, or any other third party does or fails to do.</li>
++        </UL>
++        <P>Nothing here limits rights you have under Kenyan consumer-protection law that cannot be excluded.</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 19 */
++  {
++    id: 'liability',
++    title: 'Limits on our liability',
++    body: (
++      <>
++        <UL>
++          <li>We are not liable for losses caused by a chama's officials or members — including theft, fraud, mistakes, unpaid contributions, loan defaults, misrecorded cash, or disputes between them.</li>
++          <li>We are not liable for loss from a payment sent to the wrong number, a wrong settlement account supplied by the chama, a PIN or code you shared, or a device that was not secured.</li>
++          <li>We are not liable for indirect or consequential loss, loss of profit, savings, opportunity or goodwill, or for loss that was not reasonably foreseeable.</li>
++          <li>Our total liability to a chama for all claims in any 12-month period is limited to the amount that chama paid us in the 12 months before the claim arose, or {kes(LEGAL.liabilityFloorKes)} if it paid nothing.</li>
++        </UL>
++        <P>None of this excludes liability for fraud, death or personal injury caused by negligence, or anything else that Kenyan law does not allow to be excluded or limited.</P>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 20 */
++  {
++    id: 'indemnity',
++    title: 'Your promise to cover our losses from misuse',
++    body: (
++      <P>
++        A chama, and each official acting for it, will cover {LEGAL.brand} for loss, claims and reasonable costs arising from: content or SMS they send; collecting or using members' data without proper authority;
++        a breach of these Terms or of the law; or a dispute among members or with officials that is brought against us. We will tell you of any claim and let you help deal with it.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 21 */
++  {
++    id: 'fraud',
++    title: 'Disputes inside a chama, fraud and legal requests',
++    body: (
++      <>
++        <UL>
++          <li>We cannot decide who is right in a dispute within a chama or order anyone to pay. Settle it using your chama's rules, mediation, or the courts.</li>
++          <li>If you suspect fraud or misuse, write to <Mail /> straight away. We can preserve records and, where we reasonably can, pause features (for example SMS or online collection) while it is looked into.</li>
++          <li>We may keep, disclose or hand over records where the law, a court order or a competent authority requires it, or to prevent fraud or harm. We will, where lawful, tell the affected chama.</li>
++          <li>The records in {LEGAL.product} may be used as evidence of what was recorded.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 22 */
++  {
++    id: 'suspension',
++    title: 'Suspension, ending your use and closing a chama',
++    body: (
++      <>
++        <UL>
++          <li><strong>By you.</strong> You can stop using {LEGAL.product} at any time. The Chair can move the chama to the Free plan. Ask us in writing if you want a chama closed.</li>
++          <li><strong>By us.</strong> We may suspend or close an account, a chama or a feature if these Terms are broken, there is suspected fraud or unlawful use, payment is not made, or the law requires. Where we reasonably can, we will warn you first and tell you why.</li>
++          <li><strong>After closure.</strong> You lose access. We keep records as set out in the <PrivacyLink />, including financial records for up to {LEGAL.financialRecordRetentionYears} years where the law requires it. Payments already in progress still complete.</li>
++          <li>Sections that by their nature should continue (payments owed, liability, disputes, governing law) survive.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 23 */
++  {
++    id: 'privacy',
++    title: 'Privacy',
++    body: (
++      <P>
++        How we collect, use and protect personal information is explained in our <PrivacyLink />, which forms part of these Terms. In short: we use your data only to deliver {LEGAL.product}, we do not sell it,
++        and we do not share it with advertisers or data brokers.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 24 */
++  {
++    id: 'changes',
++    title: 'Changes to these Terms',
++    body: (
++      <P>
++        We may update these Terms, for example when we add a feature or the law changes. The version and effective date are shown at the top. For a change that affects your rights or what you pay,
++        we will give notice in the app (or by SMS to the registered phone) before it applies. If you keep using {LEGAL.product} after the effective date you accept the new version; if you do not agree, stop using it and ask us to close your chama.
++      </P>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 25 */
++  {
++    id: 'law',
++    title: 'Governing law and how disputes are resolved',
++    body: (
++      <>
++        <UL>
++          <li>These Terms are governed by the laws of Kenya.</li>
++          <li>Please write to <Mail /> first. We will work with you to resolve a complaint in good faith, and aim to respond within 14 days.</li>
++          <li>If we cannot resolve it, either side may refer the dispute to mediation, and failing that to the courts of Kenya. Nothing stops a consumer from using the rights and remedies Kenyan consumer-protection law gives them.</li>
++        </UL>
++      </>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 26 */
++  {
++    id: 'general',
++    title: 'General',
++    body: (
++      <UL>
++        <li><strong>Electronic agreement.</strong> You accept these Terms electronically, and records of your acceptance, payments and actions kept by us are valid evidence.</li>
++        <li><strong>Notices.</strong> We may notify you in the app, by SMS to your registered phone, by WhatsApp, or by email where we have it. You can reach us at <Mail />.</li>
++        <li><strong>Whole agreement.</strong> These Terms and the Privacy Policy are the whole agreement about {LEGAL.product}, and replace earlier versions.</li>
++        <li><strong>If a part is invalid,</strong> the rest still applies. If we do not enforce a right straight away, we have not given it up.</li>
++        <li><strong>Assignment.</strong> You may not transfer your rights under these Terms. We may transfer ours to a successor of the business, who will be bound by them and by the Privacy Policy.</li>
++        <li><strong>Events beyond our control</strong> (for example network or power failure, or an outage at Paystack or a mobile network) do not make us liable for delay or failure caused by them.</li>
++        <li><strong>Language.</strong> The English version prevails over any translation.</li>
++      </UL>
++    ),
++  },
++
++  /* ------------------------------------------------------------------ 27 */
++  {
++    id: 'contact',
++    title: 'Contact us',
++    body: (
++      <>
++        <P>
++          <strong>{LEGAL.company}</strong><br />
++          {LEGAL.place}<br />
++          Email: <Mail /><br />
++          Web: {LEGAL.siteUrl.replace('https://', '')}
++        </P>
++      </>
++    ),
++  },
++];
++
++export default function TermsPage() {
++  useSeo({
++    title: `Terms & Conditions | ${LEGAL.product} by ${LEGAL.brand}`,
++    description: `The terms for using ${LEGAL.product}: accounts, chama and official responsibilities, payments and fees, SMS, loans, merry-go-round, liability and more.`,
++    path: LEGAL_PATHS.terms,
++  });
++  return (
++    <LegalLayout
++      title="Terms & Conditions"
++      sections={sections}
++      other={{ to: LEGAL_PATHS.privacy, label: 'Read the Privacy Policy' }}
++      intro={
++        <P>
++          Please read these Terms carefully. They explain what {LEGAL.product} does, what it does not do, and who is responsible for what — including for money, SMS and your chama's records.
++        </P>
++      }
++    />
++  );
++}
+diff --git a/src/legal/legalConfig.ts b/src/legal/legalConfig.ts
+new file mode 100644
+index 0000000..c45e2f9
+--- /dev/null
++++ b/src/legal/legalConfig.ts
+@@ -0,0 +1,57 @@
++/**
++ * Single source of truth for everything the Terms & Conditions and the Privacy
++ * Policy state about the company, contact routes, dates and retention windows.
++ *
++ * Money figures (plans, fees, report prices) are NOT repeated here — the legal
++ * pages import them from src/lib/constants.ts so a price change there can never
++ * leave the published terms quoting a different number.
++ *
++ * Changing the wording in a way that affects people's rights? Bump `version` and
++ * `effectiveDate`, and tell users (see docs/LEGAL.md).
++ */
++import { SITE } from '../seo/site';
++
++export const LEGAL = {
++  /** Registered business name. */
++  company: 'SAMUHIA BUSINESSES KENYA',
++  /** Short name used in running text and as the SMS sender name. */
++  brand: 'Samuhia',
++  smsSenderName: 'SAMUHIA',
++  product: 'MyChama',
++  /** Registered in Kenya; operates from Nakuru. */
++  place: 'Nakuru, Kenya',
++  siteUrl: SITE.url,
++  email: SITE.supportEmail,
++
++  version: '1.0',
++  /** ISO date this version took effect. */
++  effectiveDate: '2026-10-14',
++
++  /**
++   * Office of the Data Protection Commissioner registration number.
++   * Leave empty until issued — the Privacy Policy only shows the line when this is set.
++   */
++  odpcRegistrationNumber: '',
++
++  /** Days. Keep in sync with the Firestore TTL policy set on the technical-log collections (docs/LEGAL.md). */
++  technicalLogRetentionDays: 90,
++  /** Years financial records are kept after a chama closes (Kenyan accounting / tax record-keeping). */
++  financialRecordRetentionYears: 7,
++  /** How long a generated report download link stays valid (functions/mychama/billing.py STATEMENT_URL_TTL). */
++  reportLinkHours: 48,
++  /** Days we aim to answer a privacy request (Data Protection Act, 2019 regulations). */
++  privacyRequestDays: 30,
++  /** Fallback liability cap (KES) when a chama has paid nothing in the previous 12 months. */
++  liabilityFloorKes: 5000,
++} as const;
++
++export const LEGAL_PATHS = {
++  terms: '/terms',
++  privacy: '/privacy',
++} as const;
++
++export function formatEffectiveDate(): string {
++  return new Date(LEGAL.effectiveDate + 'T00:00:00+03:00').toLocaleDateString('en-KE', {
++    day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Nairobi',
++  });
++}
+diff --git a/src/marketing/Hero.tsx b/src/marketing/Hero.tsx
+index df22aba..4118283 100644
+--- a/src/marketing/Hero.tsx
++++ b/src/marketing/Hero.tsx
+@@ -189,6 +189,8 @@ export default function Hero() {
+             <a href="#features" className="hover:text-forest-700">Features</a>
+             <a href="#pricing" className="hover:text-forest-700">Pricing</a>
+             <a href="#faq" className="hover:text-forest-700">FAQ</a>
++            <Link to="/terms" className="hover:text-forest-700">Terms</Link>
++            <Link to="/privacy" className="hover:text-forest-700">Privacy</Link>
+             <Link to="/signin" className="hover:text-forest-700">Sign in</Link>
+           </nav>
+           <span>By Samuhia</span>
+diff --git a/src/seo/RouteSeo.tsx b/src/seo/RouteSeo.tsx
+index 81ad07b..11156b2 100644
+--- a/src/seo/RouteSeo.tsx
++++ b/src/seo/RouteSeo.tsx
+@@ -3,11 +3,14 @@ import { useLocation } from 'react-router-dom';
+ import { SEO_COPY } from '../marketing/content';
+ import { applySeo } from './useSeo';
+ import { PRIVATE_PATH_PREFIXES } from './site';
++import { LEGAL_PATHS } from '../legal/legalConfig';
+ 
+ /** One place that keeps <head> correct on every client-side navigation. Mount once inside the Router. */
+ export default function RouteSeo() {
+   const { pathname } = useLocation();
+   useEffect(() => {
++    // Terms & Privacy set their own title/description/canonical via useSeo.
++    if (pathname === LEGAL_PATHS.terms || pathname === LEGAL_PATHS.privacy) return;
+     const isPrivate = PRIVATE_PATH_PREFIXES.some((p) => pathname === p || pathname.startsWith(p + '/'));
+     if (isPrivate) {
+       applySeo({ title: 'MyChama', description: SEO_COPY.description, noindex: true });

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { signOut } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuth } from '../auth/AuthProvider';
@@ -103,6 +103,12 @@ export default function AppShell() {
                     {user?.displayName || user?.phoneNumber || user?.email}
                   </p>
                   <p className="px-2 pb-1.5 text-xs font-semibold text-forest-700 capitalize">{role}</p>
+                  <Link to="/terms" target="_blank" rel="noopener" className="block px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50">
+                    Terms &amp; Conditions
+                  </Link>
+                  <Link to="/privacy" target="_blank" rel="noopener" className="block px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50">
+                    Privacy Policy
+                  </Link>
                   <button
                     onClick={() => signOut(auth)}
                     className="w-full text-left px-2 py-1.5 rounded-lg text-sm hover:bg-forest-50"

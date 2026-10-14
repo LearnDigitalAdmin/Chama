@@ -7,4 +7,18 @@
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
+  <url>
+    <loc>https://chama.samuhia.co.ke/terms</loc>
+    <xhtml:link rel="alternate" hreflang="en-KE" href="https://chama.samuhia.co.ke/terms" />
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://chama.samuhia.co.ke/terms" />
+    <changefreq>yearly</changefreq>
+    <priority>0.3</priority>
+  </url>
+  <url>
+    <loc>https://chama.samuhia.co.ke/privacy</loc>
+    <xhtml:link rel="alternate" hreflang="en-KE" href="https://chama.samuhia.co.ke/privacy" />
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://chama.samuhia.co.ke/privacy" />
+    <changefreq>yearly</changefreq>
+    <priority>0.3</priority>
+  </url>
 </urlset>

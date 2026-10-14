@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import BrandMark from '../brand/BrandMark';
 import InstallButton from '../pwa/InstallButton';
+import { LEGAL_PATHS } from '../legal/legalConfig';
 
 export default function AuthLayout({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) {
   return (
@@ -18,6 +19,11 @@ export default function AuthLayout({ title, subtitle, children }: { title: strin
           <h1 className="font-display text-xl font-semibold text-ink">{title}</h1>
           {subtitle && <p className="text-sm text-forest-900/60 mt-1">{subtitle}</p>}
           <div className="mt-6 flex flex-col gap-4">{children}</div>
+          <p className="mt-6 text-xs text-forest-900/55 text-center leading-relaxed">
+            By continuing you agree to our{' '}
+            <Link to={LEGAL_PATHS.terms} className="underline underline-offset-2 hover:text-forest-700">Terms</Link> and{' '}
+            <Link to={LEGAL_PATHS.privacy} className="underline underline-offset-2 hover:text-forest-700">Privacy Policy</Link>.
+          </p>
         </div>
       </main>
     </div>

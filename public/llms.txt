@@ -20,3 +20,10 @@ MyChama does not hold chama funds — online payments are processed by Paystack 
 
 - [Sign in](https://chama.samuhia.co.ke/signin): for existing chama members and officials
 - [Create a chama](https://chama.samuhia.co.ke/create-chama): start a new chama on the Free plan
+
+## Legal
+
+- Terms & Conditions: https://chama.samuhia.co.ke/terms
+- Privacy Policy: https://chama.samuhia.co.ke/privacy
+
+MyChama is operated by SAMUHIA BUSINESSES KENYA, registered in Kenya and operating from Nakuru. Personal data is used only to deliver the service and is never sold.

@@ -29,6 +29,9 @@ import { useAuth } from './auth/AuthProvider';
 import PWAPrompts from './pwa/PWAPrompts';
 import { pwaManager } from './pwa/pwaManager';
 import RouteSeo from './seo/RouteSeo';
+import TermsPage from './legal/TermsPage';
+import PrivacyPage from './legal/PrivacyPage';
+import { LEGAL_PATHS } from './legal/legalConfig';
 
 function Root() {
   const { user, authReady } = useAuth();
@@ -46,6 +49,8 @@ export default function App() {
       <PWAPrompts />
     <Routes>
       <Route path="/" element={<Root />} />
+      <Route path={LEGAL_PATHS.terms} element={<TermsPage />} />
+      <Route path={LEGAL_PATHS.privacy} element={<PrivacyPage />} />
       <Route path="/signin" element={<SignInLanding />} />
       <Route path="/signin/phone" element={<PhoneSignIn />} />
       <Route path="/signin/admin" element={<EmailSignInAdmin />} />

@@ -189,6 +189,8 @@ export default function Hero() {
             <a href="#features" className="hover:text-forest-700">Features</a>
             <a href="#pricing" className="hover:text-forest-700">Pricing</a>
             <a href="#faq" className="hover:text-forest-700">FAQ</a>
+            <Link to="/terms" className="hover:text-forest-700">Terms</Link>
+            <Link to="/privacy" className="hover:text-forest-700">Privacy</Link>
             <Link to="/signin" className="hover:text-forest-700">Sign in</Link>
           </nav>
           <span>By Samuhia</span>
