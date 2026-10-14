@@ -54,6 +54,7 @@ from shared.money import contribution_fees, loan_repayment_fees, main_account_ch
 from shared.phone import detect_provider, is_valid_kenyan_phone, normalize_phone
 from shared.roles import require_finance_admin, require_membership
 from shared.secrets import PAYSTACK_SECRET_KEY
+import requests
 
 REGION = "africa-south1"
 
@@ -121,6 +122,30 @@ def listKenyaBanks(req: https_fn.CallableRequest) -> dict:
     return {"banks": _kenya_banks(PAYSTACK_SECRET_KEY.value)}
 
 
+def _create_split_with_bearer(*, secret_key: str, name: str, subaccount_code: str) -> dict:
+    """POST /split with the subaccount as both the sole 100% share and the fee bearer.
+
+    Paystack rejects bearer_type="subaccount" unless bearer_subaccount is also supplied
+    ("Please provide bearer subaccount"), which is what shared.paystack.create_split was missing.
+    Raises requests.HTTPError on a non-2xx response, same as the other Paystack helpers.
+    """
+    resp = requests.post(
+        "https://api.paystack.co/split",
+        json={
+            "name": name,
+            "type": "percentage",
+            "currency": "KES",
+            "subaccounts": [{"subaccount": subaccount_code, "share": 100}],
+            "bearer_type": "subaccount",
+            "bearer_subaccount": subaccount_code,
+        },
+        headers={"Authorization": f"Bearer {secret_key}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_type: str, account_number: str, bank_code: str) -> tuple[str, str]:
     """Returns (split_code, subaccount_code). Collections are charged against the subaccount code (see initiatePayment)."""
     sub = paystack.create_subaccount(
@@ -130,7 +155,11 @@ def _create_subaccount_and_split(*, secret_key: str, chama_name: str, account_ty
         account_number=account_number,
     )
     subaccount_code = sub["data"]["subaccount_code"]
-    split = paystack.create_split(secret_key=secret_key, name=f"{chama_name} settlement", subaccount_code=subaccount_code)
+    split = _create_split_with_bearer(
+        secret_key=secret_key,
+        name=f"{chama_name} settlement",
+        subaccount_code=subaccount_code,
+    )
     return split["data"]["split_code"], subaccount_code
 
 
@@ -244,13 +273,29 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
     chama_ref = db.document(paths.chama(chama_id))
     chama = chama_ref.get().to_dict()
     bank_code = _bank_code(request["accountType"], request.get("bankCode"))
-    split_code, subaccount_code = _create_subaccount_and_split(
-        secret_key=PAYSTACK_SECRET_KEY.value,
-        chama_name=chama.get("name", "Chama"),
-        account_type=request["accountType"],
-        account_number=request["accountNumber"],
-        bank_code=bank_code,
-    )
+
+    try:
+        split_code, subaccount_code = _create_subaccount_and_split(
+            secret_key=PAYSTACK_SECRET_KEY.value,
+            chama_name=chama.get("name", "Chama"),
+            account_type=request["accountType"],
+            account_number=request["accountNumber"],
+            bank_code=bank_code,
+        )
+    except requests.HTTPError as e:
+        resp = e.response
+        body = resp.text if resp is not None else ""
+        url = resp.url if resp is not None else "unknown"
+        status = resp.status_code if resp is not None else "?"
+        print(f"Paystack error {status} on {url}: {body}")
+        try:
+            detail = resp.json().get("message", "Paystack request failed")
+        except Exception:
+            detail = "Paystack request failed"
+        raise https_fn.HttpsError(
+            https_fn.FunctionsErrorCode.FAILED_PRECONDITION,
+            f"Paystack ({status}): {detail}",
+        )
 
     ts = now_ms()
     req_ref.update({"status": "approved", "approvedBy": membership.member_id, "updatedAt": ts})
@@ -262,7 +307,6 @@ def approveSettlementChange(req: https_fn.CallableRequest) -> dict:
         "updatedAt": ts,
     })
     return {"ok": True}
-
 
 @https_fn.on_call(region=REGION, secrets=[PAYSTACK_SECRET_KEY])
 def initiatePayment(req: https_fn.CallableRequest) -> dict:

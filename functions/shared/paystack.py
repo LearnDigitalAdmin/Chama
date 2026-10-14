@@ -120,6 +120,9 @@ def create_split(
     amount after Paystack's own fee; MyChama's markup fee
     (functions/shared/money.py) is already baked into what the member was
     CHARGED (gross_up_for_fees), not taken out of this split.
+
+    Paystack requires `bearer_subaccount` whenever bearer_type is "subaccount"
+    (otherwise: 400 "Please provide bearer subaccount").
     """
     payload = {
         "name": name,
@@ -128,6 +131,8 @@ def create_split(
         "subaccounts": [{"subaccount": subaccount_code, "share": 100}],
         "bearer_type": bearer_type,
     }
+    if bearer_type == "subaccount":
+        payload["bearer_subaccount"] = subaccount_code
     resp = requests.post(f"{PAYSTACK_API_BASE}/split", json=payload, headers=_headers(secret_key), timeout=20)
     resp.raise_for_status()
     return resp.json()

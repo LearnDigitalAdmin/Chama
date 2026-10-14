@@ -7,6 +7,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), pwaSeo()],
   build: {
     minify: 'terser',
+    sourcemap: false, // Ensures production source maps are completely disabled
     terserOptions: {
       compress: {
         drop_console: true,

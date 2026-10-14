@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react';
+import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import { useChama } from '../../app/ChamaProvider';
-import { setupSettlementAccount, requestSettlementChange, listKenyaBanks } from '../../lib/callables';
+import { db } from '../../lib/firebase';
+import { paths } from '../../lib/firestorePaths';
+import { setupSettlementAccount, requestSettlementChange, approveSettlementChange, listKenyaBanks } from '../../lib/callables';
 import { describeCallError } from '../../lib/errorMessages';
 import { PLANS } from '../../lib/constants';
+import type { SettlementAccountRequest } from '../../lib/types';
 
 export default function Payments() {
-  const { chama, chamaReady, isFinanceAdmin } = useChama();
+  const { chama, chamaReady, isFinanceAdmin, membership } = useChama();
   const [showForm, setShowForm] = useState(false);
 
   if (!chamaReady) return <p className="text-forest-900/60">Loading…</p>;
@@ -41,6 +45,9 @@ export default function Payments() {
             {showForm && isFinanceAdmin && (
               <SettlementForm mode="change" chamaId={chama.id!} onDone={() => setShowForm(false)} />
             )}
+            {isFinanceAdmin && membership?.memberId && (
+              <PendingSettlementRequests chamaId={chama.id!} myMemberId={membership.memberId} />
+            )}
           </>
         ) : isFinanceAdmin ? (
           <SettlementForm mode="setup" chamaId={chama.id!} onDone={() => {}} />
@@ -48,6 +55,86 @@ export default function Payments() {
           <p className="text-sm text-forest-900/60 mt-1">Not set up yet — ask the chair to add one.</p>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Pending settlement-account change requests. A change needs a second official,
+ * so this is where the other chair/treasurer sees the request and approves or
+ * rejects it. The requester sees their own request as "awaiting approval".
+ */
+function PendingSettlementRequests({ chamaId, myMemberId }: { chamaId: string; myMemberId: string }) {
+  const [requests, setRequests] = useState<SettlementAccountRequest[]>([]);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    return onSnapshot(
+      query(collection(db, paths.settlementAccountRequests(chamaId)), where('status', '==', 'pending')),
+      (snap) => setRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() }) as SettlementAccountRequest)),
+      (e) => setError(describeCallError(e).message)
+    );
+  }, [chamaId]);
+
+  async function decide(r: SettlementAccountRequest, decision: 'approve' | 'reject') {
+    if (
+      decision === 'approve' &&
+      !window.confirm(`Approve changing the settlement account to ${r.accountLabel} (${r.accountNumber})? All future collections will settle there.`)
+    ) {
+      return;
+    }
+    setError(null);
+    setBusyId(r.id);
+    try {
+      await approveSettlementChange({ chamaId, requestId: r.id, decision });
+    } catch (e) {
+      setError(describeCallError(e).message);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  if (!requests.length && !error) return null;
+
+  return (
+    <div className="mt-4 border-t border-forest-100 pt-3 flex flex-col gap-3">
+      <p className="text-sm font-semibold text-ink">Pending change requests</p>
+      {requests.map((r) => {
+        const mine = r.requestedBy === myMemberId;
+        return (
+          <div key={r.id} className="rounded-lg border border-forest-100 p-3 text-sm">
+            <p className="font-medium text-ink">
+              {r.accountLabel} · {r.accountNumber}
+            </p>
+            <p className="text-forest-900/60 mt-0.5">
+              {r.accountType === 'bank' ? 'Bank account' : r.accountType === 'till' ? 'M-Pesa Till' : 'M-Pesa Paybill'}
+              {r.createdAt ? ` · requested ${new Date(r.createdAt).toLocaleDateString()}` : ''}
+            </p>
+            {mine ? (
+              <p className="text-gold-700 font-medium mt-2">Awaiting approval from another official.</p>
+            ) : (
+              <div className="flex gap-2 mt-2">
+                <button
+                  onClick={() => decide(r, 'approve')}
+                  disabled={busyId === r.id}
+                  className="btn-primary text-sm font-semibold px-4 py-1.5 rounded-full disabled:opacity-50"
+                >
+                  {busyId === r.id ? 'Working…' : 'Approve'}
+                </button>
+                <button
+                  onClick={() => decide(r, 'reject')}
+                  disabled={busyId === r.id}
+                  className="text-sm font-semibold px-4 py-1.5 rounded-full border border-forest-100 text-brick-500 disabled:opacity-50"
+                >
+                  Reject
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {error && <p className="text-sm text-brick-500 font-medium">{error}</p>}
     </div>
   );
 }
